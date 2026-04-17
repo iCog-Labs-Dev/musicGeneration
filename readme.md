@@ -60,7 +60,7 @@ The implementation follows a clean module structure as suggested below:
 | `edo.py`           | EDO pitch math, pitch-class utilities.                       |
 | `vocab.py`         | Token vocabularies for meters, grooves, chords, keys, etc.   |
 | `tonal.py`         | Tonal system definition, chord templates, tonal distances.   |
-| `priors.py`        | `NullPrior`, `NGramPrior`, `NeuralPrior` interfaces.         |
+| `priors.py`        | `NullPrior`, placeholder `NeuralPrior`, manifests, and prior scoring helpers. |
 | `gttm_features.py` | Feature functions and weighted energy computation.           |
 | `candidates.py`    | Hard gating and candidate proposal functions.                |
 | `graph.py`         | Layer expansion, sparse edge building, pruning.              |
@@ -81,6 +81,6 @@ A recommended implementation order:
 4.  Implement SB solver on sparse edges (NumPy backend).
 5.  Implement Method A plan, then Method B.
 6.  Implement decoder (drums, bass, comping, lead) and MIDI rendering.
-7.  Add `NGramPrior` from corpus tokens (optional).
-8.  Add `NeuralPrior` wrapper (optional, Flax preferred; PyTorch wrapper acceptable).
+7.  Add the placeholder `NeuralPrior` seam and artifact contract.
+8.  Integrate the external neural prior implementation when it is available.
 9.  Add section-wise SB and richer diagnostics.

@@ -100,6 +100,25 @@ class SectioningStrategy(Enum):
     SECTION_WISE = "section_wise"
 
 
+class PriorFactorization(Enum):
+    """How a learned prior consumes structural tokens.
+
+    `FACTORIZED` is the default contract for EPIC 3 because it keeps the interface stable
+    across vocabulary growth and avoids an exploding whole-state token space.
+    """
+
+    WHOLE_STATE = "whole_state"
+    FACTORIZED = "factorized"
+    MIXED = "mixed"
+
+
+class PlaceholderPriorMode(Enum):
+    """How the placeholder neural prior behaves before a real model is integrated."""
+
+    NEUTRAL = "neutral"
+    STRUCTURED = "structured"
+
+
 @dataclass(frozen=True)
 class EDOConfig:
     """Configuration for an Equal Division of the Octave (EDO) system."""
@@ -188,6 +207,44 @@ class PriorWeights:
             _require_real(name, getattr(self, name), minimum=0.0)
         if self.lambda_data == 0.0 and self.lambda_gttm == 0.0:
             raise ValueError("At least one of lambda_data or lambda_gttm must be > 0.")
+
+
+@dataclass(frozen=True)
+class NeuralPriorConfig:
+    """Runtime configuration and artifact metadata for an external neural prior."""
+
+    model_family: str = "external_neural_prior"
+    model_version: str = "placeholder-v1"
+    factorization_mode: PriorFactorization = PriorFactorization.FACTORIZED
+    checkpoint_path: Optional[str] = None
+    tokenizer_path: Optional[str] = None
+    manifest_path: Optional[str] = None
+    supports_batch_scoring: bool = True
+    batch_size: int = 32
+    placeholder_mode: PlaceholderPriorMode = PlaceholderPriorMode.STRUCTURED
+    default_logp: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("model_family", "model_version"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string.")
+
+        if not isinstance(self.factorization_mode, PriorFactorization):
+            raise TypeError("factorization_mode must be a PriorFactorization value.")
+
+        for name in ("checkpoint_path", "tokenizer_path", "manifest_path"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be None or a non-empty string.")
+
+        if not isinstance(self.supports_batch_scoring, bool):
+            raise TypeError("supports_batch_scoring must be a bool.")
+        _require_int("batch_size", self.batch_size, minimum=1)
+
+        if not isinstance(self.placeholder_mode, PlaceholderPriorMode):
+            raise TypeError("placeholder_mode must be a PlaceholderPriorMode value.")
+        _require_real("default_logp", self.default_logp)
 
 
 @dataclass(frozen=True)

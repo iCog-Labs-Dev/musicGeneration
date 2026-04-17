@@ -4,8 +4,11 @@ from dataclasses import FrozenInstanceError
 from config import (
     DecodeConfig,
     EDOConfig,
+    NeuralPriorConfig,
     PlanConfig,
     PlanMethod,
+    PlaceholderPriorMode,
+    PriorFactorization,
     PriorWeights,
     SBBackend,
     SBConfig,
@@ -82,6 +85,34 @@ class TestSBConfig(unittest.TestCase):
             SBConfig(tolerance=0.0)
         with self.assertRaises(TypeError):
             SBConfig(backend_selection="numpy")  # type: ignore[arg-type]
+
+
+class TestNeuralPriorConfig(unittest.TestCase):
+    def test_neural_prior_config_validates_runtime_metadata(self):
+        cfg = NeuralPriorConfig(
+            model_family="flax_transformer",
+            model_version="v0.1.0",
+            factorization_mode=PriorFactorization.FACTORIZED,
+            checkpoint_path="artifacts/prior.ckpt",
+            tokenizer_path="artifacts/tokens.json",
+            manifest_path="artifacts/prior_manifest.json",
+            batch_size=64,
+            placeholder_mode=PlaceholderPriorMode.STRUCTURED,
+            default_logp=-0.25,
+        )
+        self.assertEqual(cfg.model_family, "flax_transformer")
+        self.assertEqual(cfg.batch_size, 64)
+        self.assertEqual(cfg.default_logp, -0.25)
+
+    def test_neural_prior_config_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            NeuralPriorConfig(model_family="")
+        with self.assertRaises(ValueError):
+            NeuralPriorConfig(batch_size=0)
+        with self.assertRaises(TypeError):
+            NeuralPriorConfig(factorization_mode="factorized")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            NeuralPriorConfig(placeholder_mode="structured")  # type: ignore[arg-type]
 
 
 class TestDecodeConfig(unittest.TestCase):
