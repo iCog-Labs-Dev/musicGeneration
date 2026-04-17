@@ -18,9 +18,14 @@ from rhythm_features import (
     strong_beat_bias,
     transition_score,
 )
+from vocab import DEFAULT_VOCABULARIES, MeterToken
 
 
 class TestRhythmHelpers(unittest.TestCase):
+    def test_rhythm_module_uses_shared_types(self):
+        self.assertIs(MeterSpec, MeterToken)
+        self.assertIs(DEFAULT_METERS, DEFAULT_VOCABULARIES.meters.id_map)
+
     def test_beats_per_bar_defaults(self):
         self.assertEqual(beats_per_bar(0), 4)
         self.assertEqual(beats_per_bar(1), 3)

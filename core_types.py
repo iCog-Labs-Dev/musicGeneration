@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from math import isclose, isfinite
-from typing import Iterator, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, Sequence, Tuple
+
+if TYPE_CHECKING:
+    from vocab import TokenVocabulary, Vocabularies
 
 
 ExpressiveControls = Tuple[float, ...]
@@ -24,6 +28,20 @@ def _require_real(name: str, value: float, *, minimum: float | None = None) -> N
         raise ValueError(f"{name} must be finite.")
     if minimum is not None and float(value) < minimum:
         raise ValueError(f"{name} must be >= {minimum}.")
+
+
+def _safe_token_label(vocabulary: "TokenVocabulary[Any]", token_id: int) -> str | None:
+    """Look up a token label while tolerating unknown ids."""
+    if vocabulary.has_id(token_id):
+        return vocabulary.token_for_id(token_id).label
+    return None
+
+
+def _format_token(field_name: str, token_id: int, label: str | None) -> str:
+    """Render a token id in raw or label-aware form for logs."""
+    if label is None:
+        return f"{field_name}_id={token_id}"
+    return f"{field_name}={label}[{token_id}]"
 
 
 @dataclass(frozen=True)
@@ -55,6 +73,77 @@ class BeatState:
             "groove_id",
         ):
             _require_int(name, getattr(self, name), minimum=0)
+
+    def token_labels(self, vocabularies: "Vocabularies") -> dict[str, str | None]:
+        """Resolve human-readable labels for the state's structural token ids."""
+        return {
+            "meter": _safe_token_label(vocabularies.meters, self.meter_id),
+            "beat": _safe_token_label(vocabularies.beat_positions, self.beat_in_bar),
+            "boundary": _safe_token_label(vocabularies.boundaries, self.boundary_lvl),
+            "key": _safe_token_label(vocabularies.keys, self.key_id),
+            "chord": _safe_token_label(vocabularies.chords, self.chord_id),
+            "role": _safe_token_label(vocabularies.roles, self.role_id),
+            "head": _safe_token_label(vocabularies.heads, self.head_id),
+            "groove": _safe_token_label(vocabularies.grooves, self.groove_id),
+        }
+
+    def to_dict(self, vocabularies: "Vocabularies | None" = None) -> dict[str, object]:
+        """Serialize the structural state to a log/test-friendly mapping."""
+        data: dict[str, object] = {
+            "meter_id": self.meter_id,
+            "beat_in_bar": self.beat_in_bar,
+            "boundary_lvl": self.boundary_lvl,
+            "key_id": self.key_id,
+            "chord_id": self.chord_id,
+            "role_id": self.role_id,
+            "head_id": self.head_id,
+            "groove_id": self.groove_id,
+        }
+        if vocabularies is not None:
+            labels = self.token_labels(vocabularies)
+            data.update(
+                {
+                    "meter_label": labels["meter"],
+                    "beat_label": labels["beat"],
+                    "boundary_label": labels["boundary"],
+                    "key_label": labels["key"],
+                    "chord_label": labels["chord"],
+                    "role_label": labels["role"],
+                    "head_label": labels["head"],
+                    "groove_label": labels["groove"],
+                }
+            )
+        return data
+
+    def pretty(self, vocabularies: "Vocabularies | None" = None) -> str:
+        """Return a compact human-readable representation for logs."""
+        if vocabularies is None:
+            return (
+                "BeatState("
+                f"meter_id={self.meter_id}, "
+                f"beat_in_bar={self.beat_in_bar}, "
+                f"boundary_lvl={self.boundary_lvl}, "
+                f"key_id={self.key_id}, "
+                f"chord_id={self.chord_id}, "
+                f"role_id={self.role_id}, "
+                f"head_id={self.head_id}, "
+                f"groove_id={self.groove_id})"
+            )
+
+        labels = self.token_labels(vocabularies)
+        rendered = ", ".join(
+            (
+                _format_token("meter", self.meter_id, labels["meter"]),
+                _format_token("beat", self.beat_in_bar, labels["beat"]),
+                _format_token("boundary", self.boundary_lvl, labels["boundary"]),
+                _format_token("key", self.key_id, labels["key"]),
+                _format_token("chord", self.chord_id, labels["chord"]),
+                _format_token("role", self.role_id, labels["role"]),
+                _format_token("head", self.head_id, labels["head"]),
+                _format_token("groove", self.groove_id, labels["groove"]),
+            )
+        )
+        return f"BeatState({rendered})"
 
 
 @dataclass(frozen=True)
@@ -90,6 +179,29 @@ class NoteEvent:
         if not isinstance(self.track, str) or not self.track.strip():
             raise ValueError("track must be a non-empty string.")
 
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the note event to a JSON-friendly mapping."""
+        return {
+            "ton": self.ton,
+            "toff": self.toff,
+            "duration_ticks": self.toff - self.ton,
+            "h": self.h,
+            "v": self.v,
+            "e": list(self.e),
+            "track": self.track,
+        }
+
+    def pretty(self) -> str:
+        """Return a compact, readable note-event summary."""
+        return (
+            "NoteEvent("
+            f"track={self.track}, "
+            f"ticks={self.ton}->{self.toff}, "
+            f"h={self.h}, "
+            f"v={self.v:.3f}, "
+            f"e={list(self.e)})"
+        )
+
 
 @dataclass(frozen=True)
 class Score:
@@ -116,6 +228,38 @@ class Score:
     def __len__(self) -> int:
         return len(self.note_events)
 
+    def track_event_counts(self) -> dict[str, int]:
+        """Return stable per-track event counts for diagnostics."""
+        counts = Counter(event.track for event in self.note_events)
+        return dict(sorted(counts.items()))
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the score and all note events."""
+        return {
+            "event_count": len(self),
+            "ticks_per_beat": self.ticks_per_beat,
+            "tempo_bpm": self.tempo_bpm,
+            "track_event_counts": self.track_event_counts(),
+            "note_events": [event.to_dict() for event in self.note_events],
+        }
+
+    def pretty(self, *, max_events: int = 3) -> str:
+        """Return a concise score summary with an event preview."""
+        preview_events = ", ".join(event.pretty() for event in self.note_events[:max_events])
+        if len(self.note_events) > max_events:
+            preview_events = f"{preview_events}, ..."
+        track_counts = ", ".join(
+            f"{track}:{count}" for track, count in self.track_event_counts().items()
+        )
+        return (
+            "Score("
+            f"events={len(self)}, "
+            f"tempo_bpm={self.tempo_bpm:.1f}, "
+            f"ticks_per_beat={self.ticks_per_beat}, "
+            f"tracks={{{track_counts}}}, "
+            f"preview=[{preview_events}])"
+        )
+
 
 @dataclass(frozen=True)
 class Layer:
@@ -140,6 +284,23 @@ class Layer:
     def __len__(self) -> int:
         return len(self.states)
 
+    def to_dict(self, vocabularies: "Vocabularies | None" = None) -> dict[str, object]:
+        """Serialize the layer and its candidate states."""
+        return {
+            "time_index": self.time_index,
+            "size": len(self),
+            "states": [state.to_dict(vocabularies) for state in self.states],
+        }
+
+    def pretty(self, vocabularies: "Vocabularies | None" = None, *, max_states: int = 3) -> str:
+        """Return a compact layer summary for logs."""
+        preview = ", ".join(
+            state.pretty(vocabularies) for state in self.states[:max_states]
+        )
+        if len(self.states) > max_states:
+            preview = f"{preview}, ..."
+        return f"Layer(t={self.time_index}, size={len(self)}, states=[{preview}])"
+
 
 @dataclass(frozen=True)
 class Edge:
@@ -157,6 +318,25 @@ class Edge:
         if not isinstance(self.target, BeatState):
             raise TypeError("target must be a BeatState.")
         _require_real("log_weight", self.log_weight)
+
+    def to_dict(self, vocabularies: "Vocabularies | None" = None) -> dict[str, object]:
+        """Serialize the edge and its endpoints."""
+        return {
+            "time_index": self.time_index,
+            "log_weight": self.log_weight,
+            "source": self.source.to_dict(vocabularies),
+            "target": self.target.to_dict(vocabularies),
+        }
+
+    def pretty(self, vocabularies: "Vocabularies | None" = None) -> str:
+        """Return a compact human-readable edge description."""
+        return (
+            "Edge("
+            f"t={self.time_index}, "
+            f"log_weight={self.log_weight:.3f}, "
+            f"source={self.source.pretty(vocabularies)}, "
+            f"target={self.target.pretty(vocabularies)})"
+        )
 
 
 @dataclass(frozen=True)
@@ -191,3 +371,36 @@ class EndpointDistribution:
                 return probability
         return 0.0
 
+    def to_dict(self, vocabularies: "Vocabularies | None" = None) -> dict[str, object]:
+        """Serialize the endpoint distribution and its support."""
+        return {
+            "time_index": self.layer.time_index,
+            "support_size": len(self.layer),
+            "support": [
+                {
+                    "state": state.to_dict(vocabularies),
+                    "probability": probability,
+                }
+                for state, probability in zip(self.layer.states, self.probabilities)
+            ],
+        }
+
+    def pretty(self, vocabularies: "Vocabularies | None" = None, *, max_states: int = 3) -> str:
+        """Return a compact endpoint-distribution summary."""
+        support_preview = ", ".join(
+            (
+                f"{state.pretty(vocabularies)}@{probability:.3f}"
+                for state, probability in zip(
+                    self.layer.states[:max_states],
+                    self.probabilities[:max_states],
+                )
+            )
+        )
+        if len(self.layer) > max_states:
+            support_preview = f"{support_preview}, ..."
+        return (
+            "EndpointDistribution("
+            f"t={self.layer.time_index}, "
+            f"size={len(self.layer)}, "
+            f"support=[{support_preview}])"
+        )

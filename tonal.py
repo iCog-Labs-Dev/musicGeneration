@@ -12,6 +12,7 @@ Design principles (per readme §2.1):
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Dict, FrozenSet, Tuple
 
 from edo import EDO
@@ -194,6 +195,7 @@ def is_subdominant(q: str) -> bool:
 # 4. Tonal distance — Lerdahl's Tonal Pitch Space
 # ===================================================================
 
+@lru_cache(maxsize=4096)
 def tonal_distance(a_root: int, b_root: int, edo: int = 12) -> float:
     """Circle-of-fifths distance between two roots (Lerdahl's *j*).
 
@@ -218,6 +220,7 @@ def tonal_distance(a_root: int, b_root: int, edo: int = 12) -> float:
     return min(diff, edo - diff)
 
 
+@lru_cache(maxsize=4096)
 def basic_space_distance(
     a_root: int, a_quality: str,
     b_root: int, b_quality: str,
@@ -270,6 +273,26 @@ def basic_space_distance(
     )
 
     return float(j + k)
+
+
+@lru_cache(maxsize=4096)
+def nearest_roots(root_pc: int, edo: int = 12, limit: int = 3) -> Tuple[int, ...]:
+    """Return the nearest pitch-class roots under the tonal metric.
+
+    The result excludes ``root_pc`` itself and is ordered from most-related
+    to less-related, using pitch-class order as a deterministic tiebreaker.
+    """
+    if limit <= 0:
+        return ()
+
+    candidates = []
+    for other in range(edo):
+        if other == root_pc % edo:
+            continue
+        candidates.append((tonal_distance(root_pc, other, edo), other))
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return tuple(root for _, root in candidates[:limit])
 
 
 # ===================================================================
