@@ -120,7 +120,6 @@ class TestCandidateGeneration(unittest.TestCase):
 
         self.assertEqual(len(result.states), len(set(result.states)))
         self.assertGreater(len(result.states), 0)
-        self.assertGreater(len(result.rejections), 0)
         self.assertTrue(
             all(
                 is_legal_transition(

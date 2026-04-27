@@ -224,8 +224,8 @@ def apply_meter_constraints(
 def apply_position_constraints(
     prev_state: BeatState,
     next_candidate: BeatState,
-    style_config: StyleConfig,
-    vocabularies: Vocabularies,
+    style_config: Optional[StyleConfig] = None,
+    vocabularies: Optional[Vocabularies] = None,
 ) -> tuple[bool, Optional[str]]:
     meter_ok, meter_reason = apply_meter_constraints(
         prev_state, next_candidate, style_config, vocabularies
