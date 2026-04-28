@@ -14,7 +14,7 @@ from core_types import BeatState, Edge, Layer
 from priors import NullPrior, Prior, PriorContext, calculate_transition_log_weight
 from tonal import basic_space_distance, tonal_distance
 from vocab import DEFAULT_VOCABULARIES, Vocabularies
-
+import numpy as np
 
 def _state_sort_key(state: BeatState) -> tuple[int, int, int, int, int, int, int, int]:
     return (
@@ -260,6 +260,8 @@ def build_sparse_graph(
     prior: Optional[Prior] = None,
     weights: Optional[PriorWeights] = None,
     edo: Optional[int] = None,
+    rng: np.random.Generator,
+    d_max: int
 ) -> SparseGraph:
     """Build a bounded sparse graph of BeatState transitions."""
     if not isinstance(start_layer, Layer):
@@ -318,6 +320,8 @@ def build_sparse_graph(
                     vocabularies=resolved_vocabs,
                     prior=resolved_prior,
                     context=_build_prior_context(source_state, end_layer, current_time),
+                    rng=rng, 
+                    d_max=d_max
                 )
 
             raw_candidate_count += candidate_result.proposed_count

@@ -1,4 +1,5 @@
 import unittest
+import numpy as np
 
 from candidates import is_legal_transition
 from config import PriorWeights, SBConfig, StyleConfig
@@ -73,6 +74,8 @@ class TestSparseGraphBuilder(unittest.TestCase):
             vocabularies=VOCABS,
             prior=self.prior,
             weights=self.weights,
+            rng=np.random.default_rng(42), 
+            d_max=self.sb_config.d_max
         )
 
         self.assertEqual(len(graph.layers), 4)
@@ -106,6 +109,8 @@ class TestSparseGraphBuilder(unittest.TestCase):
             vocabularies=VOCABS,
             prior=self.prior,
             weights=self.weights,
+            rng=np.random.default_rng(42), 
+            d_max=self.sb_config.d_max
         )
 
         self.assertGreater(graph.diagnostics.total_rejections, 0)
