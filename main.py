@@ -19,7 +19,7 @@ def main():
     # Demonstrate pitch calculations for 12-EDO
     pitch_height_c4 = 0  # Middle C
     pitch_height_g4 = 7  # G above Middle C
-    pitch_height_c5 = 12 # C one octave higher
+    pitch_height_c5 = 12  # C one octave higher
 
     print(f"Pitch height {pitch_height_c4} -> Pitch Class: {edo_12.pitch_class(pitch_height_c4)}")
     print(f"Pitch height {pitch_height_g4} -> Pitch Class: {edo_12.pitch_class(pitch_height_g4)}")
@@ -29,7 +29,7 @@ def main():
     print(f"Pitch height {pitch_height_g4} -> MIDI: {edo_12.to_midi(pitch_height_g4)}")
     print(f"Pitch height {pitch_height_c5} -> MIDI: {edo_12.to_midi(pitch_height_c5)}")
 
-    print("\n" + "="*20 + "\n")
+    print("\n" + "=" * 20 + "\n")
 
     # 2. Configure and create a 19-EDO system
     print("--- 19-EDO System ---")

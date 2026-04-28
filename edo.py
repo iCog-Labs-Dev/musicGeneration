@@ -47,7 +47,6 @@ class EDO:
             return (round(midi_note), 0)
 
         # MPE rendering
-        cents_per_step = 1200 / self.config.n
         midi_note_float = self.config.base_tuning + h * (12 / self.config.n)
         nearest_midi_note = round(midi_note_float)
         

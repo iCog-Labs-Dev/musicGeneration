@@ -1,0 +1,6 @@
+[flake8]
+# ONLY check for logic and syntax errors. 
+# Ignore all formatting/style (E/W rules).
+select = F, E999
+exclude = .git,__pycache__
+max-line-length = 120

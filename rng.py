@@ -95,4 +95,3 @@ def shuffle(key: RNGKey, values: Sequence[T]) -> tuple[Tuple[T, ...], RNGKey]:
     shuffled = list(values)
     rng.shuffle(shuffled)
     return tuple(shuffled), key.next_key()
-

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 from candidates import (
     CandidateGenerationResult,
@@ -390,13 +390,13 @@ def build_sparse_graph(
                     key=lambda state: (
                         -_pruning_score(
                             state,
-                                best_incoming[state],
-                                steps_remaining,
-                                end_layer,
-                                resolved_vocabs,
-                                resolved_style,
-                                edo=resolved_edo,
-                            ),
+                            best_incoming[state],
+                            steps_remaining,
+                            end_layer,
+                            resolved_vocabs,
+                            resolved_style,
+                            edo=resolved_edo,
+                        ),
                         _state_sort_key(state),
                     ),
                 )

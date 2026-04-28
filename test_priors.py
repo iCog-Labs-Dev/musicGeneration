@@ -10,7 +10,6 @@ from config import (
 from core_types import BeatState
 from gttm_features import TransitionWindow, calculate_gttm_energy
 from priors import (
-    BatchedNeuralPriorModel,
     NeuralPrior,
     NeuralPriorManifest,
     NullPrior,

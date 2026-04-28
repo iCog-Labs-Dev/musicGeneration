@@ -6,9 +6,9 @@ from gttm_features import (
     TimeSpanNode,
     reduce_time_span,
     BranchType,
-    ProlongationalNode,
     assign_prolongational_branching
 )
+
 
 class TestGTTMCoreComponents(unittest.TestCase):
 

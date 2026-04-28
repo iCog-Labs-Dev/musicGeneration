@@ -15,7 +15,6 @@ from rhythm_features import (
     is_strong_beat,
     local_window_score,
     sequence_score,
-    strong_beat_bias,
     transition_score,
 )
 from vocab import DEFAULT_VOCABULARIES, MeterToken
