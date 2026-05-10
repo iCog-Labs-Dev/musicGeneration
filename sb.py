@@ -89,6 +89,37 @@ class SBSolution:
 
 
 @dataclass(frozen=True)
+class SBTransitionModel:
+    """Bridge-conditioned transition probabilities over the sparse graph."""
+
+    solution: SBSolution
+    edge_probabilities_by_time: Tuple[Tuple[float, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.solution, SBSolution):
+            raise TypeError("solution must be an SBSolution.")
+        
+        edge_probs = tuple(tuple(float(p) for p in group) for group in self.edge_probabilities_by_time)
+        expected_len = len(self.solution.problem.graph.edges_by_time)
+        if len(edge_probs) != expected_len:
+            raise ValueError(f"Expected {expected_len} edge groups, got {len(edge_probs)}.")
+            
+        for group, edge_group in zip(edge_probs, self.solution.problem.graph.edges_by_time):
+            if len(group) != len(edge_group):
+                raise ValueError(f"Expected edge probability group of length {len(edge_group)}, got {len(group)}.")
+            for p in group:
+                if not (0.0 <= p <= 1.0) and not (np.isclose(p, 0.0) or np.isclose(p, 1.0)):
+                    raise ValueError(f"Edge probabilities must be between 0.0 and 1.0, got {p}.")
+        
+        cleaned_probs = tuple(
+            tuple(max(0.0, min(1.0, p)) for p in group)
+            for group in edge_probs
+        )
+        object.__setattr__(self, "edge_probabilities_by_time", cleaned_probs)
+
+
+
+@dataclass(frozen=True)
 class _IndexedEdgeBucket:
     """Layer-local sparse edge indices and log-kernel weights."""
 
@@ -641,3 +672,60 @@ def solve_sb(problem: SBProblem) -> SBSolution:
         log_backward_potentials=_tuplify_layers(backward),
         trace=trace,
     )
+
+
+def extract_transition_probabilities(solution: SBSolution) -> SBTransitionModel:
+    """Derive sparse bridge-modified transition probabilities from solved potentials."""
+    if not isinstance(solution, SBSolution):
+        raise TypeError("solution must be an SBSolution.")
+
+    problem = solution.problem
+    graph = problem.graph
+    layers = graph.layers
+    backward = solution.log_backward_potentials
+    
+    state_to_index = [
+        {state: idx for idx, state in enumerate(layer.states)}
+        for layer in layers
+    ]
+    
+    edge_probabilities_by_time = []
+    
+    for t, edge_group in enumerate(graph.edges_by_time):
+        probs = []
+        
+        for edge in edge_group:
+            src_idx = state_to_index[t][edge.source]
+            tgt_idx = state_to_index[t+1][edge.target]
+            
+            log_backward_src = backward[t][src_idx]
+            log_backward_tgt = backward[t+1][tgt_idx]
+            
+            if log_backward_src == float("-inf"):
+                probs.append(0.0)
+                continue
+                
+            log_kernel = edge.log_weight / problem.sb_config.temperature
+            log_prob = log_kernel + log_backward_tgt - log_backward_src
+            
+            probs.append(float(np.exp(min(0.0, log_prob))))
+            
+        src_sums: dict[BeatState, float] = {}
+        for edge, p in zip(edge_group, probs):
+            src_sums[edge.source] = src_sums.get(edge.source, 0.0) + p
+            
+        normalized_probs = []
+        for edge, p in zip(edge_group, probs):
+            total = src_sums[edge.source]
+            if total > 0.0:
+                normalized_probs.append(float(p / total))
+            else:
+                normalized_probs.append(0.0)
+                
+        edge_probabilities_by_time.append(tuple(normalized_probs))
+        
+    return SBTransitionModel(
+        solution=solution,
+        edge_probabilities_by_time=tuple(edge_probabilities_by_time),
+    )
+

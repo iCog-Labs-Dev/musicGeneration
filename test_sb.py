@@ -8,9 +8,11 @@ from core_types import BeatState, Edge, EndpointDistribution, Layer
 from graph import GraphDiagnostics, LayerBuildDiagnostics, SparseGraph
 from sb import (
     SBContractError,
+    SBTransitionModel,
     _IndexedEdgeBucket,
     _NumpySBBackend,
     build_sb_problem,
+    extract_transition_probabilities,
     solve_sb,
 )
 
@@ -434,5 +436,88 @@ class TestSBSolver(unittest.TestCase):
             solve_sb(problem)
 
 
+class TestSBTransitionModel(unittest.TestCase):
+    def test_rejects_invalid_solution(self):
+        with self.assertRaises(TypeError):
+            SBTransitionModel(solution=None, edge_probabilities_by_time=())
+
+    def test_rejects_mismatched_edge_groups_count(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+        with self.assertRaises(ValueError):
+            SBTransitionModel(
+                solution=solution,
+                edge_probabilities_by_time=((1.0,),),
+            )
+
+    def test_rejects_mismatched_edge_group_lengths(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+        with self.assertRaises(ValueError):
+            SBTransitionModel(
+                solution=solution,
+                edge_probabilities_by_time=((1.0, 0.0), (1.0,)),
+            )
+
+    def test_rejects_invalid_probabilities(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+        with self.assertRaises(ValueError):
+            SBTransitionModel(
+                solution=solution,
+                edge_probabilities_by_time=((-0.1,), (1.0,)),
+            )
+
+    def test_clamps_small_numerical_errors(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+        model = SBTransitionModel(
+            solution=solution,
+            edge_probabilities_by_time=((1.0 + 1e-10,), (0.0 - 1e-10,)),
+        )
+        self.assertEqual(model.edge_probabilities_by_time, ((1.0,), (0.0,)))
+
+
+class TestTransitionProbabilities(unittest.TestCase):
+    def test_extract_transition_probabilities_deterministic(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+        
+        model = extract_transition_probabilities(solution)
+        
+        self.assertEqual(model.edge_probabilities_by_time, ((1.0,), (1.0,)))
+
+    def test_extract_transition_probabilities_branching(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+        
+        model = extract_transition_probabilities(solution)
+        
+        self.assertEqual(len(model.edge_probabilities_by_time), 2)
+        
+        t0_probs = model.edge_probabilities_by_time[0]
+        self.assertEqual(len(t0_probs), 2)
+        self.assertAlmostEqual(sum(t0_probs), 1.0)
+        
+        t1_probs = model.edge_probabilities_by_time[1]
+        self.assertEqual(len(t1_probs), 4)
+        
+        middle_a = graph.layers[1].states[0]
+        middle_b = graph.layers[1].states[1]
+        
+        sum_a = sum(p for e, p in zip(graph.edges_by_time[1], t1_probs) if e.source == middle_a)
+        sum_b = sum(p for e, p in zip(graph.edges_by_time[1], t1_probs) if e.source == middle_b)
+        
+        self.assertAlmostEqual(sum_a, 1.0)
+        self.assertAlmostEqual(sum_b, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
