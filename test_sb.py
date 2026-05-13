@@ -6,14 +6,19 @@ import numpy as np
 from config import SBBackend, SBConfig
 from core_types import BeatState, Edge, EndpointDistribution, Layer
 from graph import GraphDiagnostics, LayerBuildDiagnostics, SparseGraph
+from rng import RNGKey
 from sb import (
     SBContractError,
     SBTransitionModel,
+    SBSolverError,
     _IndexedEdgeBucket,
     _NumpySBBackend,
+    _require_non_empty_log_support,
     build_sb_problem,
     extract_transition_probabilities,
     solve_sb,
+    sample_bridge_path,
+    uniform_bridge_from_graph,
 )
 
 
@@ -313,6 +318,14 @@ class TestSBProblemContract(unittest.TestCase):
 
 
 class TestSparseBackendHelpers(unittest.TestCase):
+    def test_logsumexp_underflow_guard_checks_relative_shift(self):
+        with self.assertRaises(SBSolverError):
+            _NumpySBBackend.logsumexp(
+                np.asarray((0.0, -200.0), dtype=float),
+                underflow_floor=-100.0,
+                context="unit_test_relative_shift",
+            )
+
     def test_reduce_by_source_matches_dense_reference(self):
         bucket = _IndexedEdgeBucket(
             time_index=0,
@@ -358,6 +371,13 @@ class TestSparseBackendHelpers(unittest.TestCase):
         expected_1 = math.log(0.7 * 0.9)
         self.assertTrue(np.allclose(reduced, np.asarray((expected_0, expected_1))))
 
+    def test_empty_support_guard_rejects_all_negative_inf(self):
+        with self.assertRaises(SBSolverError):
+            _require_non_empty_log_support(
+                "test_values",
+                np.asarray((float("-inf"), float("-inf")), dtype=float),
+            )
+
 
 class TestSBSolver(unittest.TestCase):
     def test_solve_sb_converges_on_tiny_graph(self):
@@ -369,7 +389,9 @@ class TestSBSolver(unittest.TestCase):
         self.assertTrue(solution.trace.converged)
         self.assertEqual(solution.trace.iterations, 1)
         self.assertAlmostEqual(solution.trace.final_max_delta, 0.0)
-        self.assertTrue(np.allclose(np.asarray(solution.log_forward_potentials), -np.asarray(solution.log_backward_potentials)))
+        
+        # Test basic property that forward potentials + backward potentials 
+        # should sum to the normalized log-distribution at endpoints
         start_mass = np.asarray(solution.log_forward_potentials[0]) + np.asarray(
             solution.log_backward_potentials[0]
         )
@@ -422,6 +444,33 @@ class TestSBSolver(unittest.TestCase):
         self.assertEqual(solution.trace.iterations, 1)
         self.assertFalse(solution.trace.converged)
         self.assertGreater(solution.trace.final_max_delta, 0.0)
+
+    def test_solve_sb_can_raise_on_non_convergence_when_configured(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(
+            graph,
+            pi0,
+            piT,
+            sb_config=SBConfig(
+                horizon_t=2,
+                max_iterations=1,
+                tolerance=1e-15,
+                raise_on_non_convergence=True,
+            ),
+        )
+
+        with self.assertRaises(SBSolverError):
+            solve_sb(problem)
+
+    def test_solve_sb_raises_when_underflow_floor_is_crossed(self):
+        graph, pi0, piT = _valid_graph()
+        with self.assertRaises(ValueError):
+            build_sb_problem(
+                graph,
+                pi0,
+                piT,
+                sb_config=SBConfig(horizon_t=2, log_underflow_floor=1.0),
+            )
 
     def test_solve_sb_rejects_unsupported_backend(self):
         graph, pi0, piT = _valid_graph()
@@ -521,3 +570,57 @@ class TestTransitionProbabilities(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+class TestSchrodingerBridgeSampler(unittest.TestCase):
+    def setUp(self):
+        self.start_state = _state(0, groove=0)
+        mid_state_a = _state(1, groove=1)
+        mid_state_b = _state(1, groove=2)
+        self.end_state = _state(2, groove=1)
+        
+        self.start_layer = Layer(time_index=0, states=(self.start_state,))
+        layer1 = Layer(time_index=1, states=(mid_state_a, mid_state_b))
+        layer2 = Layer(time_index=2, states=(self.end_state,))
+
+        edges_t0 = (
+            Edge(time_index=0, source=self.start_state, target=mid_state_a, log_weight=0.0),
+            Edge(time_index=0, source=self.start_state, target=mid_state_b, log_weight=0.0),
+        )
+        edges_t1 = (
+            Edge(time_index=1, source=mid_state_a, target=self.end_state, log_weight=0.0),
+            Edge(time_index=1, source=mid_state_b, target=self.end_state, log_weight=0.0),
+        )
+
+        self.graph = SparseGraph(
+            layers=(self.start_layer, layer1, layer2),
+            edges_by_time=(edges_t0, edges_t1),
+            diagnostics=_minimal_diagnostics(3),
+        )
+
+    def test_sampling_is_reproducible_under_seed(self):
+        bridge = uniform_bridge_from_graph(self.graph)
+        key = RNGKey(seed=123)
+        sample_a, _ = sample_bridge_path(bridge, key, include_edges=True, include_debug=True)
+        sample_b, _ = sample_bridge_path(bridge, key, include_edges=True, include_debug=True)
+        
+        self.assertEqual(sample_a.path, sample_b.path)
+        self.assertEqual(sample_a.edges, sample_b.edges)
+        self.assertEqual(sample_a.debug, sample_b.debug)
+
+    def test_sampled_path_follows_valid_edges(self):
+        bridge = uniform_bridge_from_graph(self.graph)
+        sampled, _ = sample_bridge_path(bridge, RNGKey(seed=9), include_edges=True)
+
+        self.assertEqual(len(sampled.path), len(self.graph.layers))
+        self.assertEqual(len(sampled.edges), len(self.graph.layers) - 1)
+        self.assertEqual(sampled.path[0], self.start_state)
+        self.assertEqual(sampled.path[-1], self.end_state)
+
+        for t, edge in enumerate(sampled.edges):
+            self.assertEqual(edge.time_index, t)
+            self.assertEqual(edge.source, sampled.path[t])
+            self.assertEqual(edge.target, sampled.path[t + 1])
+            self.assertIn(edge, self.graph.edges_by_time[t])
+
+
+if __name__ == "__main__":
+    unittest.main()

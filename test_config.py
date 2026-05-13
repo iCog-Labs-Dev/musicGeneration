@@ -75,6 +75,7 @@ class TestSBConfig(unittest.TestCase):
     def test_sb_config_defaults_to_numpy_backend(self):
         cfg = SBConfig()
         self.assertEqual(cfg.backend_selection, SBBackend.NUMPY)
+        self.assertFalse(cfg.raise_on_non_convergence)
 
     def test_sb_config_rejects_invalid_numerics(self):
         with self.assertRaises(ValueError):
@@ -83,6 +84,12 @@ class TestSBConfig(unittest.TestCase):
             SBConfig(temperature=0.0)
         with self.assertRaises(ValueError):
             SBConfig(tolerance=0.0)
+        with self.assertRaises(ValueError):
+            SBConfig(log_underflow_floor=float("inf"))
+        with self.assertRaises(ValueError):
+            SBConfig(log_underflow_floor=1.0)
+        with self.assertRaises(TypeError):
+            SBConfig(raise_on_non_convergence=1)  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             SBConfig(backend_selection="numpy")  # type: ignore[arg-type]
 

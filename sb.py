@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from config import SBBackend, SBConfig
 from core_types import BeatState, Edge, EndpointDistribution, Layer
 from graph import SparseGraph
+from rng import RNGKey, random_unit
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,45 @@ class SBConvergenceTrace:
 
 
 @dataclass(frozen=True)
+class SolvedBridge:
+    """Solved Schrödinger bridge represented by conditioned transition probabilities.
+
+    `edge_probabilities_by_time[t][i]` aligns with `graph.edges_by_time[t][i]` and encodes
+    (possibly unnormalized) probability mass for taking that edge under the solved bridge.
+    """
+
+    graph: SparseGraph
+    edge_probabilities_by_time: tuple[tuple[float, ...], ...]
+    initial_distribution: EndpointDistribution | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.graph, SparseGraph):
+            raise TypeError("graph must be a SparseGraph.")
+        edge_probs = tuple(tuple(float(p) for p in group) for group in self.edge_probabilities_by_time)
+        if len(edge_probs) != len(self.graph.edges_by_time):
+            raise ValueError("edge_probabilities_by_time must align with graph.edges_by_time.")
+        for t, (edges, probs) in enumerate(zip(self.graph.edges_by_time, edge_probs)):
+            if len(edges) != len(probs):
+                raise ValueError(
+                    f"edge_probabilities_by_time[{t}] must align 1:1 with graph.edges_by_time[{t}]."
+                )
+            _require_probs(f"edge_probabilities_by_time[{t}]", probs)
+        object.__setattr__(self, "edge_probabilities_by_time", edge_probs)
+
+        if self.initial_distribution is not None and self.initial_distribution.layer != self.graph.layers[0]:
+            raise ValueError("initial_distribution.layer must match graph.layers[0].")
+
+
+@dataclass(frozen=True)
+class SampledBridgePath:
+    """A single sampled trajectory through the bridge."""
+
+    path: tuple[BeatState, ...]
+    edges: tuple[Edge, ...] = ()
+    debug: tuple[Mapping[str, object], ...] = ()
+
+
+@dataclass(frozen=True)
 class SBSolution:
     """Solved log-space SB potentials aligned with the graph layers."""
 
@@ -74,18 +114,53 @@ class SBSolution:
         backward = tuple(tuple(layer) for layer in self.log_backward_potentials)
         expected_sizes = self.problem.diagnostics.layer_sizes
         if len(forward) != len(expected_sizes) or len(backward) != len(expected_sizes):
-            raise ValueError("Potential layers must align with the SBProblem graph layers.")
+            raise ValueError(
+                "Potential layers must align with the SBProblem graph layers."
+            )
         for idx, (expected_size, f_layer, b_layer) in enumerate(
             zip(expected_sizes, forward, backward)
         ):
             if len(f_layer) != expected_size or len(b_layer) != expected_size:
                 raise ValueError(f"Potential size mismatch at layer {idx}.")
             for value in f_layer + b_layer:
-                if not isinstance(value, (int, float)) or not np.isfinite(value) and value != float("-inf"):
+                if (
+                    not isinstance(value, (int, float))
+                    or not np.isfinite(value)
+                    and value != float("-inf")
+                ):
                     raise ValueError("Potential values must be finite or -inf.")
 
         object.__setattr__(self, "log_forward_potentials", forward)
         object.__setattr__(self, "log_backward_potentials", backward)
+
+    def to_bridge(self) -> SolvedBridge:
+        """Converts potentials into conditioned transition probabilities for sampling."""
+        graph = self.problem.graph
+        layers = graph.layers
+        temp = self.problem.sb_config.temperature
+        
+        all_edge_probs: list[tuple[float, ...]] = []
+        
+        for t, edge_group in enumerate(graph.edges_by_time):
+            # Conditioned probability P(v|u) \propto K(u,v) * exp(backward_potential(v))
+            target_potentials = self.log_backward_potentials[t + 1]
+            target_states_to_idx = {state: i for i, state in enumerate(layers[t + 1].states)}
+            
+            layer_edge_probs = []
+            for edge in edge_group:
+                target_idx = target_states_to_idx[edge.target]
+                # Log weight is already divided by temperature in the indexing step usually, 
+                # but we follow the solve_sb indexing logic here:
+                log_val = (edge.log_weight / temp) + target_potentials[target_idx]
+                layer_edge_probs.append(float(np.exp(log_val)))
+            
+            all_edge_probs.append(tuple(layer_edge_probs))
+            
+        return SolvedBridge(
+            graph=graph,
+            edge_probabilities_by_time=tuple(all_edge_probs),
+            initial_distribution=self.problem.pi0
+        )
 
 
 @dataclass(frozen=True)
@@ -174,9 +249,7 @@ class _IndexedEdgeBucket:
         source_indices = tuple(self.source_indices)
         target_indices = tuple(self.target_indices)
         log_kernel_weights = tuple(float(weight) for weight in self.log_kernel_weights)
-        if not (
-            len(source_indices) == len(target_indices) == len(log_kernel_weights)
-        ):
+        if not (len(source_indices) == len(target_indices) == len(log_kernel_weights)):
             raise ValueError("Indexed edge bucket fields must have equal lengths.")
 
         for src_idx in source_indices:
@@ -216,7 +289,12 @@ class _NumpySBBackend:
     """Small sparse log-space backend used by the SB solver."""
 
     @staticmethod
-    def logsumexp(values: np.ndarray) -> float:
+    def logsumexp(
+        values: np.ndarray,
+        *,
+        underflow_floor: Optional[float] = None,
+        context: str = "logsumexp",
+    ) -> float:
         if values.ndim != 1:
             raise ValueError("logsumexp expects a 1D array.")
         if values.size == 0:
@@ -224,8 +302,17 @@ class _NumpySBBackend:
         finite_mask = np.isfinite(values)
         if not np.any(finite_mask):
             return float("-inf")
-        max_value = float(np.max(values[finite_mask]))
-        shifted = np.exp(values[finite_mask] - max_value)
+        finite_values = values[finite_mask]
+        max_value = float(np.max(finite_values))
+        shifts = finite_values - max_value
+        if underflow_floor is not None:
+            min_shift = float(np.min(shifts))
+            if min_shift < underflow_floor:
+                raise SBSolverError(
+                    f"{context} encountered shift below underflow floor: "
+                    f"min_shift={min_shift:.6g}, floor={underflow_floor:.6g}."
+                )
+        shifted = np.exp(shifts)
         return float(max_value + np.log(np.sum(shifted)))
 
     @classmethod
@@ -233,17 +320,24 @@ class _NumpySBBackend:
         cls,
         bucket: _IndexedEdgeBucket,
         next_values: np.ndarray,
+        *,
+        underflow_floor: Optional[float] = None,
     ) -> np.ndarray:
         result = np.full(bucket.source_size, float("-inf"), dtype=float)
-        edge_values = np.asarray(bucket.log_kernel_weights, dtype=float) + next_values[
-            np.asarray(bucket.target_indices, dtype=int)
-        ]
+        edge_values = (
+            np.asarray(bucket.log_kernel_weights, dtype=float)
+            + next_values[np.asarray(bucket.target_indices, dtype=int)]
+        )
         grouped: list[list[float]] = [[] for _ in range(bucket.source_size)]
         for src_idx, edge_value in zip(bucket.source_indices, edge_values):
             grouped[src_idx].append(float(edge_value))
         for idx, group in enumerate(grouped):
             if group:
-                result[idx] = cls.logsumexp(np.asarray(group, dtype=float))
+                result[idx] = cls.logsumexp(
+                    np.asarray(group, dtype=float),
+                    underflow_floor=underflow_floor,
+                    context=f"reduce_by_source[t={bucket.time_index},src={idx}]",
+                )
         return result
 
     @classmethod
@@ -251,17 +345,24 @@ class _NumpySBBackend:
         cls,
         bucket: _IndexedEdgeBucket,
         prev_values: np.ndarray,
+        *,
+        underflow_floor: Optional[float] = None,
     ) -> np.ndarray:
         result = np.full(bucket.target_size, float("-inf"), dtype=float)
-        edge_values = np.asarray(bucket.log_kernel_weights, dtype=float) + prev_values[
-            np.asarray(bucket.source_indices, dtype=int)
-        ]
+        edge_values = (
+            np.asarray(bucket.log_kernel_weights, dtype=float)
+            + prev_values[np.asarray(bucket.source_indices, dtype=int)]
+        )
         grouped: list[list[float]] = [[] for _ in range(bucket.target_size)]
         for dst_idx, edge_value in zip(bucket.target_indices, edge_values):
             grouped[dst_idx].append(float(edge_value))
         for idx, group in enumerate(grouped):
             if group:
-                result[idx] = cls.logsumexp(np.asarray(group, dtype=float))
+                result[idx] = cls.logsumexp(
+                    np.asarray(group, dtype=float),
+                    underflow_floor=underflow_floor,
+                    context=f"reduce_by_target[t={bucket.time_index},dst={idx}]",
+                )
         return result
 
 
@@ -373,7 +474,9 @@ def _validate_horizon_matches_graph(
 
 def _positive_mass_state_indices(endpoint: EndpointDistribution) -> Tuple[int, ...]:
     return tuple(
-        idx for idx, probability in enumerate(endpoint.probabilities) if probability > 0.0
+        idx
+        for idx, probability in enumerate(endpoint.probabilities)
+        if probability > 0.0
     )
 
 
@@ -439,7 +542,9 @@ def _validate_endpoint_reachability(
             )
 
 
-def _endpoint_probabilities_to_logs(endpoint: EndpointDistribution) -> Tuple[float, ...]:
+def _endpoint_probabilities_to_logs(
+    endpoint: EndpointDistribution,
+) -> Tuple[float, ...]:
     return tuple(
         float("-inf") if prob == 0.0 else float(np.log(prob))
         for prob in endpoint.probabilities
@@ -457,8 +562,7 @@ def _select_backend(sb_config: SBConfig) -> type[_NumpySBBackend]:
 def _index_problem(problem: SBProblem) -> _IndexedSBProblem:
     layers = problem.graph.layers
     state_to_index = [
-        {state: idx for idx, state in enumerate(layer.states)}
-        for layer in layers
+        {state: idx for idx, state in enumerate(layer.states)} for layer in layers
     ]
     indexed_buckets = []
     for bucket_idx, edge_group in enumerate(problem.graph.edges_by_time):
@@ -488,7 +592,9 @@ def _index_problem(problem: SBProblem) -> _IndexedSBProblem:
     )
 
 
-def _validate_log_array(name: str, values: np.ndarray, allow_negative_inf: bool = True) -> None:
+def _validate_log_array(
+    name: str, values: np.ndarray, allow_negative_inf: bool = True
+) -> None:
     if values.ndim != 1:
         raise SBSolverError(f"{name} must be a 1D array.")
     if np.any(np.isnan(values)) or np.any(np.isposinf(values)):
@@ -497,21 +603,34 @@ def _validate_log_array(name: str, values: np.ndarray, allow_negative_inf: bool 
         raise SBSolverError(f"{name} must be finite.")
 
 
+def _require_non_empty_log_support(name: str, values: np.ndarray) -> None:
+    if not np.any(np.isfinite(values)):
+        raise SBSolverError(f"{name} has empty finite support.")
+
+
 def _propagate_backward(
     indexed_problem: _IndexedSBProblem,
     backend: type[_NumpySBBackend],
     log_terminal_backward: np.ndarray,
+    *,
+    underflow_floor: float,
 ) -> list[np.ndarray]:
     layers = indexed_problem.problem.graph.layers
     backward = [np.full(len(layer), float("-inf"), dtype=float) for layer in layers]
     backward[-1] = log_terminal_backward.copy()
     _validate_log_array("log_terminal_backward", backward[-1])
+    _require_non_empty_log_support("log_terminal_backward", backward[-1])
     for bucket in reversed(indexed_problem.indexed_buckets):
         backward[bucket.time_index] = backend.reduce_by_source(
             bucket,
             backward[bucket.time_index + 1],
+            underflow_floor=underflow_floor,
         )
         _validate_log_array(
+            f"log_backward_potentials[{bucket.time_index}]",
+            backward[bucket.time_index],
+        )
+        _require_non_empty_log_support(
             f"log_backward_potentials[{bucket.time_index}]",
             backward[bucket.time_index],
         )
@@ -522,17 +641,25 @@ def _propagate_forward(
     indexed_problem: _IndexedSBProblem,
     backend: type[_NumpySBBackend],
     log_initial_forward: np.ndarray,
+    *,
+    underflow_floor: float,
 ) -> list[np.ndarray]:
     layers = indexed_problem.problem.graph.layers
     forward = [np.full(len(layer), float("-inf"), dtype=float) for layer in layers]
     forward[0] = log_initial_forward.copy()
     _validate_log_array("log_initial_forward", forward[0])
+    _require_non_empty_log_support("log_initial_forward", forward[0])
     for bucket in indexed_problem.indexed_buckets:
         forward[bucket.time_index + 1] = backend.reduce_by_target(
             bucket,
             forward[bucket.time_index],
+            underflow_floor=underflow_floor,
         )
         _validate_log_array(
+            f"log_forward_potentials[{bucket.time_index + 1}]",
+            forward[bucket.time_index + 1],
+        )
+        _require_non_empty_log_support(
             f"log_forward_potentials[{bucket.time_index + 1}]",
             forward[bucket.time_index + 1],
         )
@@ -545,20 +672,29 @@ def _require_finite_support(
     *,
     endpoint_name: str,
 ) -> None:
-    for idx, (message_value, endpoint_value) in enumerate(zip(message, endpoint_log_probs)):
+    for idx, (message_value, endpoint_value) in enumerate(
+        zip(message, endpoint_log_probs)
+    ):
         if np.isfinite(endpoint_value) and not np.isfinite(message_value):
             raise SBSolverError(
                 f"{endpoint_name} has positive mass on unreachable support at index {idx}."
             )
 
 
-def _safe_difference(log_probs: Tuple[float, ...], message: np.ndarray, *, name: str) -> np.ndarray:
+def _safe_difference(
+    log_probs: Tuple[float, ...],
+    message: np.ndarray,
+    *,
+    name: str,
+    underflow_floor: float,
+) -> np.ndarray:
     _require_finite_support(message, log_probs, endpoint_name=name)
     result = np.full(len(log_probs), float("-inf"), dtype=float)
     for idx, (log_prob, message_value) in enumerate(zip(log_probs, message)):
         if np.isfinite(log_prob):
             result[idx] = float(log_prob - message_value)
     _validate_log_array(name, result)
+    _require_non_empty_log_support(name, result)
     return result
 
 
@@ -629,10 +765,7 @@ def build_sb_problem(
             if out_degree[state] == 0
         ),
         zero_indegree_count=sum(
-            1
-            for layer in layers[1:]
-            for state in layer.states
-            if in_degree[state] == 0
+            1 for layer in layers[1:] for state in layer.states if in_degree[state] == 0
         ),
         pi0_support_size=len(pi0.layer),
         piT_support_size=len(piT.layer),
@@ -661,17 +794,29 @@ def solve_sb(problem: SBProblem) -> SBSolution:
     iterations = 0
 
     for iteration in range(1, problem.sb_config.max_iterations + 1):
-        backward = _propagate_backward(indexed_problem, backend, log_terminal_backward)
+        backward = _propagate_backward(
+            indexed_problem,
+            backend,
+            log_terminal_backward,
+            underflow_floor=problem.sb_config.log_underflow_floor,
+        )
         log_initial_forward = _safe_difference(
             indexed_problem.log_pi0,
             backward[0],
             name="log_initial_forward",
+            underflow_floor=problem.sb_config.log_underflow_floor,
         )
-        forward = _propagate_forward(indexed_problem, backend, log_initial_forward)
+        forward = _propagate_forward(
+            indexed_problem,
+            backend,
+            log_initial_forward,
+            underflow_floor=problem.sb_config.log_underflow_floor,
+        )
         next_log_terminal_backward = _safe_difference(
             indexed_problem.log_piT,
             forward[-1],
             name="log_terminal_backward",
+            underflow_floor=problem.sb_config.log_underflow_floor,
         )
 
         final_max_delta = _max_abs_delta(
@@ -684,13 +829,30 @@ def solve_sb(problem: SBProblem) -> SBSolution:
             converged = True
             break
 
-    backward = _propagate_backward(indexed_problem, backend, log_terminal_backward)
+    if not converged and problem.sb_config.raise_on_non_convergence:
+        raise SBSolverError(
+            "SB solver did not converge within max_iterations "
+            f"({problem.sb_config.max_iterations})."
+        )
+
+    backward = _propagate_backward(
+        indexed_problem,
+        backend,
+        log_terminal_backward,
+        underflow_floor=problem.sb_config.log_underflow_floor,
+    )
     log_initial_forward = _safe_difference(
         indexed_problem.log_pi0,
         backward[0],
         name="log_initial_forward",
+        underflow_floor=problem.sb_config.log_underflow_floor,
     )
-    forward = _propagate_forward(indexed_problem, backend, log_initial_forward)
+    forward = _propagate_forward(
+        indexed_problem,
+        backend,
+        log_initial_forward,
+        underflow_floor=problem.sb_config.log_underflow_floor,
+    )
 
     trace = SBConvergenceTrace(
         iterations=iterations,
@@ -760,3 +922,117 @@ def extract_transition_probabilities(solution: SBSolution) -> SBTransitionModel:
         edge_probabilities_by_time=tuple(edge_probabilities_by_time),
     )
 
+# --- Pure Path Sampling Implementation ---
+
+def _require_probs(name: str, values: Sequence[float]) -> tuple[float, ...]:
+    probs = tuple(float(value) for value in values)
+    if not probs:
+        raise ValueError(f"{name} must not be empty.")
+    for idx, prob in enumerate(probs):
+        if not isfinite(prob):
+            raise ValueError(f"{name}[{idx}] must be finite.")
+        if prob < 0.0:
+            raise ValueError(f"{name}[{idx}] must be >= 0.")
+    total = sum(probs)
+    if total <= 0.0:
+        raise ValueError(f"{name} must have positive total mass.")
+    return probs
+
+
+def _sample_categorical(key: RNGKey, probs: Sequence[float]) -> tuple[int, RNGKey]:
+    normalized = _require_probs("probs", probs)
+    total = float(sum(normalized))
+    threshold, next_key = random_unit(key)
+    cutoff = threshold * total
+    running = 0.0
+    for idx, prob in enumerate(normalized):
+        running += prob
+        if cutoff <= running:
+            return idx, next_key
+    return len(normalized) - 1, next_key
+
+
+def _build_conditioned_transition_table(
+    graph: SparseGraph, edge_probabilities_by_time: tuple[tuple[float, ...], ...]
+) -> tuple[dict[BeatState, tuple[tuple[Edge, ...], tuple[float, ...]]], ...]:
+    tables: list[dict[BeatState, tuple[tuple[Edge, ...], tuple[float, ...]]]] = []
+    for edges, probs in zip(graph.edges_by_time, edge_probabilities_by_time):
+        by_source: dict[BeatState, list[tuple[Edge, float]]] = {}
+        for edge, prob in zip(edges, probs):
+            by_source.setdefault(edge.source, []).append((edge, float(prob)))
+        conditioned: dict[BeatState, tuple[tuple[Edge, ...], tuple[float, ...]]] = {}
+        for source, items in by_source.items():
+            outgoing_edges = tuple(edge for edge, _ in items)
+            outgoing_probs = _require_probs("outgoing_probs", tuple(prob for _, prob in items))
+            conditioned[source] = (outgoing_edges, outgoing_probs)
+        tables.append(conditioned)
+    return tuple(tables)
+
+
+def sample_bridge_path(
+    bridge: SolvedBridge,
+    rng: RNGKey,
+    *,
+    start_state: BeatState | None = None,
+    include_edges: bool = False,
+    include_debug: bool = False,
+) -> tuple[SampledBridgePath, RNGKey]:
+    """Sample a full path from a solved bridge using its conditioned transitions."""
+
+    if not isinstance(bridge, SolvedBridge):
+        raise TypeError("bridge must be a SolvedBridge.")
+    if not isinstance(rng, RNGKey):
+        raise TypeError("rng must be an RNGKey.")
+
+    graph = bridge.graph
+    transition_tables = _build_conditioned_transition_table(graph, bridge.edge_probabilities_by_time)
+
+    if start_state is None:
+        if bridge.initial_distribution is None:
+            start_state = graph.layers[0].states[0]
+        else:
+            idx, rng = _sample_categorical(rng, bridge.initial_distribution.probabilities)
+            start_state = bridge.initial_distribution.layer.states[idx]
+    else:
+        if start_state not in set(graph.layers[0].states):
+            raise ValueError("start_state must come from the bridge start layer.")
+
+    path: list[BeatState] = [start_state]
+    edges: list[Edge] = []
+    debug: list[Mapping[str, object]] = []
+
+    current = start_state
+    for t in range(len(graph.layers) - 1):
+        table = transition_tables[t]
+        if current not in table:
+            raise ValueError(f"No outgoing bridge transitions from state at time {t}.")
+        outgoing_edges, outgoing_probs = table[current]
+        chosen_idx, rng = _sample_categorical(rng, outgoing_probs)
+        edge = outgoing_edges[chosen_idx]
+        next_state = edge.target
+        path.append(next_state)
+        if include_edges:
+            edges.append(edge)
+        if include_debug:
+            debug.append(
+                {
+                    "time_index": t,
+                    "source": edge.source,
+                    "target": edge.target,
+                    "edge_probability": float(outgoing_probs[chosen_idx]) / float(sum(outgoing_probs)),
+                    "edge_log_weight": edge.log_weight,
+                }
+            )
+        current = next_state
+
+    return SampledBridgePath(path=tuple(path), edges=tuple(edges), debug=tuple(debug)), rng
+
+
+def uniform_bridge_from_graph(graph: SparseGraph) -> SolvedBridge:
+    """Utility for tests: make a bridge with uniform mass on each outgoing edge."""
+    probabilities: list[tuple[float, ...]] = []
+    for edges in graph.edges_by_time:
+        if not edges:
+            raise ValueError("graph.edges_by_time must not contain empty edge groups.")
+        probabilities.append(tuple(1.0 for _ in edges))
+    return SolvedBridge(graph=graph, edge_probabilities_by_time=tuple(probabilities))

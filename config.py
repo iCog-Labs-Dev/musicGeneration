@@ -257,6 +257,8 @@ class SBConfig:
     temperature: float = 1.0
     k_max: int = 64
     d_max: int = 8
+    log_underflow_floor: float = -745.0
+    raise_on_non_convergence: bool = False
     backend_selection: SBBackend = SBBackend.NUMPY
 
     def __post_init__(self) -> None:
@@ -270,6 +272,14 @@ class SBConfig:
             raise ValueError("temperature must be > 0.")
         _require_int("k_max", self.k_max, minimum=1)
         _require_int("d_max", self.d_max, minimum=1)
+        _require_real("log_underflow_floor", self.log_underflow_floor)
+        if self.log_underflow_floor > 0.0:
+            raise ValueError(
+                "log_underflow_floor must be <= 0.0; it is applied to "
+                "relative logsumexp shifts (value - max)."
+            )
+        if not isinstance(self.raise_on_non_convergence, bool):
+            raise TypeError("raise_on_non_convergence must be a bool.")
         if not isinstance(self.backend_selection, SBBackend):
             raise TypeError("backend_selection must be an SBBackend value.")
 
