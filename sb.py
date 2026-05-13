@@ -100,11 +100,12 @@ class SBTransitionModel:
             raise TypeError("solution must be an SBSolution.")
         
         edge_probs = tuple(tuple(float(p) for p in group) for group in self.edge_probabilities_by_time)
-        expected_len = len(self.solution.problem.graph.edges_by_time)
+        graph = self.solution.problem.graph
+        expected_len = len(graph.edges_by_time)
         if len(edge_probs) != expected_len:
             raise ValueError(f"Expected {expected_len} edge groups, got {len(edge_probs)}.")
             
-        for group, edge_group in zip(edge_probs, self.solution.problem.graph.edges_by_time):
+        for group, edge_group in zip(edge_probs, graph.edges_by_time):
             if len(group) != len(edge_group):
                 raise ValueError(f"Expected edge probability group of length {len(edge_group)}, got {len(group)}.")
             for p in group:
@@ -116,6 +117,36 @@ class SBTransitionModel:
             for group in edge_probs
         )
         object.__setattr__(self, "edge_probabilities_by_time", cleaned_probs)
+
+        outgoing_index: dict[int, dict[BeatState, list[tuple[Edge, float]]]] = {}
+        for t, (edge_group, prob_group) in enumerate(zip(graph.edges_by_time, cleaned_probs)):
+            time_index_map: dict[BeatState, list[tuple[Edge, float]]] = {}
+            for edge, p in zip(edge_group, prob_group):
+                if edge.source not in time_index_map:
+                    time_index_map[edge.source] = []
+                time_index_map[edge.source].append((edge, p))
+            
+            for src_state, edges_and_probs in time_index_map.items():
+                total_prob = sum(prob for _, prob in edges_and_probs)
+                if not (np.isclose(total_prob, 1.0) or np.isclose(total_prob, 0.0)):
+                    raise ValueError(f"Probabilities for source state {src_state} must sum to 1.0 or 0.0, got {total_prob}.")
+            
+            outgoing_index[t] = time_index_map
+            
+        frozen_index = {
+            t: {src: tuple(edges) for src, edges in time_index_map.items()}
+            for t, time_index_map in outgoing_index.items()
+        }
+        object.__setattr__(self, "_outgoing_index", frozen_index)
+
+    def get_outgoing_transitions(self, time_index: int, source: BeatState) -> Tuple[Tuple[Edge, float], ...]:
+        """Query normalized outgoing transitions for a specific source state."""
+        if not hasattr(self, "_outgoing_index"):
+            return ()
+        index = object.__getattribute__(self, "_outgoing_index")
+        if time_index not in index:
+            raise ValueError(f"Invalid time_index {time_index}.")
+        return index[time_index].get(source, ())
 
 
 
