@@ -715,6 +715,8 @@ class TestSBDiagnosticsNodeMarginals(unittest.TestCase):
 
         diag = compute_sb_diagnostics(solution)
 
+        self.assertIsInstance(diag, SBDiagnostics)
+        self.assertIsInstance(diag.node_marginals, SBNodeMarginals)
         for t, layer_probs in enumerate(diag.node_marginals.marginals):
             total = sum(layer_probs)
             self.assertAlmostEqual(
