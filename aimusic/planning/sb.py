@@ -5,6 +5,7 @@ from math import isfinite
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+import math
 
 from aimusic.core.config import SBBackend, SBConfig
 from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
@@ -1164,3 +1165,390 @@ def uniform_bridge_from_graph(graph: SparseGraph) -> SolvedBridge:
             tuple(1.0 / counts_by_source[edge.source] for edge in edges)
         )
     return SolvedBridge(graph=graph, edge_probabilities_by_time=tuple(probabilities))
+
+
+# SB-08 Part 1 — Per-layer node marginals
+
+@dataclass(frozen=True)
+class SBNodeMarginals:
+    """Per-layer bridge-marginal distributions derived from solved potentials."""
+
+    marginals: Tuple[Tuple[float, ...], ...]
+    log_marginals: Tuple[Tuple[float, ...], ...]
+
+    def __post_init__(self) -> None:
+        marg = tuple(tuple(layer) for layer in self.marginals)
+        log_marg = tuple(tuple(layer) for layer in self.log_marginals)
+        if len(marg) != len(log_marg):
+            raise ValueError("marginals and log_marginals must have the same number of layers.")
+        for t, (prob_layer, log_layer) in enumerate(zip(marg, log_marg)):
+            if len(prob_layer) != len(log_layer):
+                raise ValueError(f"Layer {t}: marginals and log_marginals size mismatch.")
+            for i, p in enumerate(prob_layer):
+                if not isinstance(p, (int, float)) or not isfinite(float(p)) or float(p) < 0.0:
+                    raise ValueError(f"marginals[{t}][{i}] must be a finite non-negative real.")
+            for i, lv in enumerate(log_layer):
+                if not isinstance(lv, (int, float)) or isinstance(lv, bool):
+                    raise TypeError(f"log_marginals[{t}][{i}] must be a real number.")
+                if math.isnan(lv):
+                    raise ValueError(f"log_marginals[{t}][{i}] must not be NaN.")
+        object.__setattr__(self, "marginals", marg)
+        object.__setattr__(self, "log_marginals", log_marg)
+
+    def to_dict(self) -> dict:
+        return {
+            "layer_count": len(self.marginals),
+            "marginals": [list(layer) for layer in self.marginals],
+            "log_marginals": [list(layer) for layer in self.log_marginals],
+        }
+
+
+# SB-08 Part 2 — Optional edge marginals
+
+@dataclass(frozen=True)
+class SBEdgeRecord:
+    """Bridge joint-marginal for one sparse edge."""
+
+    source_index: int
+    target_index: int
+    marginal: float
+    log_marginal: float
+
+    def __post_init__(self) -> None:
+        for name in ("source_index", "target_index"):
+            v = getattr(self, name)
+            if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+                raise ValueError(f"{name} must be a non-negative int.")
+        if (
+            not isinstance(self.marginal, (int, float))
+            or not isfinite(float(self.marginal))
+            or float(self.marginal) < 0.0
+        ):
+            raise ValueError("marginal must be a finite non-negative real.")
+        if not isinstance(self.log_marginal, (int, float)) or isinstance(self.log_marginal, bool):
+            raise TypeError("log_marginal must be a real number.")
+        if math.isnan(self.log_marginal):
+            raise ValueError("log_marginal must not be NaN.")
+
+    def to_dict(self) -> dict:
+        return {
+            "source_index": self.source_index,
+            "target_index": self.target_index,
+            "marginal": self.marginal,
+            "log_marginal": self.log_marginal,
+        }
+
+
+@dataclass(frozen=True)
+class SBEdgeMarginals:
+    """Bridge joint-marginals for all sparse edges, grouped by time bucket."""
+
+    edge_marginals: Tuple[Tuple[SBEdgeRecord, ...], ...]
+
+    def __post_init__(self) -> None:
+        buckets = tuple(
+            tuple(entry) for entry in self.edge_marginals
+        )
+        for t, bucket in enumerate(buckets):
+            for i, record in enumerate(bucket):
+                if not isinstance(record, SBEdgeRecord):
+                    raise TypeError(
+                        f"edge_marginals[{t}][{i}] must be an SBEdgeRecord."
+                    )
+        object.__setattr__(self, "edge_marginals", buckets)
+
+    def to_dict(self) -> dict:
+        return {
+            "bucket_count": len(self.edge_marginals),
+            "edge_marginals": [
+                [rec.to_dict() for rec in bucket]
+                for bucket in self.edge_marginals
+            ],
+        }
+
+
+# SB-08 3/4 — Iteration history
+
+@dataclass(frozen=True)
+class SBIterationRecord:
+    """Diagnostic record for one solver iteration."""
+
+    iteration: int
+    max_delta: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.iteration, int) or isinstance(self.iteration, bool) or self.iteration < 1:
+            raise ValueError("iteration must be a positive int.")
+        if (
+            not isinstance(self.max_delta, (int, float))
+            or isinstance(self.max_delta, bool)
+            or not math.isfinite(float(self.max_delta))
+            or float(self.max_delta) < 0.0
+        ):
+            raise ValueError("max_delta must be a finite non-negative real.")
+
+    def to_dict(self) -> dict:
+        return {"iteration": self.iteration, "max_delta": self.max_delta}
+
+
+def solve_sb_with_history(
+    problem: SBProblem,
+) -> tuple[SBSolution, Tuple[SBIterationRecord, ...]]:
+    """Solve the SB problem and return both the solution and per-iteration records."""
+    if not isinstance(problem, SBProblem):
+        raise TypeError("problem must be an SBProblem.")
+
+    backend = _select_backend(problem.sb_config)
+    indexed_problem = _index_problem(problem)
+    log_terminal_backward = np.zeros(problem.diagnostics.piT_support_size, dtype=float)
+    final_max_delta = float("inf")
+    converged = False
+    iterations = 0
+    history_records: list[SBIterationRecord] = []
+
+    for iteration in range(1, problem.sb_config.max_iterations + 1):
+        backward = _propagate_backward(
+            indexed_problem, backend, log_terminal_backward,
+            underflow_floor=problem.sb_config.log_underflow_floor,
+        )
+        log_initial_forward = _safe_difference(
+            indexed_problem.log_pi0,
+            backward[0],
+            name="log_initial_forward",
+            underflow_floor=problem.sb_config.log_underflow_floor,
+        )
+        forward = _propagate_forward(
+            indexed_problem, backend, log_initial_forward,
+            underflow_floor=problem.sb_config.log_underflow_floor,
+        )
+        next_log_terminal_backward = _safe_difference(
+            indexed_problem.log_piT,
+            forward[-1],
+            name="log_terminal_backward",
+            underflow_floor=problem.sb_config.log_underflow_floor,
+        )
+
+        final_max_delta = _max_abs_delta(
+            next_log_terminal_backward,
+            log_terminal_backward,
+        )
+        iterations = iteration
+        log_terminal_backward = next_log_terminal_backward
+        recorded_delta = final_max_delta if isfinite(final_max_delta) else 0.0
+        history_records.append(SBIterationRecord(iteration=iteration, max_delta=recorded_delta))
+
+        if final_max_delta <= problem.sb_config.tolerance:
+            converged = True
+            break
+
+    # Final pass with converged potentials
+    backward = _propagate_backward(
+        indexed_problem, backend, log_terminal_backward,
+        underflow_floor=problem.sb_config.log_underflow_floor,
+    )
+    log_initial_forward = _safe_difference(
+        indexed_problem.log_pi0,
+        backward[0],
+        name="log_initial_forward",
+        underflow_floor=problem.sb_config.log_underflow_floor,
+    )
+    forward = _propagate_forward(
+        indexed_problem, backend, log_initial_forward,
+        underflow_floor=problem.sb_config.log_underflow_floor,
+    )
+
+    trace = SBConvergenceTrace(
+        iterations=iterations,
+        converged=converged,
+        final_max_delta=float(final_max_delta) if isfinite(final_max_delta) else 0.0,
+        residual_history=tuple(r.max_delta for r in history_records),
+    )
+    solution = SBSolution(
+        problem=problem,
+        log_forward_potentials=_tuplify_layers(forward),
+        log_backward_potentials=_tuplify_layers(backward),
+        trace=trace,
+    )
+    _, marginals = _compute_bridge_marginals_and_conditionals(solution)
+    solution = SBSolution(
+        problem=solution.problem,
+        log_forward_potentials=solution.log_forward_potentials,
+        log_backward_potentials=solution.log_backward_potentials,
+        trace=solution.trace,
+        marginals=marginals,
+    )
+    return solution, tuple(history_records)
+
+# SB-08 P4/4 — SBDiagnostics bundle and compute_sb_diagnostics
+
+@dataclass(frozen=True)
+class SBDiagnostics:
+    """All SB-08 diagnostic outputs for one solver run."""
+
+    node_marginals: SBNodeMarginals
+    edge_marginals: Optional[SBEdgeMarginals]
+    iteration_history: Optional[Tuple[SBIterationRecord, ...]]
+    converged: bool
+    iterations_run: int
+    final_max_delta: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node_marginals, SBNodeMarginals):
+            raise TypeError("node_marginals must be an SBNodeMarginals.")
+        if self.edge_marginals is not None and not isinstance(self.edge_marginals, SBEdgeMarginals):
+            raise TypeError("edge_marginals must be an SBEdgeMarginals or None.")
+        if self.iteration_history is not None:
+            history = tuple(self.iteration_history)
+            if any(not isinstance(r, SBIterationRecord) for r in history):
+                raise TypeError("iteration_history must contain only SBIterationRecord instances.")
+            object.__setattr__(self, "iteration_history", history)
+        if not isinstance(self.converged, bool):
+            raise TypeError("converged must be a bool.")
+        if not isinstance(self.iterations_run, int) or self.iterations_run < 0:
+            raise ValueError("iterations_run must be a non-negative int.")
+        if not isinstance(self.final_max_delta, (int, float)) or not isfinite(float(self.final_max_delta)):
+            raise ValueError("final_max_delta must be finite.")
+
+    def to_dict(self) -> dict:
+        return {
+            "converged": self.converged,
+            "iterations_run": self.iterations_run,
+            "final_max_delta": self.final_max_delta,
+            "node_marginals": self.node_marginals.to_dict(),
+            "edge_marginals": self.edge_marginals.to_dict() if self.edge_marginals is not None else None,
+            "iteration_history": (
+                [r.to_dict() for r in self.iteration_history]
+                if self.iteration_history is not None
+                else None
+            ),
+        }
+
+    def pretty(self) -> str:
+        edge_info = (
+            f"edge_buckets={len(self.edge_marginals.edge_marginals)}"
+            if self.edge_marginals is not None
+            else "edge_marginals=None"
+        )
+        history_info = (
+            f"history={len(self.iteration_history)}"
+            if self.iteration_history is not None
+            else "history=None"
+        )
+        return (
+            f"SBDiagnostics(converged={self.converged}, "
+            f"iterations={self.iterations_run}, "
+            f"residual={self.final_max_delta:.3e}, "
+            f"layers={len(self.node_marginals.marginals)}, "
+            f"{edge_info}, {history_info})"
+        )
+
+
+def compute_sb_diagnostics(
+    solution: SBSolution,
+    *,
+    include_edge_marginals: bool = False,
+    iteration_history: Optional[Tuple[SBIterationRecord, ...]] = None,
+) -> SBDiagnostics:
+    """Compute per-layer node marginals, optional edge marginals, and bundle diagnostics."""
+
+    if not isinstance(solution, SBSolution):
+        raise TypeError("solution must be an SBSolution.")
+
+    if iteration_history is not None:
+        history_tuple = tuple(iteration_history)
+        if any(not isinstance(r, SBIterationRecord) for r in history_tuple):
+            raise TypeError("iteration_history must contain only SBIterationRecord instances.")
+    else:
+        history_tuple = None  # type: ignore[assignment]
+
+    problem = solution.problem
+    layers = problem.graph.layers
+    edges_by_time = problem.graph.edges_by_time
+    log_phi = solution.log_forward_potentials
+    log_psi = solution.log_backward_potentials
+
+    # ---- shared helpers 
+    def _logsumexp(vals: Tuple[float, ...]) -> float:
+        finite = [v for v in vals if math.isfinite(v)]
+        if not finite:
+            return float("-inf")
+        m = max(finite)
+        return m + math.log(sum(math.exp(v - m) for v in finite))
+
+    def _normalize_log(log_unnorm: Tuple[float, ...]) -> Tuple[float, ...]:
+        lse = _logsumexp(log_unnorm)
+        if not math.isfinite(lse):
+            return tuple(float("-inf") for _ in log_unnorm)
+        return tuple(v - lse if math.isfinite(v) else float("-inf") for v in log_unnorm)
+
+    # ---- Part 1: node marginals 
+    all_log_marg: list[Tuple[float, ...]] = []
+    all_marg: list[Tuple[float, ...]] = []
+
+    for t, layer in enumerate(layers):
+        log_unnorm = tuple(
+            phi + psi for phi, psi in zip(log_phi[t], log_psi[t])
+        )
+        log_norm = _normalize_log(log_unnorm)
+        probs = tuple(
+            math.exp(lv) if math.isfinite(lv) else 0.0 for lv in log_norm
+        )
+        all_log_marg.append(log_norm)
+        all_marg.append(probs)
+
+    node_marginals = SBNodeMarginals(
+        marginals=tuple(all_marg),
+        log_marginals=tuple(all_log_marg),
+    )
+
+    # ---- Part 2: edge marginals (optional) 
+    edge_marginals_result: Optional[SBEdgeMarginals] = None
+    if include_edge_marginals:
+        all_buckets: list[Tuple[SBEdgeRecord, ...]] = []
+        for t, edge_group in enumerate(edges_by_time):
+            src_idx_map = {s: i for i, s in enumerate(layers[t].states)}
+            tgt_idx_map = {s: i for i, s in enumerate(layers[t + 1].states)}
+
+            log_unnorm_edges: list[float] = []
+            src_indices: list[int] = []
+            tgt_indices: list[int] = []
+            for edge in edge_group:
+                si = src_idx_map.get(edge.source, -1)
+                ti = tgt_idx_map.get(edge.target, -1)
+                if si < 0 or ti < 0:
+                    log_unnorm_edges.append(float("-inf"))
+                else:
+                    log_unnorm_edges.append(
+                        log_phi[t][si] + edge.log_weight + log_psi[t + 1][ti]
+                    )
+                src_indices.append(si)
+                tgt_indices.append(ti)
+
+            lse = _logsumexp(tuple(log_unnorm_edges))
+            bucket: list[SBEdgeRecord] = []
+            for log_val, si, ti in zip(log_unnorm_edges, src_indices, tgt_indices):
+                if math.isfinite(log_val) and math.isfinite(lse):
+                    log_m = log_val - lse
+                    prob = math.exp(log_m)
+                else:
+                    log_m = float("-inf")
+                    prob = 0.0
+                bucket.append(SBEdgeRecord(
+                    source_index=max(si, 0),
+                    target_index=max(ti, 0),
+                    marginal=prob,
+                    log_marginal=log_m,
+                ))
+            all_buckets.append(tuple(bucket))
+
+        edge_marginals_result = SBEdgeMarginals(edge_marginals=tuple(all_buckets))
+
+    # ---- Part 3 + 4: bundle 
+    return SBDiagnostics(
+        node_marginals=node_marginals,
+        edge_marginals=edge_marginals_result,
+        iteration_history=history_tuple,
+        converged=solution.trace.converged,
+        iterations_run=solution.trace.iterations,
+        final_max_delta=solution.trace.final_max_delta,
+    )

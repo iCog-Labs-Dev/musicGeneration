@@ -19,6 +19,12 @@ from aimusic.planning.sb import (
     sample_bridge_path,
     solved_bridge_from_solution,
     uniform_bridge_from_graph,
+    SBDiagnostics,
+    SBEdgeMarginals,
+    SBIterationRecord,
+    SBNodeMarginals,
+    compute_sb_diagnostics,
+    solve_sb_with_history,
 )
 
 
@@ -692,6 +698,483 @@ class TestBridgeTrajectoryExtraction(unittest.TestCase):
         for step in sample_a.debug:
             self.assertGreaterEqual(step["edge_probability"], 0.0)
             self.assertLessEqual(step["edge_probability"], 1.0)
+
+
+# ===========================================================================
+# SB-08: Marginals, iteration history, and convergence diagnostics
+# ===========================================================================
+
+
+class TestSBDiagnosticsNodeMarginals(unittest.TestCase):
+    """Node marginals are correctly derived from forward/backward potentials."""
+
+    def test_node_marginals_sum_to_one_per_layer(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        for t, layer_probs in enumerate(diag.node_marginals.marginals):
+            total = sum(layer_probs)
+            self.assertAlmostEqual(
+                total, 1.0, places=9,
+                msg=f"Layer {t} marginals do not sum to 1.0 (got {total}).",
+            )
+
+    def test_node_marginals_log_and_prob_are_consistent(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        for t, (log_layer, prob_layer) in enumerate(
+            zip(diag.node_marginals.log_marginals, diag.node_marginals.marginals)
+        ):
+            for i, (lv, pv) in enumerate(zip(log_layer, prob_layer)):
+                if math.isfinite(lv):
+                    self.assertAlmostEqual(
+                        math.exp(lv), pv, places=9,
+                        msg=f"Mismatch at layer {t}, node {i}: "
+                            f"exp({lv}) != {pv}.",
+                    )
+                else:
+                    self.assertEqual(
+                        pv, 0.0,
+                        msg=f"Layer {t}, node {i}: -inf log should map to 0.0 prob.",
+                    )
+
+    def test_node_marginals_shape_matches_graph_layers(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        layer_sizes = problem.diagnostics.layer_sizes
+        self.assertEqual(len(diag.node_marginals.marginals), len(layer_sizes))
+        for t, expected_size in enumerate(layer_sizes):
+            self.assertEqual(
+                len(diag.node_marginals.marginals[t]), expected_size,
+                msg=f"Layer {t} marginals size mismatch.",
+            )
+
+    def test_single_path_graph_marginals_are_all_one(self):
+        # On a chain graph with a single state per layer and uniform endpoints,
+        # every node marginal must be exactly 1.0.
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        for t, layer_probs in enumerate(diag.node_marginals.marginals):
+            for i, p in enumerate(layer_probs):
+                self.assertAlmostEqual(
+                    p, 1.0, places=9,
+                    msg=f"Layer {t}, node {i}: expected marginal 1.0, got {p}.",
+                )
+
+    def test_branching_graph_endpoint_marginals_match_piT(self):
+        # The final-layer marginals must match the piT probabilities.
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        final_probs = diag.node_marginals.marginals[-1]
+        expected = problem.piT.probabilities
+        for i, (got, exp) in enumerate(zip(final_probs, expected)):
+            self.assertAlmostEqual(
+                got, exp, places=6,
+                msg=f"Final layer node {i}: marginal {got} != piT prob {exp}.",
+            )
+
+    def test_branching_graph_initial_marginals_match_pi0(self):
+        # The first-layer marginals must match the pi0 probabilities.
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        initial_probs = diag.node_marginals.marginals[0]
+        expected = problem.pi0.probabilities
+        for i, (got, exp) in enumerate(zip(initial_probs, expected)):
+            self.assertAlmostEqual(
+                got, exp, places=6,
+                msg=f"Initial layer node {i}: marginal {got} != pi0 prob {exp}.",
+            )
+
+
+class TestSBDiagnosticsEdgeMarginals(unittest.TestCase):
+    """Edge marginals are correctly derived and structurally consistent."""
+
+    def test_edge_marginals_not_computed_by_default(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        self.assertIsNone(diag.edge_marginals)
+
+    def test_edge_marginals_computed_when_requested(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        self.assertIsNotNone(diag.edge_marginals)
+        self.assertIsInstance(diag.edge_marginals, SBEdgeMarginals)
+
+    def test_edge_marginals_bucket_count_matches_graph(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        expected_buckets = len(graph.edges_by_time)
+        self.assertEqual(
+            len(diag.edge_marginals.edge_marginals), expected_buckets,
+        )
+
+    def test_edge_marginals_count_per_bucket_matches_edges(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        for t, (edge_group, marginal_bucket) in enumerate(
+            zip(graph.edges_by_time, diag.edge_marginals.edge_marginals)
+        ):
+            self.assertEqual(
+                len(marginal_bucket), len(edge_group),
+                msg=f"Bucket {t}: edge count mismatch.",
+            )
+
+    def test_edge_marginals_are_non_negative(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        for t, bucket in enumerate(diag.edge_marginals.edge_marginals):
+            for em in bucket:
+                self.assertGreaterEqual(
+                    em.marginal, 0.0,
+                    msg=f"Bucket {t}: negative edge marginal {em.marginal}.",
+                )
+
+    def test_edge_marginals_sum_to_one_across_all_buckets(self):
+        # The sum of all edge marginals across all buckets should equal T
+        # (one unit of mass per time step), but since each bucket covers one
+        # transition, the sum over a single bucket equals the total node mass
+        # at the source layer (= 1.0).  We verify the per-bucket sum.
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        for t, bucket in enumerate(diag.edge_marginals.edge_marginals):
+            bucket_sum = sum(em.marginal for em in bucket)
+            self.assertAlmostEqual(
+                bucket_sum, 1.0, places=6,
+                msg=f"Bucket {t}: edge marginals sum to {bucket_sum}, expected 1.0.",
+            )
+
+    def test_edge_marginals_log_and_prob_consistent(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        for t, bucket in enumerate(diag.edge_marginals.edge_marginals):
+            for em in bucket:
+                if math.isfinite(em.log_marginal):
+                    self.assertAlmostEqual(
+                        math.exp(em.log_marginal), em.marginal, places=9,
+                        msg=f"Bucket {t}: log/prob mismatch for edge "
+                            f"({em.source_index}->{em.target_index}).",
+                    )
+                else:
+                    self.assertEqual(em.marginal, 0.0)
+
+    def test_single_path_graph_edge_marginals_are_all_one(self):
+        # On a chain with one state per layer, every edge marginal must be 1.0.
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        for t, bucket in enumerate(diag.edge_marginals.edge_marginals):
+            for em in bucket:
+                self.assertAlmostEqual(
+                    em.marginal, 1.0, places=9,
+                    msg=f"Bucket {t}: expected edge marginal 1.0, got {em.marginal}.",
+                )
+
+
+class TestSBDiagnosticsIterationHistory(unittest.TestCase):
+    """Iteration history is captured and structured correctly."""
+
+    def test_history_not_present_without_solve_with_history(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        self.assertIsNone(diag.iteration_history)
+
+    def test_solve_with_history_returns_solution_and_history(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        solution, history = solve_sb_with_history(problem)
+
+        self.assertIsInstance(solution, type(solve_sb(problem)))
+        self.assertIsInstance(history, tuple)
+        self.assertGreater(len(history), 0)
+
+    def test_history_records_are_sbiterationrecord_instances(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        _, history = solve_sb_with_history(problem)
+
+        for record in history:
+            self.assertIsInstance(record, SBIterationRecord)
+
+    def test_history_iteration_indices_are_sequential(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        _, history = solve_sb_with_history(problem)
+
+        for expected_idx, record in enumerate(history, start=1):
+            self.assertEqual(
+                record.iteration, expected_idx,
+                msg=f"Expected iteration {expected_idx}, got {record.iteration}.",
+            )
+
+    def test_history_max_deltas_are_finite_and_non_negative(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        _, history = solve_sb_with_history(problem)
+
+        for record in history:
+            self.assertTrue(
+                math.isfinite(record.max_delta),
+                msg=f"max_delta is not finite at iteration {record.iteration}.",
+            )
+            self.assertGreaterEqual(record.max_delta, 0.0)
+
+    def test_history_passed_to_diagnostics_is_accessible(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        solution, history = solve_sb_with_history(problem)
+        diag = compute_sb_diagnostics(solution, iteration_history=history)
+
+        self.assertIsNotNone(diag.iteration_history)
+        self.assertEqual(len(diag.iteration_history), len(history))
+
+    def test_history_length_matches_iterations_run(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        solution, history = solve_sb_with_history(problem)
+
+        self.assertEqual(len(history), solution.trace.iterations)
+
+    def test_history_final_delta_matches_solution_trace(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        solution, history = solve_sb_with_history(problem)
+
+        self.assertAlmostEqual(
+            history[-1].max_delta,
+            solution.trace.final_max_delta,
+            places=12,
+        )
+
+    def test_history_non_converging_case_has_max_iterations_records(self):
+        s0 = _state(0, 0)
+        s1a = _state(1, 1); s1b = _state(1, 2)
+        s2a = _state(2, 1); s2b = _state(2, 2)
+        s3 = _state(3, 0)
+        l0 = Layer(time_index=0, states=(s0,))
+        l1 = Layer(time_index=1, states=(s1a, s1b))
+        l2 = Layer(time_index=2, states=(s2a, s2b))
+        l3 = Layer(time_index=3, states=(s3,))
+        edges0 = (
+            Edge(0, s0, s1a, math.log(0.9)),
+            Edge(0, s0, s1b, math.log(0.1)),
+        )
+        edges1 = (
+            Edge(1, s1a, s2a, math.log(0.3)),
+            Edge(1, s1a, s2b, math.log(0.7)),
+            Edge(1, s1b, s2a, math.log(0.6)),
+            Edge(1, s1b, s2b, math.log(0.4)),
+        )
+        edges2 = (
+            Edge(2, s2a, s3, math.log(0.5)),
+            Edge(2, s2b, s3, math.log(0.5)),
+        )
+        from aimusic.planning.graph import GraphDiagnostics, LayerBuildDiagnostics
+        diag = GraphDiagnostics(
+            layer_sizes=(1, 2, 2, 1),
+            layer_diagnostics=tuple(
+                LayerBuildDiagnostics(
+                    time_index=t,
+                    source_state_count=1,
+                    raw_candidate_count=1,
+                    unique_candidate_count=1,
+                    kept_candidate_count=1,
+                    raw_edge_count=1,
+                    kept_edge_count=1,
+                )
+                for t in range(3)
+            ),
+        )
+        graph = SparseGraph(
+            layers=(l0, l1, l2, l3),
+            edges_by_time=(edges0, edges1, edges2),
+            diagnostics=diag,
+        )
+        pi0 = EndpointDistribution(layer=l0, probabilities=(1.0,))
+        piT = EndpointDistribution(layer=l3, probabilities=(1.0,))
+        problem = build_sb_problem(
+            graph, pi0, piT,
+            sb_config=SBConfig(horizon_t=3, max_iterations=3, tolerance=1e-300),
+        )
+
+        solution, history = solve_sb_with_history(problem)
+
+        self.assertFalse(solution.trace.converged)
+        self.assertEqual(len(history), 3)
+
+
+class TestSBDiagnosticsConvergenceFields(unittest.TestCase):
+    """Convergence metadata on SBDiagnostics mirrors the solution trace."""
+
+    def test_converged_field_mirrors_trace(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        self.assertEqual(diag.converged, solution.trace.converged)
+
+    def test_iterations_run_mirrors_trace(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        self.assertEqual(diag.iterations_run, solution.trace.iterations)
+
+    def test_final_max_delta_mirrors_trace(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        self.assertAlmostEqual(
+            diag.final_max_delta, solution.trace.final_max_delta, places=12,
+        )
+
+    def test_non_converged_solution_reflected_in_diagnostics(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(
+            graph, pi0, piT,
+            sb_config=SBConfig(horizon_t=2, max_iterations=1, tolerance=1e-15),
+        )
+        solution = solve_sb(problem)
+
+        diag = compute_sb_diagnostics(solution)
+
+        self.assertFalse(diag.converged)
+        self.assertEqual(diag.iterations_run, 1)
+
+
+class TestSBDiagnosticsValidation(unittest.TestCase):
+    """compute_sb_diagnostics rejects bad inputs cleanly."""
+
+    def test_rejects_non_solution_input(self):
+        with self.assertRaises(TypeError):
+            compute_sb_diagnostics("not a solution")  # type: ignore[arg-type]
+
+    def test_rejects_bad_iteration_history_entry(self):
+        graph, pi0, piT = _valid_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        with self.assertRaises(TypeError):
+            compute_sb_diagnostics(
+                solution,
+                iteration_history=("not a record",),  # type: ignore[arg-type]
+            )
+
+    def test_solve_with_history_rejects_non_problem(self):
+        with self.assertRaises(TypeError):
+            solve_sb_with_history("not a problem")  # type: ignore[arg-type]
+
+
+class TestSBDiagnosticsDeterminism(unittest.TestCase):
+    """Diagnostics are deterministic and pure."""
+
+    def test_compute_diagnostics_is_deterministic(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+        solution = solve_sb(problem)
+
+        first = compute_sb_diagnostics(solution, include_edge_marginals=True)
+        second = compute_sb_diagnostics(solution, include_edge_marginals=True)
+
+        self.assertEqual(
+            first.node_marginals.marginals,
+            second.node_marginals.marginals,
+        )
+        self.assertEqual(
+            first.edge_marginals.edge_marginals,
+            second.edge_marginals.edge_marginals,
+        )
+
+    def test_solve_with_history_is_deterministic(self):
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        sol1, hist1 = solve_sb_with_history(problem)
+        sol2, hist2 = solve_sb_with_history(problem)
+
+        self.assertEqual(sol1, sol2)
+        self.assertEqual(hist1, hist2)
+
+    def test_solve_with_history_matches_solve_sb(self):
+        # solve_sb_with_history must produce the same SBSolution as solve_sb.
+        graph, pi0, piT = _branching_graph()
+        problem = build_sb_problem(graph, pi0, piT)
+
+        plain_solution = solve_sb(problem)
+        history_solution, _ = solve_sb_with_history(problem)
+
+        self.assertEqual(plain_solution, history_solution)
 
 
 if __name__ == "__main__":
