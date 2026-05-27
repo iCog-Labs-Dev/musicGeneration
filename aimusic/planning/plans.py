@@ -732,8 +732,7 @@ class MethodBPlanResult:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for Method B
-
+# Internal helpers for Method B
 
 def _sb_config_for_leg(run_config: MethodBRunConfig, leg_beats: int) -> SBConfig:
     """Return an SBConfig whose horizon_t matches the leg length."""
@@ -1069,6 +1068,386 @@ def run_method_b(
         endpoints=endpoints,
         leg1=leg1,
         leg2=leg2,
+        path=path,
+        diagnostics=diagnostics,
+    )
+
+# ---------------------------------------------------------------------------
+# EPIC 10 — 2: Section-wise SB
+# (intro → theme → solo → bridge → return, one SB pass per section)
+
+@dataclass(frozen=True)
+class SectionResult:
+    """Outputs of one SB pass within a section-wise run."""
+
+    section: PlanningSection
+    graph: SparseGraph
+    sb_problem: SBProblem
+    sb_solution: SBSolution
+    bridge: SolvedBridge
+    path: Tuple[BeatState, ...]
+    path_score: Optional[float]
+    sampled_path: Optional[SampledBridgePath]
+    diagnostics: MethodBLegDiagnostics   # reused — label = section.name
+
+
+@dataclass(frozen=True)
+class SectionWisePlanDiagnostics:
+    """Diagnostics for a full section-wise planning run."""
+
+    section_count: int
+    section_tags: Tuple[str, ...]
+    target_tension_arcs: Tuple[Tuple[float, ...], ...]
+    endpoint_selection_mode: str
+    chosen_start_state: BeatState
+    chosen_end_state: BeatState
+    chosen_start_probability: float
+    chosen_end_probability: float
+    per_section: Tuple[MethodBLegDiagnostics, ...]
+    total_bridge_iterations: int
+    all_sections_converged: bool
+
+
+@dataclass(frozen=True)
+class SectionWisePlanResult:
+    """Full output of a section-wise Method A planning run."""
+
+    run_config: MethodARunConfig
+    vocabularies: Vocabularies
+    section_results: Tuple[SectionResult, ...]
+    path: Tuple[BeatState, ...]      # length == total_beats + 1
+    diagnostics: SectionWisePlanDiagnostics
+
+# ---------------------------------------------------------------------------
+# Internal helpers for section-wise planning
+# ---------------------------------------------------------------------------
+def _key_anchor_ids_from_config(
+    edo: int,
+    style_config: StyleConfig,
+    vocabularies: Vocabularies,
+) -> Tuple[int, ...]:
+    """Variant of _key_anchor_ids that takes explicit edo + style instead of run_config."""
+    fifth = get_fifth_steps(edo) % len(vocabularies.keys)
+    anchors = (0, fifth, len(vocabularies.keys) // 2)
+    return tuple(dict.fromkeys(anchor % len(vocabularies.keys) for anchor in anchors))
+
+
+def _build_section_endpoint_distribution(
+    *,
+    section: PlanningSection,
+    is_start: bool,
+    run_config: MethodARunConfig,
+    vocabularies: Vocabularies,
+) -> EndpointDistribution:
+    """Build an endpoint distribution for one boundary of a section."""
+    time_index = section.start_time if is_start else section.end_time
+    beat_positions: dict[int, int] = {}
+    for meter_id in _meter_ids(run_config.style_config, vocabularies):
+        beats_per_bar = vocabularies.meters.token_for_id(meter_id).beats_per_bar
+        beat_positions[meter_id] = time_index % beats_per_bar
+
+    plan_config = run_config.plan_config
+    groove_ids = _groove_anchor_ids(run_config.style_config, vocabularies)
+    key_ids = _key_anchor_ids(run_config, vocabularies)
+    role_ids = (0, 1) if is_start else (3, 2)
+    head_ids = (1, 2)
+    anchor_weight = (
+        plan_config.start_anchor_weight if is_start else plan_config.end_anchor_weight
+    )
+
+    scored_candidates: list[tuple[float, BeatState]] = []
+    for meter_id in _meter_ids(run_config.style_config, vocabularies):
+        beat_in_bar = beat_positions[meter_id]
+        boundary_level = _endpoint_boundary_level(is_start=is_start, beat_in_bar=beat_in_bar)
+        for key_id in key_ids:
+            for quality in ("maj", "min"):
+                chord_id = _chord_id_for(key_id, quality, vocabularies)
+                for role_id in role_ids:
+                    for head_id in head_ids:
+                        for groove_id in groove_ids:
+                            state = BeatState(
+                                meter_id=meter_id,
+                                beat_in_bar=beat_in_bar,
+                                boundary_lvl=boundary_level,
+                                key_id=key_id,
+                                chord_id=chord_id,
+                                role_id=role_id,
+                                head_id=head_id,
+                                groove_id=groove_id,
+                            )
+                            score = _candidate_score(
+                                state,
+                                is_start=is_start,
+                                boundary_level=boundary_level,
+                                primary_key_id=key_ids[0],
+                            ) + anchor_weight
+                            scored_candidates.append((score, state))
+
+    scored_candidates.sort(key=lambda item: (-item[0], _state_sort_key(item[1])))
+    unique_states: list[BeatState] = []
+    unique_scores: list[float] = []
+    seen: set[BeatState] = set()
+    for score, state in scored_candidates:
+        if state in seen:
+            continue
+        seen.add(state)
+        unique_states.append(state)
+        unique_scores.append(score)
+        if len(unique_states) >= plan_config.endpoint_top_k:
+            break
+
+    layer = Layer(time_index=time_index, states=tuple(unique_states))
+    return EndpointDistribution(
+        layer=layer,
+        probabilities=_softmax(unique_scores, plan_config.endpoint_temperature),
+    )
+
+
+def _run_section(
+    *,
+    section: PlanningSection,
+    start_state: BeatState,
+    end_state: BeatState,
+    run_config: MethodARunConfig,
+    resolved_vocabs: Vocabularies,
+    prior: Prior,
+    rng: np.random.Generator,
+    bridge_key: RNGKey,
+) -> SectionResult:
+    """Build graph, solve SB, and extract path for one named section."""
+    section_beats = section.end_time - section.start_time
+    sb_config = SBConfig(
+        horizon_t=section_beats,
+        **(
+            {
+                "max_iterations": run_config.sb_config.max_iterations,
+                "tolerance": run_config.sb_config.tolerance,
+                "temperature": run_config.sb_config.temperature,
+                "k_max": run_config.sb_config.k_max,
+                "d_max": run_config.sb_config.d_max,
+                "log_underflow_floor": run_config.sb_config.log_underflow_floor,
+                "raise_on_non_convergence": run_config.sb_config.raise_on_non_convergence,
+                "backend_selection": run_config.sb_config.backend_selection,
+            }
+            if run_config.sb_config is not None
+            else {}
+        ),
+    )
+
+    start_layer = Layer(time_index=section.start_time, states=(start_state,))
+    end_layer = Layer(time_index=section.end_time, states=(end_state,))
+
+    graph = build_sparse_graph(
+        start_layer=start_layer,
+        end_layer=end_layer,
+        total_beats=section_beats,
+        sb_config=sb_config,
+        style_config=run_config.style_config,
+        vocabularies=resolved_vocabs,
+        prior=prior,
+        weights=run_config.prior_weights,
+        edo=run_config.edo,
+        rng=rng,
+        d_max=sb_config.d_max,
+    )
+
+    pi0_sec = _singleton_endpoint_distribution(start_state, time_index=section.start_time)
+    piT_sec = _singleton_endpoint_distribution(end_state, time_index=section.end_time)
+    problem = build_sb_problem(graph, pi0_sec, piT_sec, sb_config=sb_config)
+    solution = solve_sb(problem)
+    bridge = solution.to_bridge()
+
+    if run_config.use_sampling:
+        sampled_path, _ = sample_bridge_path(
+            bridge, bridge_key, include_edges=True, include_debug=True
+        )
+        path = sampled_path.path
+        path_score = None
+    else:
+        path, path_score = map_bridge_path(bridge)
+        sampled_path = None
+
+    leg_diag = MethodBLegDiagnostics(
+        label=section.name,
+        start_time=section.start_time,
+        end_time=section.end_time,
+        graph_layer_sizes=graph.diagnostics.layer_sizes,
+        bridge_iterations=solution.trace.iterations,
+        bridge_converged=solution.trace.converged,
+        path_mode="sample" if run_config.use_sampling else "map",
+    )
+
+    return SectionResult(
+        section=section,
+        graph=graph,
+        sb_problem=problem,
+        sb_solution=solution,
+        bridge=bridge,
+        path=path,
+        path_score=path_score,
+        sampled_path=sampled_path,
+        diagnostics=leg_diag,
+    )
+
+
+def run_method_a_sectioned(
+    run_config: MethodARunConfig,
+    *,
+    prior: Optional[Prior] = None,
+    vocabularies: Optional[Vocabularies] = None,
+) -> SectionWisePlanResult:
+    """Run section-wise Method A: one SB pass per named section, chained."""
+    if run_config.plan_config.sectioning_strategy is not SectioningStrategy.SECTION_WISE:
+        raise ValueError(
+            "run_method_a_sectioned requires plan_config.sectioning_strategy == SECTION_WISE. "
+            "Use run_method_a for single-pass planning."
+        )
+    if len(run_config.plan_config.section_names) < 2:
+        raise ValueError(
+            "Section-wise planning requires at least two section_names."
+        )
+
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_prior: Prior = NullPrior() if prior is None else prior
+
+    sections = build_section_plan(run_config)
+    boundary_count = len(sections) + 1   # one state per boundary
+
+    # Derive independent RNG keys: one selection key, then pairs per section.
+    root_key = RNGKey(seed=run_config.seed)
+    all_keys = root_key.split(1 + 2 * len(sections))
+    selection_key = all_keys[0]
+    section_keys = [
+        (all_keys[1 + 2 * idx], all_keys[1 + 2 * idx + 1])
+        for idx in range(len(sections))
+    ]
+
+    # --- Build and choose one state per boundary -------------------------
+    # Boundaries: t_0, t_1, t_2, ..., t_N  (N+1 values for N sections)
+    # t_0  = sections[0].start_time  (global start)
+    # t_k  = sections[k-1].end_time == sections[k].start_time
+    # t_N  = sections[-1].end_time   (global end)
+
+    boundary_distributions: list[EndpointDistribution] = []
+
+    # First boundary (global start) — always is_start=True
+    boundary_distributions.append(
+        _build_section_endpoint_distribution(
+            section=sections[0],
+            is_start=True,
+            run_config=run_config,
+            vocabularies=resolved_vocabs,
+        )
+    )
+
+    # Interior boundaries: end of section[k-1] == start of section[k]
+    # We average end-of-section[k-1] and start-of-section[k] scores to
+    # find states that are good for both roles.
+    for idx in range(len(sections) - 1):
+        end_dist = _build_section_endpoint_distribution(
+            section=sections[idx],
+            is_start=False,
+            run_config=run_config,
+            vocabularies=resolved_vocabs,
+        )
+        start_dist = _build_section_endpoint_distribution(
+            section=sections[idx + 1],
+            is_start=True,
+            run_config=run_config,
+            vocabularies=resolved_vocabs,
+        )
+        # Merge: union of states, averaged probabilities (re-normalised)
+        all_states = list(
+            dict.fromkeys(end_dist.layer.states + start_dist.layer.states)
+        )
+        merged_scores = []
+        for state in all_states:
+            p_end = end_dist.probability_of(state)
+            p_start = start_dist.probability_of(state)
+            merged_scores.append((p_end + p_start) / 2.0)
+        total = sum(merged_scores) or 1.0
+        merged_probs = tuple(s / total for s in merged_scores)
+        time_index = sections[idx].end_time
+        boundary_distributions.append(
+            EndpointDistribution(
+                layer=Layer(time_index=time_index, states=tuple(all_states)),
+                probabilities=merged_probs,
+            )
+        )
+
+    # Last boundary (global end) — always is_start=False
+    boundary_distributions.append(
+        _build_section_endpoint_distribution(
+            section=sections[-1],
+            is_start=False,
+            run_config=run_config,
+            vocabularies=resolved_vocabs,
+        )
+    )
+
+    assert len(boundary_distributions) == boundary_count
+
+    # Choose one state at each boundary
+    chosen_states: list[BeatState] = []
+    current_key = selection_key
+    for dist in boundary_distributions:
+        choice, current_key = _choose_endpoint_state(
+            dist, key=current_key, sample=run_config.use_sampling
+        )
+        chosen_states.append(choice.state)
+
+    # --- Run one SB per section ------------------------------------------
+    section_results: list[SectionResult] = []
+    for idx, section in enumerate(sections):
+        graph_rng_key, bridge_key = section_keys[idx]
+        result = _run_section(
+            section=section,
+            start_state=chosen_states[idx],
+            end_state=chosen_states[idx + 1],
+            run_config=run_config,
+            resolved_vocabs=resolved_vocabs,
+            prior=resolved_prior,
+            rng=_numpy_generator_from_key(graph_rng_key),
+            bridge_key=bridge_key,
+        )
+        section_results.append(result)
+
+    # --- Concatenate paths -----------------------------------------------
+    joined: list[BeatState] = list(section_results[0].path)
+    for result in section_results[1:]:
+        joined.extend(result.path[1:])
+    path: Tuple[BeatState, ...] = tuple(joined)
+
+    # --- Diagnostics -----------------------------------------------
+    per_section_diag = tuple(r.diagnostics for r in section_results)
+    total_iterations = sum(d.bridge_iterations for d in per_section_diag)
+    all_converged = all(d.bridge_converged for d in per_section_diag)
+
+    start_choice_prob = boundary_distributions[0].probabilities[
+        boundary_distributions[0].layer.states.index(chosen_states[0])
+    ]
+    end_choice_prob = boundary_distributions[-1].probabilities[
+        boundary_distributions[-1].layer.states.index(chosen_states[-1])
+    ]
+
+    diagnostics = SectionWisePlanDiagnostics(
+        section_count=len(sections),
+        section_tags=tuple(s.name for s in sections),
+        target_tension_arcs=tuple(s.target_tension_arc for s in sections),
+        endpoint_selection_mode="sample" if run_config.use_sampling else "argmax",
+        chosen_start_state=chosen_states[0],
+        chosen_end_state=chosen_states[-1],
+        chosen_start_probability=start_choice_prob,
+        chosen_end_probability=end_choice_prob,
+        per_section=per_section_diag,
+        total_bridge_iterations=total_iterations,
+        all_sections_converged=all_converged,
+    )
+
+    return SectionWisePlanResult(
+        run_config=run_config,
+        vocabularies=resolved_vocabs,
+        section_results=tuple(section_results),
         path=path,
         diagnostics=diagnostics,
     )
