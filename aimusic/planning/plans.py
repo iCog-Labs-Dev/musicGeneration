@@ -606,3 +606,469 @@ def run_method_a(
         sampled_path=sampled_path,
         diagnostics=diagnostics,
     )
+
+
+# ---------------------------------------------------------------------------
+# EPIC 10 — 1: Method B  (start → midpoint → return, two SB passes)
+
+@dataclass(frozen=True)
+class MethodBRunConfig:
+    """
+    Run configuration for Method B: two-leg SB with an explicit midpoint.
+    """
+
+    total_beats: int
+    seed: int = 0
+    use_sampling: bool = False
+    style_config: StyleConfig = field(default_factory=StyleConfig)
+    prior_weights: PriorWeights = field(default_factory=PriorWeights)
+    sb_config: Optional[SBConfig] = None
+    decode_config: DecodeConfig = field(default_factory=DecodeConfig)
+    plan_config: PlanConfig = field(default_factory=lambda: PlanConfig(
+        method=PlanMethod.METHOD_B,
+        loop_midpoint=1,
+    ))
+    neural_prior_config: NeuralPriorConfig = field(default_factory=NeuralPriorConfig)
+    edo: int = 12
+
+    def __post_init__(self) -> None:
+        _require_int("total_beats", self.total_beats, minimum=2)
+        _require_int("seed", self.seed, minimum=0)
+        if not isinstance(self.use_sampling, bool):
+            raise TypeError("use_sampling must be a bool.")
+        if self.plan_config.method is not PlanMethod.METHOD_B:
+            raise ValueError("MethodBRunConfig requires plan_config.method == METHOD_B.")
+        midpoint = self.plan_config.loop_midpoint
+        if midpoint is None:
+            raise ValueError("plan_config.loop_midpoint must be set for Method B.")
+        if not (1 <= midpoint < self.total_beats):
+            raise ValueError(
+                f"loop_midpoint must satisfy 1 <= loop_midpoint < total_beats, "
+                f"got loop_midpoint={midpoint}, total_beats={self.total_beats}."
+            )
+        _require_int("edo", self.edo, minimum=1)
+
+    @property
+    def loop_midpoint(self) -> int:
+        """Convenience accessor for the validated midpoint beat index."""
+        return self.plan_config.loop_midpoint  # type: ignore[return-value]
+
+    @property
+    def leg1_beats(self) -> int:
+        """Number of beats in the first leg (start → midpoint)."""
+        return self.loop_midpoint
+
+    @property
+    def leg2_beats(self) -> int:
+        """Number of beats in the second leg (midpoint → return)."""
+        return self.total_beats - self.loop_midpoint
+
+
+@dataclass(frozen=True)
+class MethodBEndpoints:
+    """Endpoint distributions and choices for both Method B legs."""
+
+    pi0: EndpointDistribution      # start  (t=0)
+    piMid: EndpointDistribution    # midpoint (t=loop_midpoint), leg-1 terminal
+    piT: EndpointDistribution      # return (t=total_beats)
+    start_choice: EndpointChoice
+    mid_choice: EndpointChoice     # drawn from piMid; pinned as leg-2 start
+    end_choice: EndpointChoice
+    sections: Tuple[PlanningSection, ...]
+
+
+@dataclass(frozen=True)
+class MethodBLegDiagnostics:
+    """Per-leg solver summary for Method B diagnostics."""
+
+    label: str                          # "leg1" or "leg2"
+    start_time: int
+    end_time: int
+    graph_layer_sizes: Tuple[int, ...]
+    bridge_iterations: int
+    bridge_converged: bool
+    path_mode: str
+
+@dataclass(frozen=True)
+class MethodBPlanDiagnostics:
+    """Inspectable diagnostics for a full Method B planning run."""
+
+    chosen_start_state: BeatState
+    chosen_mid_state: BeatState
+    chosen_end_state: BeatState
+    endpoint_selection_mode: str
+    chosen_start_probability: float
+    chosen_mid_probability: float
+    chosen_end_probability: float
+    section_tags: Tuple[str, ...]
+    target_tension_arcs: Tuple[Tuple[float, ...], ...]
+    leg1: MethodBLegDiagnostics
+    leg2: MethodBLegDiagnostics
+
+
+@dataclass(frozen=True)
+class MethodBLegResult:
+    """Outputs of one SB leg within a Method B run."""
+    graph: SparseGraph
+    sb_problem: SBProblem
+    sb_solution: SBSolution
+    bridge: SolvedBridge
+    path: Tuple[BeatState, ...]
+    path_score: Optional[float]
+    sampled_path: Optional[SampledBridgePath]
+    diagnostics: MethodBLegDiagnostics
+
+
+@dataclass(frozen=True)
+class MethodBPlanResult:
+    """Full output of a Method B planning run."""
+    run_config: MethodBRunConfig
+    vocabularies: Vocabularies
+    endpoints: MethodBEndpoints
+    leg1: MethodBLegResult
+    leg2: MethodBLegResult
+    path: Tuple[BeatState, ...]        # len == total_beats + 1
+    diagnostics: MethodBPlanDiagnostics
+
+
+# ---------------------------------------------------------------------------
+# Helpers for Method B
+
+
+def _sb_config_for_leg(run_config: MethodBRunConfig, leg_beats: int) -> SBConfig:
+    """Return an SBConfig whose horizon_t matches the leg length."""
+    if run_config.sb_config is not None:
+        base = run_config.sb_config
+        # Re-stamp horizon_t to the leg length; all other knobs are preserved.
+        return SBConfig(
+            horizon_t=leg_beats,
+            max_iterations=base.max_iterations,
+            tolerance=base.tolerance,
+            temperature=base.temperature,
+            k_max=base.k_max,
+            d_max=base.d_max,
+            log_underflow_floor=base.log_underflow_floor,
+            raise_on_non_convergence=base.raise_on_non_convergence,
+            backend_selection=base.backend_selection,
+        )
+    return SBConfig(horizon_t=leg_beats)
+
+
+def _run_single_leg(
+    *,
+    start_state: BeatState,
+    end_state: BeatState,
+    start_time: int,
+    leg_beats: int,
+    sb_config: SBConfig,
+    run_config: MethodBRunConfig,
+    resolved_vocabs: Vocabularies,
+    prior: Prior,
+    rng: np.random.Generator,
+    bridge_key: RNGKey,
+    label: str,
+) -> MethodBLegResult:
+    """Build graph, solve SB, and extract path for one Method B leg."""
+    start_layer = Layer(time_index=start_time, states=(start_state,))
+    end_layer = Layer(time_index=start_time + leg_beats, states=(end_state,))
+
+    graph = build_sparse_graph(
+        start_layer=start_layer,
+        end_layer=end_layer,
+        total_beats=leg_beats,
+        sb_config=sb_config,
+        style_config=run_config.style_config,
+        vocabularies=resolved_vocabs,
+        prior=prior,
+        weights=run_config.prior_weights,
+        edo=run_config.edo,
+        rng=rng,
+        d_max=sb_config.d_max,
+    )
+
+    pi0_leg = _singleton_endpoint_distribution(start_state, time_index=start_time)
+    piT_leg = _singleton_endpoint_distribution(end_state, time_index=start_time + leg_beats)
+    problem = build_sb_problem(graph, pi0_leg, piT_leg, sb_config=sb_config)
+    solution = solve_sb(problem)
+    bridge = solution.to_bridge()
+
+    if run_config.use_sampling:
+        sampled_path, _ = sample_bridge_path(
+            bridge, bridge_key, include_edges=True, include_debug=True
+        )
+        path = sampled_path.path
+        path_score = None
+    else:
+        path, path_score = map_bridge_path(bridge)
+        sampled_path = None
+
+    leg_diag = MethodBLegDiagnostics(
+        label=label,
+        start_time=start_time,
+        end_time=start_time + leg_beats,
+        graph_layer_sizes=graph.diagnostics.layer_sizes,
+        bridge_iterations=solution.trace.iterations,
+        bridge_converged=solution.trace.converged,
+        path_mode="sample" if run_config.use_sampling else "map",
+    )
+
+    return MethodBLegResult(
+        graph=graph,
+        sb_problem=problem,
+        sb_solution=solution,
+        bridge=bridge,
+        path=path,
+        path_score=path_score,
+        sampled_path=sampled_path,
+        diagnostics=leg_diag,
+    )
+
+
+def _build_midpoint_distribution(
+    *,
+    run_config: MethodBRunConfig,
+    vocabularies: Vocabularies,
+) -> EndpointDistribution:
+    """Build a midpoint endpoint distribution at t=loop_midpoint."""
+    mid_time = run_config.loop_midpoint
+    plan_config = run_config.plan_config
+
+    # Build candidate scores treating the midpoint as an end-of-leg-1
+    end_scores: dict[BeatState, float] = {}
+    for meter_id in _meter_ids(run_config.style_config, vocabularies):
+        beats_per_bar = vocabularies.meters.token_for_id(meter_id).beats_per_bar
+        beat_in_bar = mid_time % beats_per_bar
+        boundary_level = _endpoint_boundary_level(is_start=False, beat_in_bar=beat_in_bar)
+        key_ids = _key_anchor_ids(run_config, vocabularies)
+        groove_ids = _groove_anchor_ids(run_config.style_config, vocabularies)
+        for key_id in key_ids:
+            for quality in ("maj", "min"):
+                chord_id = _chord_id_for(key_id, quality, vocabularies)
+                for role_id in (3, 2):      # cad / change — end-of-leg feel
+                    for head_id in (1, 2):
+                        for groove_id in groove_ids:
+                            state = BeatState(
+                                meter_id=meter_id,
+                                beat_in_bar=beat_in_bar,
+                                boundary_lvl=boundary_level,
+                                key_id=key_id,
+                                chord_id=chord_id,
+                                role_id=role_id,
+                                head_id=head_id,
+                                groove_id=groove_id,
+                            )
+                            end_scores[state] = _candidate_score(
+                                state,
+                                is_start=False,
+                                boundary_level=boundary_level,
+                                primary_key_id=key_ids[0],
+                            )
+
+    # Build candidate scores treating the midpoint as a start-of-leg-2
+    start_scores: dict[BeatState, float] = {}
+    for meter_id in _meter_ids(run_config.style_config, vocabularies):
+        beats_per_bar = vocabularies.meters.token_for_id(meter_id).beats_per_bar
+        beat_in_bar = mid_time % beats_per_bar
+        boundary_level = _endpoint_boundary_level(is_start=True, beat_in_bar=beat_in_bar)
+        key_ids = _key_anchor_ids(run_config, vocabularies)
+        groove_ids = _groove_anchor_ids(run_config.style_config, vocabularies)
+        for key_id in key_ids:
+            for quality in ("maj", "min"):
+                chord_id = _chord_id_for(key_id, quality, vocabularies)
+                for role_id in (0, 1):      # hold / prep — start-of-leg feel
+                    for head_id in (1, 2):
+                        for groove_id in groove_ids:
+                            state = BeatState(
+                                meter_id=meter_id,
+                                beat_in_bar=beat_in_bar,
+                                boundary_lvl=boundary_level,
+                                key_id=key_id,
+                                chord_id=chord_id,
+                                role_id=role_id,
+                                head_id=head_id,
+                                groove_id=groove_id,
+                            )
+                            start_scores[state] = _candidate_score(
+                                state,
+                                is_start=True,
+                                boundary_level=boundary_level,
+                                primary_key_id=key_ids[0],
+                            )
+
+    # Average scores for states that appear in both pools; keep union
+    all_states = set(end_scores) | set(start_scores)
+    combined: list[tuple[float, BeatState]] = []
+    for state in all_states:
+        score = (end_scores.get(state, 0.0) + start_scores.get(state, 0.0)) / 2.0
+        combined.append((score, state))
+
+    combined.sort(key=lambda item: (-item[0], _state_sort_key(item[1])))
+    top_k = plan_config.endpoint_top_k
+    combined = combined[:top_k]
+
+    states = tuple(state for _, state in combined)
+    scores = [score for score, _ in combined]
+    layer = Layer(time_index=mid_time, states=states)
+    return EndpointDistribution(
+        layer=layer,
+        probabilities=_softmax(scores, plan_config.endpoint_temperature),
+    )
+
+
+def generate_method_b_endpoints(
+    run_config: MethodBRunConfig,
+    *,
+    vocabularies: Optional[Vocabularies] = None,
+    selection_key: Optional[RNGKey] = None,
+    sample_endpoints: bool = False,
+) -> MethodBEndpoints:
+    """Build and select endpoint distributions for all three Method B anchors."""
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+
+    # Re-use Method A helpers for the outer endpoints.
+    # We construct a temporary MethodARunConfig purely to delegate to the
+    # existing distribution builders — no SB is run here.
+    _a_config = MethodARunConfig(
+        total_beats=run_config.total_beats,
+        seed=run_config.seed,
+        use_sampling=run_config.use_sampling,
+        style_config=run_config.style_config,
+        prior_weights=run_config.prior_weights,
+        decode_config=run_config.decode_config,
+        plan_config=PlanConfig(
+            method=PlanMethod.METHOD_A,
+            sectioning_strategy=SectioningStrategy.SINGLE_PASS,
+            endpoint_top_k=run_config.plan_config.endpoint_top_k,
+            endpoint_temperature=run_config.plan_config.endpoint_temperature,
+            start_anchor_weight=run_config.plan_config.start_anchor_weight,
+            end_anchor_weight=run_config.plan_config.end_anchor_weight,
+        ),
+        neural_prior_config=run_config.neural_prior_config,
+        edo=run_config.edo,
+    )
+
+    pi0 = generate_start_endpoint_distribution(_a_config, vocabularies=resolved_vocabs)
+    piT = generate_end_endpoint_distribution(_a_config, vocabularies=resolved_vocabs)
+    piMid = _build_midpoint_distribution(run_config=run_config, vocabularies=resolved_vocabs)
+
+    root_key = RNGKey(seed=run_config.seed) if selection_key is None else selection_key
+    start_key, mid_key, end_key = root_key.split(3)
+
+    start_choice, _ = _choose_endpoint_state(pi0, key=start_key, sample=sample_endpoints)
+    mid_choice, _ = _choose_endpoint_state(piMid, key=mid_key, sample=sample_endpoints)
+    end_choice, _ = _choose_endpoint_state(piT, key=end_key, sample=sample_endpoints)
+
+    # Build a two-section plan: leg1 and leg2.
+    sections = (
+        PlanningSection(
+            name="leg1",
+            start_time=0,
+            end_time=run_config.loop_midpoint,
+            boundary_level=2,
+            target_tension_arc=(0.2, 0.85, 0.5),
+        ),
+        PlanningSection(
+            name="leg2",
+            start_time=run_config.loop_midpoint,
+            end_time=run_config.total_beats,
+            boundary_level=3,
+            target_tension_arc=(0.5, 0.85, 0.2),
+        ),
+    )
+
+    return MethodBEndpoints(
+        pi0=pi0,
+        piMid=piMid,
+        piT=piT,
+        start_choice=start_choice,
+        mid_choice=mid_choice,
+        end_choice=end_choice,
+        sections=sections,
+    )
+
+
+def run_method_b(
+    run_config: MethodBRunConfig,
+    *,
+    prior: Optional[Prior] = None,
+    vocabularies: Optional[Vocabularies] = None,
+) -> MethodBPlanResult:
+    """Run Method B: two sequential SB passes joined at the midpoint."""
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_prior: Prior = NullPrior() if prior is None else prior
+
+    root_key = RNGKey(seed=run_config.seed)
+    endpoint_key, leg1_graph_key, leg1_bridge_key, leg2_graph_key, leg2_bridge_key = (
+        root_key.split(5)
+    )
+
+    endpoints = generate_method_b_endpoints(
+        run_config,
+        vocabularies=resolved_vocabs,
+        selection_key=endpoint_key,
+        sample_endpoints=run_config.use_sampling,
+    )
+
+    start_state = endpoints.start_choice.state
+    mid_state = endpoints.mid_choice.state
+    end_state = endpoints.end_choice.state
+
+    sb1 = _sb_config_for_leg(run_config, run_config.leg1_beats)
+    sb2 = _sb_config_for_leg(run_config, run_config.leg2_beats)
+
+    leg1 = _run_single_leg(
+        start_state=start_state,
+        end_state=mid_state,
+        start_time=0,
+        leg_beats=run_config.leg1_beats,
+        sb_config=sb1,
+        run_config=run_config,
+        resolved_vocabs=resolved_vocabs,
+        prior=resolved_prior,
+        rng=_numpy_generator_from_key(leg1_graph_key),
+        bridge_key=leg1_bridge_key,
+        label="leg1",
+    )
+
+    leg2 = _run_single_leg(
+        start_state=mid_state,
+        end_state=end_state,
+        start_time=run_config.loop_midpoint,
+        leg_beats=run_config.leg2_beats,
+        sb_config=sb2,
+        run_config=run_config,
+        resolved_vocabs=resolved_vocabs,
+        prior=resolved_prior,
+        rng=_numpy_generator_from_key(leg2_graph_key),
+        bridge_key=leg2_bridge_key,
+        label="leg2",
+    )
+
+    # Concatenate: leg1 gives beats 0..midpoint (inclusive),
+    # leg2 gives beats midpoint..total (inclusive).
+    # Drop leg2[0] because it duplicates leg1[-1] (both are mid_state).
+    path: Tuple[BeatState, ...] = leg1.path + leg2.path[1:]
+
+    diagnostics = MethodBPlanDiagnostics(
+        chosen_start_state=start_state,
+        chosen_mid_state=mid_state,
+        chosen_end_state=end_state,
+        endpoint_selection_mode=endpoints.start_choice.selection_mode,
+        chosen_start_probability=endpoints.start_choice.selected_probability,
+        chosen_mid_probability=endpoints.mid_choice.selected_probability,
+        chosen_end_probability=endpoints.end_choice.selected_probability,
+        section_tags=tuple(s.name for s in endpoints.sections),
+        target_tension_arcs=tuple(s.target_tension_arc for s in endpoints.sections),
+        leg1=leg1.diagnostics,
+        leg2=leg2.diagnostics,
+    )
+
+    return MethodBPlanResult(
+        run_config=run_config,
+        vocabularies=resolved_vocabs,
+        endpoints=endpoints,
+        leg1=leg1,
+        leg2=leg2,
+        path=path,
+        diagnostics=diagnostics,
+    )
