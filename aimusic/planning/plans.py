@@ -18,7 +18,7 @@ from aimusic.core.config import (
 from aimusic.core.core_types import BeatState, EndpointDistribution, Layer
 from aimusic.core.rng import RNGKey, random_unit
 from aimusic.core.vocab import DEFAULT_VOCABULARIES, Vocabularies, build_default_vocabularies
-from aimusic.planning.graph import SparseGraph, build_sparse_graph
+from aimusic.planning.graph import SparseGraph, StitchAnchor, build_sparse_graph
 from aimusic.planning.sb import (
     SBProblem,
     SBSolution,
@@ -1213,6 +1213,7 @@ def _run_section(
     prior: Prior,
     rng: np.random.Generator,
     bridge_key: RNGKey,
+    stitch_anchor: Optional[StitchAnchor] = None,
 ) -> SectionResult:
     """Build graph, solve SB, and extract path for one named section."""
     section_beats = section.end_time - section.start_time
@@ -1249,6 +1250,7 @@ def _run_section(
         edo=run_config.edo,
         rng=rng,
         d_max=sb_config.d_max,
+        stitch_anchor=stitch_anchor,
     )
 
     pi0_sec = _singleton_endpoint_distribution(start_state, time_index=section.start_time)
@@ -1400,6 +1402,17 @@ def run_method_a_sectioned(
     section_results: list[SectionResult] = []
     for idx, section in enumerate(sections):
         graph_rng_key, bridge_key = section_keys[idx]
+        # Build a soft stitch anchor from the previous section's terminal path state 
+        if idx == 0 or not section_results:
+            anchor: Optional[StitchAnchor] = None
+        else:
+            prev_path = section_results[-1].path
+            prev_terminal = prev_path[-1] if prev_path else None
+            anchor = (
+                StitchAnchor(prev_terminal=prev_terminal)
+                if prev_terminal is not None
+                else None
+            )
         result = _run_section(
             section=section,
             start_state=chosen_states[idx],
@@ -1409,10 +1422,13 @@ def run_method_a_sectioned(
             prior=resolved_prior,
             rng=_numpy_generator_from_key(graph_rng_key),
             bridge_key=bridge_key,
+            stitch_anchor=anchor,
         )
         section_results.append(result)
 
     # --- Concatenate paths -----------------------------------------------
+    # Each section path spans [t_start .. t_end] inclusive.
+    # Drop path[0] of every section except the first to avoid duplicates.
     joined: list[BeatState] = list(section_results[0].path)
     for result in section_results[1:]:
         joined.extend(result.path[1:])
