@@ -343,7 +343,7 @@ def _meter_ids(style_config: StyleConfig, vocabularies: Vocabularies) -> Tuple[i
     return tuple(dict.fromkeys(ids))
 
 
-def _key_anchor_ids(run_config: MethodARunConfig, vocabularies: Vocabularies) -> Tuple[int, ...]:
+def _key_anchor_ids(run_config: MethodARunConfig | MethodBRunConfig, vocabularies: Vocabularies) -> Tuple[int, ...]:
     fifth = get_fifth_steps(run_config.edo) % len(vocabularies.keys)
     anchors = (0, fifth, len(vocabularies.keys) // 2)
     return tuple(dict.fromkeys(anchor % len(vocabularies.keys) for anchor in anchors))
@@ -1217,23 +1217,9 @@ def _run_section(
 ) -> SectionResult:
     """Build graph, solve SB, and extract path for one named section."""
     section_beats = section.end_time - section.start_time
-    sb_config = SBConfig(
-        horizon_t=section_beats,
-        **(
-            {
-                "max_iterations": run_config.sb_config.max_iterations,
-                "tolerance": run_config.sb_config.tolerance,
-                "temperature": run_config.sb_config.temperature,
-                "k_max": run_config.sb_config.k_max,
-                "d_max": run_config.sb_config.d_max,
-                "log_underflow_floor": run_config.sb_config.log_underflow_floor,
-                "raise_on_non_convergence": run_config.sb_config.raise_on_non_convergence,
-                "backend_selection": run_config.sb_config.backend_selection,
-            }
-            if run_config.sb_config is not None
-            else {}
-        ),
-    )
+    import dataclasses
+    _base_sb = run_config.sb_config if run_config.sb_config is not None else SBConfig()
+    sb_config = dataclasses.replace(_base_sb, horizon_t=section_beats)
 
     start_layer = Layer(time_index=section.start_time, states=(start_state,))
     end_layer = Layer(time_index=section.end_time, states=(end_state,))
@@ -1681,7 +1667,7 @@ def extract_long_form_diagnostics(
 ) -> LongFormDiagnostics:
     """Extract a ``LongFormDiagnostics`` from any planning result type."""
     if isinstance(result, MethodAPlanResult):
-        summaries = (SectionSummary.from_method_a_result(result),)
+        summaries: tuple[SectionSummary, ...] = (SectionSummary.from_method_a_result(result),)
         return _long_form_diagnostics_from_summaries(
             method="method_a",
             total_beats=result.run_config.total_beats,
@@ -1813,7 +1799,7 @@ class ComparisonReport:
 
 
 def _run_one_arm(spec: ComparisonRunSpec) -> tuple[
-    "MethodAPlanResult | MethodBPlanResult | SectionWisePlanResult",
+    MethodAPlanResult | MethodBPlanResult | SectionWisePlanResult,
     LongFormDiagnostics,
 ]:
     """Dispatch to the correct runner for one comparison arm."""
@@ -1821,6 +1807,7 @@ def _run_one_arm(spec: ComparisonRunSpec) -> tuple[
     prior = spec.prior
     vocabs = spec.vocabularies
 
+    result: MethodAPlanResult | MethodBPlanResult | SectionWisePlanResult
     if isinstance(cfg, MethodBRunConfig):
         result = run_method_b(cfg, prior=prior, vocabularies=vocabs)
     elif isinstance(cfg, MethodARunConfig):
