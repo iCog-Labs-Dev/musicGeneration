@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import math
 
 from aimusic.core.config import (
     NeuralPriorConfig,
@@ -27,6 +28,15 @@ from aimusic.scoring.priors import (
 )
 from aimusic.core.vocab import DEFAULT_VOCABULARIES
 
+from aimusic.scoring.priors import (
+    NeuralPriorScoringStats,
+    NeuralPriorSession,
+    FactorizedStreamScorer,
+    open_neural_prior_session,
+    load_neural_prior,
+    _chunk,
+)
+from unittest.mock import MagicMock
 
 VOCABS = DEFAULT_VOCABULARIES
 
@@ -313,6 +323,252 @@ class TestPriorScoringIntegration(unittest.TestCase):
 
         self.assertEqual(batched, scalar)
 
+
+class TestNeuralPriorScoringStats(unittest.TestCase):
+    def test_model_fraction_zero_when_no_queries(self):
+        stats = NeuralPriorScoringStats()
+        self.assertAlmostEqual(stats.model_fraction, 0.0)
+
+    def test_model_fraction_correct(self):
+        stats = NeuralPriorScoringStats(total_queries=10, model_calls=7, placeholder_calls=3)
+        self.assertAlmostEqual(stats.model_fraction, 0.7)
+
+    def test_all_placeholder_gives_zero_fraction(self):
+        stats = NeuralPriorScoringStats(total_queries=8, model_calls=0, placeholder_calls=8)
+        self.assertAlmostEqual(stats.model_fraction, 0.0)
+
+    def test_all_model_gives_one(self):
+        stats = NeuralPriorScoringStats(total_queries=10, model_calls=10, placeholder_calls=0)
+        self.assertAlmostEqual(stats.model_fraction, 1.0)
+
+    def test_to_dict_has_required_keys(self):
+        d = NeuralPriorScoringStats(total_queries=5, model_calls=4, fallback_count=1).to_dict()
+        for key in ("total_queries", "model_calls", "placeholder_calls",
+                    "batch_count", "fallback_count", "model_fraction"):
+            self.assertIn(key, d)
+
+    def test_rejects_negative_counts(self):
+        with self.assertRaises((ValueError, TypeError)):
+            NeuralPriorScoringStats(total_queries=-1)
+
+
+class TestChunk(unittest.TestCase):
+    def test_even_split(self):
+        self.assertEqual(_chunk(list(range(6)), 2), [[0, 1], [2, 3], [4, 5]])
+
+    def test_uneven_split(self):
+        self.assertEqual(_chunk(list(range(5)), 2), [[0, 1], [2, 3], [4]])
+
+    def test_empty_input(self):
+        self.assertEqual(_chunk([], 3), [])
+
+    def test_size_larger_than_input(self):
+        self.assertEqual(_chunk([1, 2], 10), [[1, 2]])
+
+    def test_size_one(self):
+        self.assertEqual(_chunk([10, 20, 30], 1), [[10], [20], [30]])
+
+    def test_splits_12_into_3_batches_of_4(self):
+        result = _chunk(list(range(12)), 4)
+        self.assertEqual(len(result), 3)
+        self.assertTrue(all(len(c) == 4 for c in result))
+
+    def test_splits_10_into_3_batches(self):
+        result = _chunk(list(range(10)), 4)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[2], list(range(8, 10)))
+
+
+class TestNeuralPriorSession(unittest.TestCase):
+    def _make_session(self):
+        prior = NeuralPrior(config=NeuralPriorConfig())
+        return NeuralPriorSession(prior)
+
+    def test_finalize_seals_session(self):
+        session = self._make_session()
+        session.finalize()
+        s = state()
+        with self.assertRaises(RuntimeError):
+            session.score(s, s, 0)
+
+    def test_finalize_twice_raises(self):
+        session = self._make_session()
+        session.finalize()
+        with self.assertRaises(RuntimeError):
+            session.finalize()
+
+    def test_placeholder_mode_returns_finite_score(self):
+        session = self._make_session()
+        s = state()
+        logp = session.score(s, s, 0)
+        self.assertTrue(math.isfinite(logp))
+
+    def test_stats_total_matches_call_count(self):
+        session = self._make_session()
+        s = state()
+        for _ in range(5):
+            session.score(s, s, 0)
+        stats = session.finalize()
+        self.assertEqual(stats.total_queries, 5)
+
+    def test_batch_score_returns_correct_count(self):
+        from aimusic.scoring.priors import PriorQuery
+        session = self._make_session()
+        s = state()
+        queries = [PriorQuery(prev_state=s, next_state=s, time_index=i) for i in range(8)]
+        logps = session.score_batch(queries)
+        self.assertEqual(len(logps), 8)
+        self.assertTrue(all(math.isfinite(lp) for lp in logps))
+
+    def test_fallback_not_double_counted_in_factorized_mode(self):
+        from aimusic.scoring.priors import NeuralPriorManifest
+        bad_model = MagicMock()
+        bad_model.score_transition = MagicMock(side_effect=RuntimeError("bad"))
+        manifest = NeuralPriorManifest(
+            factorization_mode=PriorFactorization.FACTORIZED,
+            token_streams=("meter", "key"),
+        )
+        prior = NeuralPrior(
+            config=NeuralPriorConfig(factorization_mode=PriorFactorization.FACTORIZED),
+            manifest=manifest,
+            model=bad_model,
+        )
+        session = NeuralPriorSession(prior)
+        s = state()
+        session.score(s, s, 0)
+        stats = session.finalize()
+        # 2 streams both failed → fallback_count should be 2, not 4
+        self.assertEqual(stats.fallback_count, 2)
+
+    def test_score_and_batch_cannot_be_used_after_finalize(self):
+        session = self._make_session()
+        session.finalize()
+        s = state()
+        with self.assertRaises(RuntimeError):
+            session.score(s, s, 0)
+        session2 = self._make_session()
+        session2.finalize()
+        with self.assertRaises(RuntimeError):
+            session2.score_batch([])
+
+
+class TestLoadNeuralPrior(unittest.TestCase):
+    def test_returns_neural_prior_instance(self):
+        prior = load_neural_prior(NeuralPriorConfig())
+        self.assertIsInstance(prior, NeuralPrior)
+
+    def test_placeholder_when_no_model(self):
+        prior = load_neural_prior(NeuralPriorConfig(), model=None)
+        self.assertIsNone(prior.model)
+
+    def test_model_attached_when_provided(self):
+        model = MagicMock(spec=["score_transition"])
+        model.score_transition = MagicMock(return_value=0.0)
+        prior = load_neural_prior(NeuralPriorConfig(), model=model)
+        self.assertIs(prior.model, model)
+
+    def test_factorization_mismatch_raises(self):
+        from aimusic.scoring.priors import NeuralPriorManifest
+        config = NeuralPriorConfig(factorization_mode=PriorFactorization.FACTORIZED)
+        manifest = NeuralPriorManifest(factorization_mode=PriorFactorization.WHOLE_STATE)
+        with self.assertRaises(ValueError):
+            load_neural_prior(config, manifest_override=manifest)
+
+    def test_matching_modes_do_not_raise(self):
+        from aimusic.scoring.priors import NeuralPriorManifest
+        for mode in (PriorFactorization.FACTORIZED, PriorFactorization.WHOLE_STATE, PriorFactorization.MIXED):
+            config = NeuralPriorConfig(factorization_mode=mode)
+            manifest = NeuralPriorManifest(factorization_mode=mode)
+            prior = load_neural_prior(config, manifest_override=manifest)
+            self.assertIs(prior.manifest.factorization_mode, mode)
+
+
+class TestOpenNeuralPriorSession(unittest.TestCase):
+    def test_returns_session_instance(self):
+        prior = NeuralPrior(config=NeuralPriorConfig())
+        session = open_neural_prior_session(prior)
+        self.assertIsInstance(session, NeuralPriorSession)
+
+    def test_session_is_not_sealed(self):
+        prior = NeuralPrior(config=NeuralPriorConfig())
+        session = open_neural_prior_session(prior)
+        logp = session.score(state(), state(), 0)
+        self.assertTrue(math.isfinite(logp))
+
+    def test_each_call_returns_independent_session(self):
+        prior = NeuralPrior(config=NeuralPriorConfig())
+        self.assertIsNot(open_neural_prior_session(prior), open_neural_prior_session(prior))
+
+
+class TestFactorizedStreamScorer(unittest.TestCase):
+    def _make_query(self):
+        from aimusic.scoring.priors import (
+            TokenizedPriorQuery, StructuralEventTokens, StructuralTokenSequence,
+        )
+        event = StructuralEventTokens(0, 0, 0, 0, 0, 0, 0, 0)
+        return TokenizedPriorQuery(
+            prev_event=event, next_event=event, time_index=0,
+            history_tokens=StructuralTokenSequence(),
+            future_hint_tokens=StructuralTokenSequence(),
+            factorization_mode=PriorFactorization.FACTORIZED,
+        )
+
+    def test_sums_per_stream_scores(self):
+        model = MagicMock()
+        model.score_transition = MagicMock(return_value=0.5)
+        scorer = FactorizedStreamScorer(
+            model=model, active_streams=("meter", "key", "chord"), default_logp=0.0,
+        )
+        fallback = NeuralPrior(config=NeuralPriorConfig())
+        total, fb = scorer.score(self._make_query(), fallback_scorer=fallback)
+        self.assertAlmostEqual(total, 1.5)
+        self.assertEqual(fb, 0)
+        self.assertEqual(model.score_transition.call_count, 3)
+
+    def test_fallback_on_stream_exception(self):
+        model = MagicMock()
+        model.score_transition = MagicMock(side_effect=RuntimeError("dead"))
+        scorer = FactorizedStreamScorer(
+            model=model, active_streams=("meter", "key"), default_logp=0.0,
+        )
+        fallback = NeuralPrior(config=NeuralPriorConfig())
+        total, fb = scorer.score(self._make_query(), fallback_scorer=fallback)
+        self.assertEqual(fb, 2)
+        self.assertTrue(math.isfinite(total))
+
+    def test_rejects_empty_streams(self):
+        model = MagicMock(spec=["score_transition"])
+        model.score_transition = MagicMock(return_value=0.0)
+        with self.assertRaises(ValueError):
+            FactorizedStreamScorer(model=model, active_streams=())
+
+
+class TestPlaceholderAllFactorizationModes(unittest.TestCase):
+    """Placeholder-only (model=None) must return finite scores for every mode."""
+
+    def _run(self, mode):
+        from aimusic.scoring.priors import NeuralPriorManifest
+        config = NeuralPriorConfig(factorization_mode=mode)
+        manifest = NeuralPriorManifest(factorization_mode=mode)
+        prior = NeuralPrior(config=config, manifest=manifest, model=None)
+        session = NeuralPriorSession(prior)
+        s = state()
+        logp = session.score(s, s, 0)
+        stats = session.finalize()
+        self.assertTrue(math.isfinite(logp))
+        self.assertEqual(stats.total_queries, 1)
+        self.assertEqual(stats.model_calls, 0)
+        self.assertEqual(stats.placeholder_calls, 1)
+        self.assertAlmostEqual(stats.model_fraction, 0.0)
+
+    def test_placeholder_factorized(self):
+        self._run(PriorFactorization.FACTORIZED)
+
+    def test_placeholder_whole_state(self):
+        self._run(PriorFactorization.WHOLE_STATE)
+
+    def test_placeholder_mixed(self):
+        self._run(PriorFactorization.MIXED)
 
 if __name__ == "__main__":
     unittest.main()

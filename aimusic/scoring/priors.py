@@ -951,8 +951,7 @@ class NeuralPriorSession:
                 default_logp=prior.config.default_logp,
             )
             logp, fb = scorer.score(query, fallback_scorer=prior)
-            self._fallbacks += fb
-            return logp, fb 
+            return logp, fb
         
         
         elif mode is PriorFactorization.WHOLE_STATE:
