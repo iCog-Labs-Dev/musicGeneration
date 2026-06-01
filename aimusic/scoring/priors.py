@@ -733,3 +733,406 @@ def calculate_transition_log_weights(
 
 
 calculate_log_weight = calculate_transition_log_weight
+
+# ---------------------------------------------------------------------------
+# EPIC 10 - 5 : NeuralPrior integration
+@dataclass(frozen=True)
+class NeuralPriorScoringStats:
+    """Observability record for one NeuralPrior scoring session.
+
+    Attach this to a run result to understand whether the model was actually
+    called, how many batches were dispatched, and whether any fallbacks fired.
+
+    Attributes
+    ----------
+    total_queries:
+        Total number of (prev, next) transition pairs scored.
+    model_calls:
+        Number of queries routed to the real model (0 if placeholder only).
+    placeholder_calls:
+        Number of queries handled by the placeholder scorer.
+    batch_count:
+        Number of batches sent to ``score_transition_batch`` (0 for single
+        scoring or placeholder-only runs).
+    fallback_count:
+        Number of queries that fell back from model to placeholder after a
+        scoring exception.
+    factorization_mode:
+        The ``PriorFactorization`` used for this session.
+    """
+
+    total_queries: int = 0
+    model_calls: int = 0
+    placeholder_calls: int = 0
+    batch_count: int = 0
+    fallback_count: int = 0
+    factorization_mode: PriorFactorization = PriorFactorization.FACTORIZED
+
+    def __post_init__(self) -> None:
+        for name in ("total_queries", "model_calls", "placeholder_calls",
+                     "batch_count", "fallback_count"):
+            _require_int(name, getattr(self, name), minimum=0)
+        if not isinstance(self.factorization_mode, PriorFactorization):
+            raise TypeError("factorization_mode must be a PriorFactorization.")
+
+    @property
+    def model_fraction(self) -> float:
+        """Fraction of queries handled by the real model (0–1)."""
+        return self.model_calls / self.total_queries if self.total_queries > 0 else 0.0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "total_queries": self.total_queries,
+            "model_calls": self.model_calls,
+            "placeholder_calls": self.placeholder_calls,
+            "batch_count": self.batch_count,
+            "fallback_count": self.fallback_count,
+            "factorization_mode": self.factorization_mode.value,
+            "model_fraction": self.model_fraction,
+        }
+
+
+@dataclass(frozen=True)
+class FactorizedStreamScorer:
+    """Score a transition by summing per-stream log-probs from a factorized model.
+
+    In ``FACTORIZED`` mode a real model exposes one score per structural
+    dimension (meter, key, chord, …) and we sum them.  This class provides
+    the accumulation logic and a graceful per-stream fallback to the
+    placeholder when the model raises.
+
+    Each dimension is scored by calling ``model.score_transition`` with a
+    ``TokenizedPriorQuery`` that has *only* the relevant stream in its
+    factorization context — the model is expected to look at ``prev_event``
+    and ``next_event`` and return a per-stream log-prob.
+
+    If the model does not distinguish streams (i.e. ``score_transition``
+    always returns the same value regardless of which stream is requested),
+    this simply yields ``n_streams * model_score``.  The caller is expected
+    to configure a model that is truly factorized; this class enforces nothing
+    about the model internals.
+    """
+
+    model: NeuralPriorModel
+    active_streams: Tuple[str, ...]
+    default_logp: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model, NeuralPriorModel):
+            raise TypeError("model must satisfy the NeuralPriorModel protocol.")
+        if not self.active_streams:
+            raise ValueError("active_streams must not be empty.")
+        _require_real("default_logp", self.default_logp)
+
+    def score(
+        self,
+        query: TokenizedPriorQuery,
+        *,
+        fallback_scorer: "NeuralPrior",
+    ) -> tuple[float, int]:
+        """Return ``(total_log_prob, fallback_count)`` for *query*.
+
+        Each active stream is scored independently.  A per-stream exception
+        falls back to ``fallback_scorer._score_placeholder`` for that stream
+        only, so one bad dimension never silences all others.
+        """
+        total = 0.0
+        fallbacks = 0
+        for stream in self.active_streams:
+            stream_query = TokenizedPriorQuery(
+                prev_event=query.prev_event,
+                next_event=query.next_event,
+                time_index=query.time_index,
+                history_tokens=query.history_tokens,
+                future_hint_tokens=query.future_hint_tokens,
+                section_name=query.section_name,
+                metadata=(("stream", stream),) + query.metadata,
+                factorization_mode=PriorFactorization.FACTORIZED,
+            )
+            try:
+                total += float(self.model.score_transition(stream_query))
+            except Exception:
+                total += fallback_scorer._score_placeholder(stream_query)
+                fallbacks += 1
+        return total, fallbacks
+
+
+def _score_whole_state(
+    model: NeuralPriorModel,
+    query: TokenizedPriorQuery,
+    *,
+    default_logp: float,
+    fallback_scorer: "NeuralPrior",
+) -> tuple[float, int]:
+    """Score a query in WHOLE_STATE mode with exception fallback.
+
+    Returns ``(log_prob, fallback_count)`` where ``fallback_count`` is 1
+    if the model raised and 0 otherwise.
+    """
+    try:
+        return float(model.score_transition(query)), 0
+    except Exception:
+        return fallback_scorer._score_placeholder(query), 1
+
+
+def _score_mixed(
+    model: NeuralPriorModel,
+    query: TokenizedPriorQuery,
+    *,
+    active_streams: Tuple[str, ...],
+    default_logp: float,
+    fallback_scorer: "NeuralPrior",
+) -> tuple[float, int]:
+    """Score a query in MIXED mode: whole-state score plus per-stream deltas.
+
+    The whole-state score anchors the base log-prob; each stream adds a
+    small factorized correction.  Falls back per component on exception.
+    """
+    base, fb_base = _score_whole_state(
+        model, query, default_logp=default_logp, fallback_scorer=fallback_scorer
+    )
+    delta_query = TokenizedPriorQuery(
+        prev_event=query.prev_event,
+        next_event=query.next_event,
+        time_index=query.time_index,
+        history_tokens=query.history_tokens,
+        future_hint_tokens=query.future_hint_tokens,
+        section_name=query.section_name,
+        metadata=query.metadata,
+        factorization_mode=PriorFactorization.FACTORIZED,
+    )
+    stream_scorer = FactorizedStreamScorer(
+        model=model,
+        active_streams=active_streams,
+        default_logp=default_logp,
+    )
+    delta, fb_delta = stream_scorer.score(delta_query, fallback_scorer=fallback_scorer)
+    # Weight the factorized delta at 0.25 so it refines rather than dominates.
+    return base + 0.25 * delta, fb_base + fb_delta
+
+
+def _chunk(items: Sequence, size: int) -> list[list]:
+    if size <= 0:
+        raise ValueError("batch_size must be positive")
+    return [list(items[i:i + size]) for i in range(0, len(items), size)]
+
+
+class NeuralPriorSession:
+    """Stateful scoring session for a single graph-build or section pass.
+
+    ``NeuralPrior.logp_next`` and ``logp_next_batch`` are stateless — they
+    cannot accumulate stats across the many calls made during graph building.
+    This class wraps a ``NeuralPrior`` for one session, collects
+    ``NeuralPriorScoringStats``, and handles chunked batch dispatch so the
+    caller never has to think about ``batch_size``.
+
+    Usage
+    -----
+    ::
+
+        session = NeuralPriorSession(neural_prior)
+        for prev, next_, t, ctx in transitions:
+            logp = session.score(prev, next_, t, context=ctx)
+        stats = session.finalize()
+
+    Or for a batch::
+
+        logps = session.score_batch(queries)
+        stats = session.finalize()
+    """
+
+    def __init__(self, prior: "NeuralPrior") -> None:
+        if not isinstance(prior, NeuralPrior):
+            raise TypeError("prior must be a NeuralPrior.")
+        self._prior = prior
+        self._total = 0
+        self._model_calls = 0
+        self._placeholder_calls = 0
+        self._batch_count = 0
+        self._fallbacks = 0
+        self._finalized = False
+
+    def score(
+        self,
+        prev_state: BeatState,
+        next_state: BeatState,
+        t: int,
+        context: Optional[PriorContext] = None,
+    ) -> float:
+        """Score one transition, routing by factorization mode."""
+        if self._finalized:
+            raise RuntimeError("Session already finalized.")
+        self._total += 1
+        query = PriorQuery(
+            prev_state=prev_state, next_state=next_state,
+            time_index=t, context=context,
+        )
+        tokenized = query.tokenize(self._prior.manifest.factorization_mode)
+        logp, fallbacks = self._dispatch_single(tokenized)
+        self._fallbacks += fallbacks
+        return logp
+
+    def score_batch(self, queries: Sequence[PriorQuery]) -> Tuple[float, ...]:
+        """Score a batch of queries, chunking to ``config.batch_size``."""
+        if self._finalized:
+            raise RuntimeError("Session already finalized.")
+        query_items = tuple(queries)
+        self._total += len(query_items)
+        tokenized = tuple(
+            q.tokenize(self._prior.manifest.factorization_mode) for q in query_items
+        )
+        return self._dispatch_batch(tokenized)
+
+    def _dispatch_single(
+        self, query: TokenizedPriorQuery
+    ) -> tuple[float, int]:
+        """Route one tokenized query to the correct scoring path."""
+        prior = self._prior
+        mode = prior.manifest.factorization_mode
+
+        if prior.model is None:
+            self._placeholder_calls += 1
+            return prior._score_placeholder(query), 0
+
+        self._model_calls += 1
+        if mode is PriorFactorization.FACTORIZED:
+            scorer = FactorizedStreamScorer(
+                model=prior.model,
+                active_streams=prior.manifest.token_streams,
+                default_logp=prior.config.default_logp,
+            )
+            logp, fb = scorer.score(query, fallback_scorer=prior)
+            self._fallbacks += fb
+            return logp, fb 
+        
+        
+        elif mode is PriorFactorization.WHOLE_STATE:
+            return _score_whole_state(
+                prior.model, query,
+                default_logp=prior.config.default_logp,
+                fallback_scorer=prior,
+            )
+        else:  # MIXED
+            return _score_mixed(
+                prior.model, query,
+                active_streams=prior.manifest.token_streams,
+                default_logp=prior.config.default_logp,
+                fallback_scorer=prior,
+            )
+
+    def _dispatch_batch(
+        self, queries: Tuple[TokenizedPriorQuery, ...]
+    ) -> Tuple[float, ...]:
+        """Dispatch tokenized queries in chunks of ``batch_size``."""
+        prior = self._prior
+        mode = prior.manifest.factorization_mode
+        batch_size = prior.config.batch_size
+
+        # Placeholder-only path — no batching needed
+        if prior.model is None:
+            self._placeholder_calls += len(queries)
+            return tuple(prior._score_placeholder(q) for q in queries)
+
+        # Non-batch model or FACTORIZED/MIXED (scored stream-by-stream)
+        use_native_batch = (
+            prior.config.supports_batch_scoring
+            and prior.manifest.supports_batch_scoring
+            and isinstance(prior.model, BatchedNeuralPriorModel)
+            and mode is PriorFactorization.WHOLE_STATE
+        )
+
+        results: list[float] = []
+        for chunk in _chunk(queries, batch_size):
+            if use_native_batch:
+                self._batch_count += 1
+                self._model_calls += len(chunk)
+                try:
+                    scores = prior.model.score_transition_batch(tuple(chunk))  # type: ignore[attr-defined]
+                    if len(scores) != len(chunk):
+                        raise ValueError("score_transition_batch length mismatch.")
+                    results.extend(float(s) for s in scores)
+                except Exception:
+                    # Full chunk fallback
+                    self._fallbacks += len(chunk)
+                    self._model_calls -= len(chunk)
+                    self._placeholder_calls += len(chunk)
+                    results.extend(prior._score_placeholder(q) for q in chunk)
+            else:
+                # Per-query dispatch for FACTORIZED / MIXED or non-batched models
+                for q in chunk:
+                    logp, fb = self._dispatch_single(q)
+                    self._fallbacks += fb
+                    results.append(logp)
+        return tuple(results)
+
+    def finalize(self) -> NeuralPriorScoringStats:
+        """Return accumulated stats and mark the session as done."""
+        if self._finalized:
+            raise RuntimeError("Session already finalized.")
+        self._finalized = True
+        return NeuralPriorScoringStats(
+            total_queries=self._total,
+            model_calls=self._model_calls,
+            placeholder_calls=self._placeholder_calls,
+            batch_count=self._batch_count,
+            fallback_count=self._fallbacks,
+            factorization_mode=self._prior.manifest.factorization_mode,
+        )
+
+
+def load_neural_prior(
+    config: NeuralPriorConfig,
+    *,
+    model: Optional[NeuralPriorModel] = None,
+    manifest_override: Optional[NeuralPriorManifest] = None,
+) -> NeuralPrior:
+    """Factory: build a ready-to-use ``NeuralPrior`` from config + optional model.
+
+    If ``manifest_override`` is not provided and ``config.manifest_path`` is
+    set, the manifest is loaded from that path.  Otherwise a manifest shell is
+    derived from the config.
+
+    If ``model`` is None the prior runs in placeholder mode (STRUCTURED or
+    NEUTRAL per ``config.placeholder_mode``).
+
+    Parameters
+    ----------
+    config:
+        Runtime configuration from the caller.
+    model:
+        An object satisfying ``NeuralPriorModel`` (or ``BatchedNeuralPriorModel``).
+        Pass ``None`` to use the deterministic placeholder.
+    manifest_override:
+        An already-constructed manifest.  When provided, ``config.manifest_path``
+        is ignored.
+    """
+    if not isinstance(config, NeuralPriorConfig):
+        raise TypeError("config must be a NeuralPriorConfig.")
+    if model is not None and not isinstance(model, NeuralPriorModel):
+        raise TypeError("model must satisfy the NeuralPriorModel protocol or be None.")
+    if manifest_override is not None and not isinstance(manifest_override, NeuralPriorManifest):
+        raise TypeError("manifest_override must be a NeuralPriorManifest or None.")
+
+    if manifest_override is not None:
+        manifest = manifest_override
+    elif config.manifest_path is not None:
+        manifest = load_neural_prior_manifest(config.manifest_path)
+        # Validate alignment
+        if manifest.factorization_mode is not config.factorization_mode:
+            raise ValueError(
+                f"Loaded manifest factorization_mode={manifest.factorization_mode.value!r} "
+                f"does not match config factorization_mode={config.factorization_mode.value!r}."
+            )
+    else:
+        manifest = build_neural_prior_manifest(config)
+
+    return NeuralPrior(config=config, manifest=manifest, model=model)
+
+
+def open_neural_prior_session(prior: NeuralPrior) -> NeuralPriorSession:
+    """Convenience factory for a new scoring session on *prior*.
+
+    Equivalent to ``NeuralPriorSession(prior)`` but reads more naturally
+    at the call site in ``run_method_a`` / ``run_method_b``.
+    """
+    return NeuralPriorSession(prior)
