@@ -1467,3 +1467,459 @@ def run_method_a_sectioned(
         path=path,
         diagnostics=diagnostics,
     )
+    
+# ---------------------------------------------------------------------------
+# EPIC 10 — 6 & 7: Evaluation harness + section-level diagnostics
+
+# 7: Unified section-level summary that all three run paths emit \
+
+@dataclass(frozen=True)
+class SectionSummary:
+    """Normalised per-section diagnostic record."""
+
+    label: str
+    start_time: int
+    end_time: int
+    beat_count: int
+    graph_layer_sizes: Tuple[int, ...]
+    mean_layer_size: float
+    min_layer_size: int
+    max_layer_size: int
+    bridge_iterations: int
+    bridge_converged: bool
+    final_max_delta: float
+    path_mode: str
+    neighbor_cache_hit_rate: float = 0.0
+
+    @classmethod
+    def from_leg_result(cls, result: "MethodBLegResult") -> "SectionSummary":
+        """Build from a single Method B leg result."""
+        diag = result.diagnostics
+        sizes = diag.graph_layer_sizes
+        trace = result.sb_solution.trace
+        graph_diag = result.graph.diagnostics
+        return cls(
+            label=diag.label,
+            start_time=diag.start_time,
+            end_time=diag.end_time,
+            beat_count=diag.end_time - diag.start_time,
+            graph_layer_sizes=sizes,
+            mean_layer_size=sum(sizes) / len(sizes) if sizes else 0.0,
+            min_layer_size=min(sizes) if sizes else 0,
+            max_layer_size=max(sizes) if sizes else 0,
+            bridge_iterations=trace.iterations,
+            bridge_converged=trace.converged,
+            final_max_delta=trace.final_max_delta,
+            path_mode=diag.path_mode,
+            neighbor_cache_hit_rate=graph_diag.neighbor_cache_hit_rate,
+        )
+
+    @classmethod
+    def from_section_result(cls, result: "SectionResult") -> "SectionSummary":
+        """Build from a section-wise SectionResult."""
+        diag = result.diagnostics
+        sizes = diag.graph_layer_sizes
+        trace = result.sb_solution.trace
+        graph_diag = result.graph.diagnostics
+        return cls(
+            label=diag.label,
+            start_time=diag.start_time,
+            end_time=diag.end_time,
+            beat_count=diag.end_time - diag.start_time,
+            graph_layer_sizes=sizes,
+            mean_layer_size=sum(sizes) / len(sizes) if sizes else 0.0,
+            min_layer_size=min(sizes) if sizes else 0,
+            max_layer_size=max(sizes) if sizes else 0,
+            bridge_iterations=trace.iterations,
+            bridge_converged=trace.converged,
+            final_max_delta=trace.final_max_delta,
+            path_mode=diag.path_mode,
+            neighbor_cache_hit_rate=graph_diag.neighbor_cache_hit_rate,
+        )
+
+    @classmethod
+    def from_method_a_result(cls, result: "MethodAPlanResult") -> "SectionSummary":
+        """Build from a single-pass Method A result."""
+        diag = result.diagnostics
+        sizes = diag.graph_layer_sizes
+        trace = result.sb_solution.trace
+        graph_diag = result.graph.diagnostics
+        return cls(
+            label="full",
+            start_time=0,
+            end_time=len(result.path) - 1,
+            beat_count=len(result.path) - 1,
+            graph_layer_sizes=sizes,
+            mean_layer_size=sum(sizes) / len(sizes) if sizes else 0.0,
+            min_layer_size=min(sizes) if sizes else 0,
+            max_layer_size=max(sizes) if sizes else 0,
+            bridge_iterations=trace.iterations,
+            bridge_converged=trace.converged,
+            final_max_delta=trace.final_max_delta,
+            path_mode=diag.path_mode,
+            neighbor_cache_hit_rate=graph_diag.neighbor_cache_hit_rate,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "label": self.label,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "beat_count": self.beat_count,
+            "mean_layer_size": round(self.mean_layer_size, 2),
+            "min_layer_size": self.min_layer_size,
+            "max_layer_size": self.max_layer_size,
+            "bridge_iterations": self.bridge_iterations,
+            "bridge_converged": self.bridge_converged,
+            "final_max_delta": self.final_max_delta,
+            "path_mode": self.path_mode,
+            "neighbor_cache_hit_rate": round(self.neighbor_cache_hit_rate, 4),
+        }
+
+
+@dataclass(frozen=True)
+class LongFormDiagnostics:
+    """Top-level diagnostics for any long-form planning run."""
+
+    method: str
+    total_beats: int
+    total_sections: int
+    sections: Tuple[SectionSummary, ...]
+    all_sections_converged: bool
+    total_bridge_iterations: int
+    mean_bridge_iterations: float
+    total_graph_states: int
+    mean_neighbor_cache_hit_rate: float
+    path_length: int
+
+    @property
+    def converged_section_count(self) -> int:
+        return sum(1 for s in self.sections if s.bridge_converged)
+
+    @property
+    def slowest_section(self) -> Optional[SectionSummary]:
+        """Section with the most bridge iterations."""
+        return max(self.sections, key=lambda s: s.bridge_iterations) if self.sections else None
+
+    @property
+    def largest_section(self) -> Optional[SectionSummary]:
+        """Section with the highest max_layer_size."""
+        return max(self.sections, key=lambda s: s.max_layer_size) if self.sections else None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "method": self.method,
+            "total_beats": self.total_beats,
+            "total_sections": self.total_sections,
+            "all_sections_converged": self.all_sections_converged,
+            "total_bridge_iterations": self.total_bridge_iterations,
+            "mean_bridge_iterations": round(self.mean_bridge_iterations, 1),
+            "total_graph_states": self.total_graph_states,
+            "mean_neighbor_cache_hit_rate": round(self.mean_neighbor_cache_hit_rate, 4),
+            "path_length": self.path_length,
+            "sections": [s.to_dict() for s in self.sections],
+        }
+
+    def format_summary(self) -> str:
+        """Return a human-readable multi-line summary."""
+        lines = [
+            f"Method:             {self.method}",
+            f"Total beats:        {self.total_beats}",
+            f"Sections:           {self.total_sections}",
+            f"Path length:        {self.path_length}",
+            f"All converged:      {self.all_sections_converged}",
+            f"Total SB iters:     {self.total_bridge_iterations}",
+            f"Mean SB iters:      {self.mean_bridge_iterations:.1f}",
+            f"Total graph states: {self.total_graph_states}",
+            f"Cache hit rate:     {self.mean_neighbor_cache_hit_rate:.1%}",
+            "",
+            "Section breakdown:",
+        ]
+        for sec in self.sections:
+            conv = "✓" if sec.bridge_converged else "✗"
+            lines.append(
+                f"  [{conv}] {sec.label:20s}  "
+                f"beats={sec.beat_count:4d}  "
+                f"iters={sec.bridge_iterations:4d}  "
+                f"layers={sec.mean_layer_size:5.1f}avg  "
+                f"cache={sec.neighbor_cache_hit_rate:.0%}"
+            )
+        return "\n".join(lines)
+
+
+def _long_form_diagnostics_from_summaries(
+    method: str,
+    total_beats: int,
+    path_length: int,
+    sections: Tuple[SectionSummary, ...],
+) -> LongFormDiagnostics:
+    """Shared constructor for all three run paths."""
+    all_converged = all(s.bridge_converged for s in sections)
+    total_iters = sum(s.bridge_iterations for s in sections)
+    mean_iters = total_iters / len(sections) if sections else 0.0
+    total_states = sum(sum(s.graph_layer_sizes) for s in sections)
+    mean_cache = (
+        sum(s.neighbor_cache_hit_rate for s in sections) / len(sections)
+        if sections else 0.0
+    )
+    return LongFormDiagnostics(
+        method=method,
+        total_beats=total_beats,
+        total_sections=len(sections),
+        sections=sections,
+        all_sections_converged=all_converged,
+        total_bridge_iterations=total_iters,
+        mean_bridge_iterations=mean_iters,
+        total_graph_states=total_states,
+        mean_neighbor_cache_hit_rate=mean_cache,
+        path_length=path_length,
+    )
+
+
+def extract_long_form_diagnostics(
+    result: "MethodAPlanResult | MethodBPlanResult | SectionWisePlanResult",
+) -> LongFormDiagnostics:
+    """Extract a ``LongFormDiagnostics`` from any planning result type."""
+    if isinstance(result, MethodAPlanResult):
+        summaries = (SectionSummary.from_method_a_result(result),)
+        return _long_form_diagnostics_from_summaries(
+            method="method_a",
+            total_beats=result.run_config.total_beats,
+            path_length=len(result.path),
+            sections=summaries,
+        )
+
+    if isinstance(result, MethodBPlanResult):
+        summaries = (
+            SectionSummary.from_leg_result(result.leg1),
+            SectionSummary.from_leg_result(result.leg2),
+        )
+        return _long_form_diagnostics_from_summaries(
+            method="method_b",
+            total_beats=result.run_config.total_beats,
+            path_length=len(result.path),
+            sections=summaries,
+        )
+
+    if isinstance(result, SectionWisePlanResult):
+        summaries = tuple(
+            SectionSummary.from_section_result(r) for r in result.section_results
+        )
+        return _long_form_diagnostics_from_summaries(
+            method="section_wise",
+            total_beats=result.run_config.total_beats,
+            path_length=len(result.path),
+            sections=summaries,
+        )
+
+    raise TypeError(
+        f"Unsupported result type: {type(result).__name__}. "
+        "Expected MethodAPlanResult, MethodBPlanResult, or SectionWisePlanResult."
+    )
+
+
+# 6: Comparison harness
+
+@dataclass(frozen=True)
+class ComparisonRunSpec:
+    """Specification for one arm of a comparison experiment."""
+
+    label: str
+    run_config: "MethodARunConfig | MethodBRunConfig"
+    prior: Optional[Prior] = None
+    vocabularies: Optional[Vocabularies] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("label must be a non-empty string.")
+        if not isinstance(self.run_config, (MethodARunConfig, MethodBRunConfig)):
+            raise TypeError(
+                "run_config must be a MethodARunConfig or MethodBRunConfig."
+            )
+
+@dataclass(frozen=True)
+class ComparisonArmResult:
+    """Result of one arm within a comparison run."""
+
+    spec: ComparisonRunSpec
+    result: "MethodAPlanResult | MethodBPlanResult | SectionWisePlanResult"
+    diagnostics: LongFormDiagnostics
+    wall_seconds: float
+    error: Optional[str] = None       # set if the arm raised; result may be None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error is None
+
+@dataclass(frozen=True)
+class ComparisonReport:
+    """Aggregated result of a multi-arm comparison experiment."""
+
+    arms: Tuple[ComparisonArmResult, ...]
+    winner_label: Optional[str]
+    total_wall_seconds: float
+
+    @property
+    def successful_arms(self) -> Tuple[ComparisonArmResult, ...]:
+        return tuple(arm for arm in self.arms if arm.succeeded)
+
+    @property
+    def failed_arms(self) -> Tuple[ComparisonArmResult, ...]:
+        return tuple(arm for arm in self.arms if not arm.succeeded)
+
+    def format_summary(self) -> str:
+        """Return a human-readable comparison table."""
+        lines = [
+            f"Comparison: {len(self.arms)} arms  "
+            f"({len(self.successful_arms)} succeeded, "
+            f"{len(self.failed_arms)} failed)",
+            f"Total wall time: {self.total_wall_seconds:.2f}s",
+            f"Winner: {self.winner_label or 'none (no convergence)'}",
+            "",
+        ]
+        for arm in self.arms:
+            status = "OK " if arm.succeeded else "ERR"
+            if arm.succeeded:
+                diag = arm.diagnostics
+                lines.append(
+                    f"  [{status}] {arm.spec.label:30s}  "
+                    f"iters={diag.total_bridge_iterations:5d}  "
+                    f"converged={diag.all_sections_converged!s:5}  "
+                    f"states={diag.total_graph_states:6d}  "
+                    f"wall={arm.wall_seconds:.2f}s"
+                )
+            else:
+                lines.append(
+                    f"  [{status}] {arm.spec.label:30s}  "
+                    f"error={arm.error}"
+                )
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "winner_label": self.winner_label,
+            "total_wall_seconds": round(self.total_wall_seconds, 3),
+            "arms": [
+                {
+                    "label": arm.spec.label,
+                    "succeeded": arm.succeeded,
+                    "wall_seconds": round(arm.wall_seconds, 3),
+                    "error": arm.error,
+                    "diagnostics": arm.diagnostics.to_dict() if arm.succeeded else None,
+                }
+                for arm in self.arms
+            ],
+        }
+
+
+def _run_one_arm(spec: ComparisonRunSpec) -> tuple[
+    "MethodAPlanResult | MethodBPlanResult | SectionWisePlanResult",
+    LongFormDiagnostics,
+]:
+    """Dispatch to the correct runner for one comparison arm."""
+    cfg = spec.run_config
+    prior = spec.prior
+    vocabs = spec.vocabularies
+
+    if isinstance(cfg, MethodBRunConfig):
+        result = run_method_b(cfg, prior=prior, vocabularies=vocabs)
+    elif isinstance(cfg, MethodARunConfig):
+        if cfg.plan_config.sectioning_strategy is SectioningStrategy.SECTION_WISE:
+            result = run_method_a_sectioned(cfg, prior=prior, vocabularies=vocabs)
+        else:
+            result = run_method_a(cfg, prior=prior, vocabularies=vocabs)
+    else:
+        raise TypeError(f"Unsupported run_config type: {type(cfg).__name__}")
+
+    diag = extract_long_form_diagnostics(result)
+    return result, diag
+
+
+def run_comparison(
+    specs: Sequence[ComparisonRunSpec],
+    *,
+    raise_on_arm_error: bool = False,
+) -> ComparisonReport:
+    """Run multiple planning configurations and return a comparison report."""
+    import time
+
+    spec_list = list(specs)
+    if not spec_list:
+        raise ValueError("specs must contain at least one ComparisonRunSpec.")
+    if any(not isinstance(spec, ComparisonRunSpec) for spec in spec_list):
+        raise TypeError("specs must contain only ComparisonRunSpec instances.")
+
+    arm_results: list[ComparisonArmResult] = []
+    total_start = time.perf_counter()
+
+    for spec in spec_list:
+        arm_start = time.perf_counter()
+        try:
+            result, diag = _run_one_arm(spec)
+            wall = time.perf_counter() - arm_start
+            arm_results.append(
+                ComparisonArmResult(
+                    spec=spec,
+                    result=result,
+                    diagnostics=diag,
+                    wall_seconds=wall,
+                )
+            )
+        except Exception as exc:
+            if raise_on_arm_error:
+                raise
+            wall = time.perf_counter() - arm_start
+            # Build a stub diagnostics so the arm slot is never empty
+            stub_summary = SectionSummary(
+                label="error",
+                start_time=0,
+                end_time=0,
+                beat_count=0,
+                graph_layer_sizes=(),
+                mean_layer_size=0.0,
+                min_layer_size=0,
+                max_layer_size=0,
+                bridge_iterations=0,
+                bridge_converged=False,
+                final_max_delta=float("inf"),
+                path_mode="none",
+            )
+            stub_diag = LongFormDiagnostics(
+                method="error",
+                total_beats=0,
+                total_sections=0,
+                sections=(stub_summary,),
+                all_sections_converged=False,
+                total_bridge_iterations=0,
+                mean_bridge_iterations=0.0,
+                total_graph_states=0,
+                mean_neighbor_cache_hit_rate=0.0,
+                path_length=0,
+            )
+            arm_results.append(
+                ComparisonArmResult(
+                    spec=spec,
+                    result=None,         # type: ignore[arg-type]
+                    diagnostics=stub_diag,
+                    wall_seconds=wall,
+                    error=str(exc),
+                )
+            )
+
+    total_wall = time.perf_counter() - total_start
+
+    # Winner: fewest total bridge iterations among converging arms
+    converging = [
+        arm for arm in arm_results
+        if arm.succeeded and arm.diagnostics.all_sections_converged
+    ]
+    winner_label: Optional[str] = None
+    if converging:
+        winner = min(converging, key=lambda arm: arm.diagnostics.total_bridge_iterations)
+        winner_label = winner.spec.label
+
+    return ComparisonReport(
+        arms=tuple(arm_results),
+        winner_label=winner_label,
+        total_wall_seconds=total_wall,
+    )
