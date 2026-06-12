@@ -12,7 +12,13 @@ from aimusic.planning.candidates import (
 )
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Edge, Layer
-from aimusic.scoring.priors import NullPrior, Prior, PriorContext, calculate_transition_log_weight
+from aimusic.scoring.priors import (
+    NullPrior,
+    Prior,
+    PriorContext,
+    PriorQuery,
+    calculate_transition_log_weights,
+)
 from aimusic.theory.tonal import basic_space_distance, tonal_distance
 from aimusic.core.vocab import DEFAULT_VOCABULARIES, Vocabularies
 import numpy as np
@@ -505,8 +511,7 @@ def build_sparse_graph(
 
             raw_candidate_count += candidate_result.proposed_count
             rejected.extend(candidate_result.rejections)
-
-            source_edges = []
+            
             source_context = _build_prior_context(source_state, end_layer, current_time)
             is_first_step = (current_time == start_layer.time_index)
             stitch_bonus = (
@@ -514,26 +519,32 @@ def build_sparse_graph(
                 if stitch_anchor is not None and is_first_step
                 else 0.0
             )
-            for candidate_state in candidate_result.states:
-                raw_edge_count += 1
-                source_edges.append(
-                    Edge(
-                        time_index=current_time,
-                        source=source_state,
-                        target=candidate_state,
-                        log_weight=calculate_transition_log_weight(
-                            source_state,
-                            candidate_state,
-                            current_time,
-                            prior=resolved_prior,
-                            context=source_context,
-                            weights=weights,
-                            vocabularies=resolved_vocabs,
-                            edo=resolved_edo,
-                        ) + stitch_bonus,
-                    )
+            queries = tuple(
+                PriorQuery(
+                    prev_state=source_state,
+                    next_state=candidate_state,
+                    time_index=current_time,
+                    context=source_context,
                 )
-
+                for candidate_state in candidate_result.states
+            )
+            raw_edge_count += len(queries)
+            log_weights = calculate_transition_log_weights(
+                queries,
+                prior=resolved_prior,
+                weights=weights,
+                vocabularies=resolved_vocabs,
+                edo=resolved_edo,
+            )
+            source_edges = [
+                Edge(
+                    time_index=current_time,
+                    source=source_state,
+                    target=query.next_state,
+                    log_weight=log_weight + stitch_bonus,
+                )
+                for query, log_weight in zip(queries, log_weights)
+            ]
             source_edges.sort(
                 key=lambda edge: (
                     -_edge_priority_score(

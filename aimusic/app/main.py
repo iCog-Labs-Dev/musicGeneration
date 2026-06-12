@@ -1,12 +1,13 @@
+from __future__ import annotations
+
+from aimusic.app.cli import main as cli_main
 from aimusic.core.config import EDOConfig, MicrotonalRendering
 from aimusic.theory.edo import EDO
 from aimusic.theory.tonal import TonalSystem
 
 
-def main():
-    """Demonstrates the use of the EDO formalization."""
-
-    # 1. Configure and create a 12-EDO system
+def run_edo_demo() -> None:
+    """Legacy EDO demonstration kept as a separate helper."""
     print("--- 12-EDO System ---")
     config_12_edo = EDOConfig(n=12)
     edo_12 = EDO(config_12_edo)
@@ -16,10 +17,9 @@ def main():
     print(f"EDO System: {edo_12}")
     print(f"Tonal System: {tonal_system_12}")
 
-    # Demonstrate pitch calculations for 12-EDO
-    pitch_height_c4 = 0  # Middle C
-    pitch_height_g4 = 7  # G above Middle C
-    pitch_height_c5 = 12  # C one octave higher
+    pitch_height_c4 = 0
+    pitch_height_g4 = 7
+    pitch_height_c5 = 12
 
     print(f"Pitch height {pitch_height_c4} -> Pitch Class: {edo_12.pitch_class(pitch_height_c4)}")
     print(f"Pitch height {pitch_height_g4} -> Pitch Class: {edo_12.pitch_class(pitch_height_g4)}")
@@ -31,9 +31,11 @@ def main():
 
     print("\n" + "=" * 20 + "\n")
 
-    # 2. Configure and create a 19-EDO system
     print("--- 19-EDO System ---")
-    config_19_edo = EDOConfig(n=19, microtonal_rendering_method=MicrotonalRendering.MPE)
+    config_19_edo = EDOConfig(
+        n=19,
+        microtonal_rendering_method=MicrotonalRendering.MPE,
+    )
     edo_19 = EDO(config_19_edo)
     tonal_system_19 = TonalSystem(edo_19)
 
@@ -41,20 +43,31 @@ def main():
     print(f"EDO System: {edo_19}")
     print(f"Tonal System: {tonal_system_19}")
 
-    # Demonstrate pitch calculations for 19-EDO
-    # In 19-EDO, a "perfect fifth" is 11 steps.
     pitch_height_c4_19 = 0
     pitch_height_g4_19 = 11
     pitch_height_c5_19 = 19
 
-    print(f"Pitch height {pitch_height_c4_19} -> Pitch Class: {edo_19.pitch_class(pitch_height_c4_19)}")
-    print(f"Pitch height {pitch_height_g4_19} -> Pitch Class: {edo_19.pitch_class(pitch_height_g4_19)}")
-    print(f"Pitch height {pitch_height_c5_19} -> Pitch Class: {edo_19.pitch_class(pitch_height_c5_19)}")
+    print(
+        f"Pitch height {pitch_height_c4_19} -> Pitch Class: "
+        f"{edo_19.pitch_class(pitch_height_c4_19)}"
+    )
+    print(
+        f"Pitch height {pitch_height_g4_19} -> Pitch Class: "
+        f"{edo_19.pitch_class(pitch_height_g4_19)}"
+    )
+    print(
+        f"Pitch height {pitch_height_c5_19} -> Pitch Class: "
+        f"{edo_19.pitch_class(pitch_height_c5_19)}"
+    )
 
-    # Note how non-12-EDO pitches are mapped to MIDI note + pitch bend
     print(f"Pitch height {pitch_height_c4_19} -> MIDI: {edo_19.to_midi(pitch_height_c4_19)}")
     print(f"Pitch height {pitch_height_g4_19} -> MIDI: {edo_19.to_midi(pitch_height_g4_19)}")
     print(f"Pitch height {pitch_height_c5_19} -> MIDI: {edo_19.to_midi(pitch_height_c5_19)}")
+
+
+def main() -> None:
+    """Primary application entrypoint."""
+    cli_main()
 
 
 if __name__ == "__main__":

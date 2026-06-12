@@ -7,6 +7,7 @@ import numpy as np
 
 from aimusic.core.config import (
     DecodeConfig,
+    EDOConfig,
     NeuralPriorConfig,
     PlanConfig,
     PlanMethod,
@@ -15,9 +16,11 @@ from aimusic.core.config import (
     SectioningStrategy,
     StyleConfig,
 )
-from aimusic.core.core_types import BeatState, EndpointDistribution, Layer
+from aimusic.core.core_types import BeatState, EndpointDistribution, Layer, Score
 from aimusic.core.rng import RNGKey, random_unit
 from aimusic.core.vocab import DEFAULT_VOCABULARIES, Vocabularies, build_default_vocabularies
+from aimusic.decode import decode_path_to_score
+from aimusic.render import render_midi
 from aimusic.planning.graph import SparseGraph, StitchAnchor, build_sparse_graph
 from aimusic.planning.sb import (
     SBProblem,
@@ -30,6 +33,7 @@ from aimusic.planning.sb import (
     solve_sb,
 )
 from aimusic.scoring.priors import NullPrior, Prior
+from aimusic.theory.edo import EDO
 from aimusic.theory.tonal import get_fifth_steps
 
 
@@ -184,6 +188,15 @@ class MethodAPlanResult:
     path_score: Optional[float]
     sampled_path: Optional[SampledBridgePath]
     diagnostics: MethodAPlanDiagnostics
+
+
+@dataclass(frozen=True)
+class ExactBridgeDemoResult:
+    """Compatibility wrapper for legacy bridge-demo scripts."""
+
+    plan_result: MethodAPlanResult
+    score: Score
+    output_path: str
 
 
 def _resolved_vocabs(
@@ -1909,4 +1922,53 @@ def run_comparison(
         arms=tuple(arm_results),
         winner_label=winner_label,
         total_wall_seconds=total_wall,
+    )
+
+def render_exact_bridge_demo(
+    *,
+    start_chord: str,
+    end_chord: str,
+    output_path: str,
+    total_beats: int,
+    seed: int = 0,
+    meter: str = "4/4",
+    groove: str = "straight_8ths",
+    style_config: Optional[StyleConfig] = None,
+    decode_config: Optional[DecodeConfig] = None,
+    tempo_bpm: float = 120.0,
+    edo: int = 12,
+) -> ExactBridgeDemoResult:
+    """Render a short bridge example using the current Method A pipeline.
+
+    `start_chord`, `end_chord`, `meter`, and `groove` are accepted for compatibility with
+    legacy scripts. The current implementation delegates endpoint selection to Method A.
+    """
+    del start_chord, end_chord, meter, groove
+
+    resolved_style = StyleConfig() if style_config is None else style_config
+    resolved_decode = DecodeConfig() if decode_config is None else decode_config
+    run_config = MethodARunConfig(
+        total_beats=total_beats,
+        seed=seed,
+        style_config=resolved_style,
+        decode_config=resolved_decode,
+        edo=edo,
+    )
+    plan_result = run_method_a(run_config)
+    score = decode_path_to_score(
+        plan_result.path,
+        decode_config=resolved_decode,
+        vocabularies=plan_result.vocabularies,
+        edo=edo,
+        tempo_bpm=tempo_bpm,
+    )
+    render_midi(
+        score,
+        EDO(EDOConfig(n=edo, base_tuning=0)),
+        output_path,
+    )
+    return ExactBridgeDemoResult(
+        plan_result=plan_result,
+        score=score,
+        output_path=output_path,
     )
