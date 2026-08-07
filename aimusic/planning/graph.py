@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from functools import lru_cache
+from typing import Dict, FrozenSet, Optional, Tuple
 
 _logger = logging.getLogger(__name__)
 
@@ -52,6 +53,146 @@ def _resolved_prior(prior: Optional[Prior]) -> Prior:
 
 def _edo_size(vocabularies: Vocabularies) -> int:
     return len(vocabularies.keys)
+
+
+# ---------------------------------------------------------------------------
+# EPIC 10 — Ticket 4: Cached neighbor sets and memoized distances
+
+@lru_cache(maxsize=8192)
+def _cached_endpoint_distance(
+    src_chord_root: int,
+    src_chord_quality: str,
+    src_key_root: int,
+    src_boundary_lvl: int,
+    src_beat_in_bar: int,
+    src_meter_id: int,
+    src_role_id: int,
+    src_groove_id: int,
+    tgt_chord_root: int,
+    tgt_chord_quality: str,
+    tgt_key_root: int,
+    tgt_boundary_lvl: int,
+    tgt_beat_in_bar: int,
+    tgt_meter_id: int,
+    tgt_role_id: int,
+    tgt_groove_id: int,
+    edo: int,
+) -> float:
+    """Pure-value wrapper around the endpoint distance calculation."""
+    
+    harmonic = basic_space_distance(
+        src_chord_root, src_chord_quality,
+        tgt_chord_root, tgt_chord_quality,
+        edo,
+    )
+    tonal = tonal_distance(src_key_root, tgt_key_root, edo)
+    structural = (
+        abs(src_boundary_lvl - tgt_boundary_lvl)
+        + abs(src_beat_in_bar - tgt_beat_in_bar) * 0.25
+        + (0.5 if src_meter_id != tgt_meter_id else 0.0)
+        + (0.25 if src_role_id != tgt_role_id else 0.0)
+        + (0.15 if src_groove_id != tgt_groove_id else 0.0)
+    )
+    return float(harmonic + tonal + structural)
+
+
+def _fast_endpoint_distance(
+    state: BeatState,
+    end_layer: Layer,
+    vocabularies: Vocabularies,
+    edo: int,
+) -> float:
+    """Cached minimum distance from *state* to any state in *end_layer*."""
+    
+    if len(end_layer) == 0:
+        return 0.0
+
+    src_chord = vocabularies.chords.token_for_id(state.chord_id)
+    src_key = vocabularies.keys.token_for_id(state.key_id)
+
+    min_dist = float("inf")
+    for target in end_layer.states:
+        tgt_chord = vocabularies.chords.token_for_id(target.chord_id)
+        tgt_key = vocabularies.keys.token_for_id(target.key_id)
+        dist = _cached_endpoint_distance(
+            src_chord.root_pc, src_chord.quality,
+            src_key.root_pc,
+            state.boundary_lvl, state.beat_in_bar, state.meter_id,
+            state.role_id, state.groove_id,
+            tgt_chord.root_pc, tgt_chord.quality,
+            tgt_key.root_pc,
+            target.boundary_lvl, target.beat_in_bar, target.meter_id,
+            target.role_id, target.groove_id,
+            edo,
+        )
+        if dist < min_dist:
+            min_dist = dist
+    return min_dist
+
+
+class NeighborCache:
+    """Per-graph-build cache of legal BeatState successors."""
+
+    def __init__(self) -> None:
+        self._store: Dict[BeatState, FrozenSet[BeatState]] = {}
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def get(
+        self,
+        source: BeatState,
+        t: int,
+        *,
+        style_config: StyleConfig,
+        vocabularies: Vocabularies,
+        prior: "Prior",
+        context: Optional["PriorContext"],
+        rng: "np.random.Generator",
+        d_max: int,
+    ) -> "CandidateGenerationResult":
+        """Return valid successors of *source*, using the cache when possible."""
+        if source in self._store:
+            self.hits += 1
+            cached_states = tuple(
+                sorted(self._store[source], key=_state_sort_key)
+            )
+            return CandidateGenerationResult(
+                time_index=t,
+                source_state=source,
+                states=cached_states,
+                rejections=(),
+            )
+
+        self.misses += 1
+        result = get_valid_next_states(
+            source,
+            t,
+            rng=rng,
+            d_max=d_max,
+            style_config=style_config,
+            vocabularies=vocabularies,
+            prior=prior,
+            context=context,
+        )
+        self._store[source] = frozenset(result.states)
+        return result
+
+    @property
+    def size(self) -> int:
+        """Number of distinct source states currently cached."""
+        return len(self._store)
+
+    @property
+    def hit_rate(self) -> float:
+        """Cache hit rate as a fraction in [0, 1].  Returns 0 when empty."""
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
+
+    def clear(self) -> None:
+        """Evict all entries (e.g. between sections with different configs)."""
+        self._store.clear()
+        self.hits = 0
+        self.misses = 0
 
 
 def _estimate_endpoint_distance(
@@ -110,11 +251,11 @@ def _pruning_score(
         for endpoint in end_layer.states
     ):
         return float("-inf")
-    endpoint_distance = _estimate_endpoint_distance(
+    endpoint_distance = _fast_endpoint_distance(
         state,
         end_layer,
         vocabularies,
-        edo=edo,
+        edo if edo is not None else _edo_size(vocabularies),
     )
     horizon_scale = max(1, steps_remaining)
     return float(best_incoming_log_mass - (endpoint_distance / horizon_scale))
@@ -141,11 +282,11 @@ def _edge_priority_score(
     return float(
         edge.log_weight
         - (
-            _estimate_endpoint_distance(
+            _fast_endpoint_distance(
                 edge.target,
                 end_layer,
                 vocabularies,
-                edo=edo,
+                edo if edo is not None else _edo_size(vocabularies),
             )
             / max(1, steps_remaining)
         )
@@ -194,10 +335,18 @@ class GraphDiagnostics:
 
     layer_sizes: Tuple[int, ...]
     layer_diagnostics: Tuple[LayerBuildDiagnostics, ...]
+    neighbor_cache_hits: int = 0
+    neighbor_cache_misses: int = 0
 
     @property
     def total_rejections(self) -> int:
         return sum(len(item.rejected_proposals) for item in self.layer_diagnostics)
+
+    @property
+    def neighbor_cache_hit_rate(self) -> float:
+        """Fraction of candidate lookups served from the neighbor cache."""
+        total = self.neighbor_cache_hits + self.neighbor_cache_misses
+        return self.neighbor_cache_hits / total if total > 0 else 0.0
 
 
 @dataclass(frozen=True)
@@ -258,6 +407,32 @@ def _candidate_result_for_target_layer(
     )
 
 
+@dataclass(frozen=True)
+class StitchAnchor:
+    """Soft continuity constraint between adjacent sections."""
+
+    prev_terminal: BeatState
+    log_bonus: float = 1.5
+    match_key: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prev_terminal, BeatState):
+            raise TypeError("prev_terminal must be a BeatState.")
+        from math import isfinite
+        if not isinstance(self.log_bonus, (int, float)) or not isfinite(float(self.log_bonus)):
+            raise ValueError("log_bonus must be a finite real number.")
+        if not isinstance(self.match_key, bool):
+            raise TypeError("match_key must be a bool.")
+
+    def bonus_for(self, source: BeatState) -> float:
+        """Return the log-space bonus for *source* at the first step."""
+        if source == self.prev_terminal:
+            return float(self.log_bonus)
+        if self.match_key and source.key_id == self.prev_terminal.key_id:
+            return float(self.log_bonus) * 0.5   # half credit for key match only
+        return 0.0
+
+
 def build_sparse_graph(
     start_layer: Layer,
     end_layer: Layer,
@@ -270,7 +445,8 @@ def build_sparse_graph(
     weights: Optional[PriorWeights] = None,
     edo: Optional[int] = None,
     rng: np.random.Generator,
-    d_max: int
+    d_max: int,
+    stitch_anchor: Optional[StitchAnchor] = None,
 ) -> SparseGraph:
     """Build a bounded sparse graph of BeatState transitions."""
     if not isinstance(start_layer, Layer):
@@ -279,6 +455,8 @@ def build_sparse_graph(
         raise TypeError("end_layer must be a Layer.")
     if not isinstance(total_beats, int) or total_beats < 1:
         raise ValueError("total_beats must be >= 1.")
+    if stitch_anchor is not None and not isinstance(stitch_anchor, StitchAnchor):
+        raise TypeError("stitch_anchor must be a StitchAnchor or None.")
 
     resolved_sb = SBConfig() if sb_config is None else sb_config
     resolved_style = StyleConfig() if style_config is None else style_config
@@ -297,6 +475,7 @@ def build_sparse_graph(
     layers = [start_layer]
     edge_layers: list[Tuple[Edge, ...]] = []
     diagnostics: list[LayerBuildDiagnostics] = []
+    neighbor_cache = NeighborCache()
 
     for step in range(total_beats):
         current_layer = layers[-1]
@@ -322,21 +501,27 @@ def build_sparse_graph(
                     vocabularies=resolved_vocabs,
                 )
             else:
-                candidate_result = get_valid_next_states(
+                candidate_result = neighbor_cache.get(
                     source_state,
                     current_time,
                     style_config=resolved_style,
                     vocabularies=resolved_vocabs,
                     prior=resolved_prior,
                     context=_build_prior_context(source_state, end_layer, current_time),
-                    rng=rng, 
-                    d_max=d_max
+                    rng=rng,
+                    d_max=d_max,
                 )
 
             raw_candidate_count += candidate_result.proposed_count
             rejected.extend(candidate_result.rejections)
-
+            
             source_context = _build_prior_context(source_state, end_layer, current_time)
+            is_first_step = (current_time == start_layer.time_index)
+            stitch_bonus = (
+                stitch_anchor.bonus_for(source_state)
+                if stitch_anchor is not None and is_first_step
+                else 0.0
+            )
             queries = tuple(
                 PriorQuery(
                     prev_state=source_state,
@@ -359,7 +544,7 @@ def build_sparse_graph(
                     time_index=current_time,
                     source=source_state,
                     target=query.next_state,
-                    log_weight=log_weight,
+                    log_weight=log_weight + stitch_bonus,
                 )
                 for query, log_weight in zip(queries, log_weights)
             ]
@@ -466,5 +651,7 @@ def build_sparse_graph(
         diagnostics=GraphDiagnostics(
             layer_sizes=tuple(len(layer) for layer in layers),
             layer_diagnostics=tuple(diagnostics),
+            neighbor_cache_hits=neighbor_cache.hits,
+            neighbor_cache_misses=neighbor_cache.misses,
         ),
     )
