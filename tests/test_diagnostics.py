@@ -10,10 +10,10 @@ from unittest.mock import MagicMock
 from aimusic.core.diagnostics import (
     TimelineEvent, 
     StructuralDiagnostics, 
+    compute_tension_curve,
     RunManifest,
     SBDiagnostics
 )
-from aimusic.scoring.tension import TENSION_MODEL_VERSION
 # --- Math Pipeline Imports ---
 from aimusic.core.config import SBConfig, SBBackend
 from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
@@ -65,29 +65,22 @@ class TestDiagnostics(unittest.TestCase):
         self.assertEqual(data["groove_timeline"][0]["label"], "Swing")
         self.assertEqual(data["boundaries"], [0.0, 4.0])
 
-    def test_structural_diagnostics_carries_target_curve_and_deviation(self):
-        """The dead heuristic `compute_tension_curve` (tested against a
-        fictional role vocabulary) has been removed. Real tension curves now
-        come from aimusic.scoring.tension and StructuralDiagnostics must
-        carry both the realized and target curves plus a deviation report.
-        See tests/test_tension.py for the tension-model tests themselves.
-        """
-        struct = StructuralDiagnostics(
-            tension_curve=[(0.0, 0.2), (1.0, 0.6)],
-            target_tension_curve=[(0.0, 0.25), (1.0, 0.5)],
-            tension_deviation={"mean_absolute_error": 0.075},
-        )
-        data = struct.to_dict()
-
-        self.assertIn("target_tension_curve", data)
-        self.assertIn("tension_deviation", data)
-        self.assertEqual(data["target_tension_curve"], [(0.0, 0.25), (1.0, 0.5)])
-        self.assertEqual(data["tension_deviation"]["mean_absolute_error"], 0.075)
-
-    def test_run_manifest_carries_tension_model_version(self):
-        manifest = RunManifest(seed=1, config_dump={})
-        data = manifest.to_dict()
-        self.assertEqual(data["tension_model_version"], TENSION_MODEL_VERSION)
+    def test_compute_tension_curve(self):
+        """Tests the heuristic math mapping musical roles to tension floats."""
+        roles = [
+            TimelineEvent(0.0, 4.0, "Tonic"),
+            TimelineEvent(4.0, 8.0, "Subdominant"),
+            TimelineEvent(8.0, 12.0, "Dominant"),
+            TimelineEvent(12.0, 16.0, "Unknown") 
+        ]
+        
+        curve = compute_tension_curve(roles)
+        
+        self.assertEqual(len(curve), 4)
+        self.assertEqual(curve[0], (0.0, 0.1))
+        self.assertEqual(curve[1], (4.0, 0.5))
+        self.assertEqual(curve[2], (8.0, 0.9))
+        self.assertEqual(curve[3], (12.0, 0.5)) 
 
     def test_sb_diagnostics_extraction(self):
         """Tests that SB logs and Effective Entropy are correctly calculated from a solution."""
@@ -241,53 +234,123 @@ class TestDiagnostics(unittest.TestCase):
             self.assertEqual(len(notes), 3)
             self.assertEqual(notes[1].pitch_height, 64, "Regression: Pipeline picked wrong structural path")
 
-    def test_manifest_contains_target_realized_and_deviation_e2e(self):
-        """Acceptance criterion #3: manifests contain target and realized
-        tension curves plus deviation metrics, end to end through the real
-        Method A pipeline (not a mocked fixture)."""
-        from aimusic.app.cli import _build_structural_diagnostics
+    def test_manifest_serialization_deserialization_round_trip(self):
+        """Tests that RunManifest.to_dict() and RunManifest.from_dict() perform lossless round-trips."""
+        from aimusic.core.diagnostics import (
+            EndpointDiagnosticsData,
+            GraphDiagnosticsData,
+            LayerGraphStats,
+            PathDiagnosticsData,
+        )
+        graph_stats = GraphDiagnosticsData(
+            layer_sizes=[1, 4, 1],
+            per_layer_stats=[
+                LayerGraphStats(time_index=1, proposed=10, legal=8, scored=8, retained=4, pruned=2)
+            ],
+            rejection_summary={"illegal_step": 2},
+            pruning_summary={"k_max_prune": 2},
+            total_proposed=10,
+            total_legal=8,
+            total_scored=8,
+            total_retained=4,
+            total_pruned=2,
+        )
+        endpoint_stats = EndpointDiagnosticsData(pi0_support_size=1, piT_support_size=1, unreachable_probability_mass=0.0)
+        path_stats = PathDiagnosticsData(path_mode="map", path_score=-3.5, path_length=4)
+
+        manifest = RunManifest(
+            seed=42,
+            config_dump={"edo": 12},
+            graph_stats=graph_stats,
+            endpoint_stats=endpoint_stats,
+            path_stats=path_stats,
+        )
+        data = manifest.to_dict()
+
+        self.assertEqual(data["schema_version"], "1.0.0")
+        self.assertEqual(data["seed"], 42)
+
+        deserialized = RunManifest.from_dict(data)
+        self.assertEqual(deserialized.seed, 42)
+        self.assertEqual(deserialized.schema_version, "1.0.0")
+        self.assertEqual(deserialized.graph_stats.total_proposed, 10)
+        self.assertEqual(deserialized.graph_stats.rejection_summary, {"illegal_step": 2})
+        self.assertEqual(deserialized.endpoint_stats.pi0_support_size, 1)
+        self.assertEqual(deserialized.path_stats.path_score, -3.5)
+
+    def test_manifest_deserialization_invalid_or_missing_fields(self):
+        """Verifies that missing or invalid fields raise clear TypeError/ValueError exceptions."""
+        with self.assertRaises(TypeError):
+            RunManifest.from_dict("not a dict")  # type: ignore
+
+        with self.assertRaises(ValueError):
+            RunManifest.from_dict({})
+
+        with self.assertRaises(ValueError):
+            RunManifest.from_dict({"seed": 42})  # missing config
+
+    def test_manifest_unsupported_schema_version_rejected(self):
+        """Verifies that unsupported major schema versions are rejected."""
+        with self.assertRaises(ValueError):
+            RunManifest.from_dict({"seed": 42, "config": {}, "schema_version": "2.0.0"})
+
+        with self.assertRaises(ValueError):
+            RunManifest.from_dict({"seed": 42, "config": {}, "schema_version": "invalid"})
+
+    def test_manifest_older_schema_migration_safe(self):
+        """Verifies that older unversioned manifests and legacy pruned_nodes migrate safely."""
+        legacy_data = {
+            "seed": 100,
+            "config": {"meter": "4/4"},
+            "sb_stats": {
+                "converged": True,
+                "iterations_run": 5,
+                "final_max_delta": 1e-6,
+                "layer_sizes": [1, 2, 1],
+                "pruned_nodes": 4,  # legacy field
+                "effective_entropy": 0.5,
+            },
+        }
+
+        manifest = RunManifest.from_dict(legacy_data)
+        self.assertEqual(manifest.schema_version, "1.0.0")
+        self.assertEqual(manifest.seed, 100)
+        self.assertEqual(manifest.sb_stats.disconnected_nodes, 4)
+        self.assertEqual(manifest.sb_stats.pruned_nodes, 4)
+
+    def test_manifest_pruning_totals_match_graph_diagnostic_records(self):
+        """Verifies that manifest pruning totals exactly match the underlying graph build diagnostics."""
+        from aimusic.core.diagnostics import build_run_manifest
         from aimusic.planning.plans import MethodARunConfig, run_method_a
 
-        # seed=0 is used because not every seed produces a valid endpoint
-        # pairing for this small total_beats (pre-existing pipeline
-        # behavior, unrelated to tension diagnostics); seed=0 is stable.
-        run_config = MethodARunConfig(total_beats=6, seed=0)
-        plan_result = run_method_a(run_config)
+        config = MethodARunConfig(total_beats=4, seed=123)
+        plan_result = run_method_a(config)
+        manifest = build_run_manifest(plan_result, seed=123, config_dump={"test": True})
 
-        structural_stats = _build_structural_diagnostics(
-            plan_result.path,
-            plan_result.vocabularies,
-            edo=run_config.edo,
-            sections=plan_result.endpoints.sections,
+        expected_total_pruned = sum(
+            len(diag.pruned_states) for diag in plan_result.graph.diagnostics.layer_diagnostics
         )
-        manifest = RunManifest(seed=0, config_dump={}, structural_stats=structural_stats)
+        self.assertEqual(manifest.graph_stats.total_pruned, expected_total_pruned)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manifest_path = Path(tmpdir) / "manifest.json"
-            with manifest_path.open("w") as f:
-                json.dump(manifest.to_dict(), f)
-            with manifest_path.open() as f:
-                data = json.load(f)
+    def test_generated_manifest_includes_all_diagnostics(self):
+        """End-to-end verification that generated manifests include graph, endpoint, solver, and path info."""
+        from aimusic.core.diagnostics import build_run_manifest
+        from aimusic.planning.plans import MethodARunConfig, run_method_a
 
-        self.assertEqual(data["tension_model_version"], TENSION_MODEL_VERSION)
-        structure = data["structure"]
-        self.assertIn("tension_curve", structure)
-        self.assertIn("target_tension_curve", structure)
-        self.assertIn("tension_deviation", structure)
-        self.assertTrue(len(structure["tension_curve"]) > 0)
-        self.assertTrue(len(structure["target_tension_curve"]) > 0)
+        config = MethodARunConfig(total_beats=4, seed=777)
+        plan_result = run_method_a(config)
+        manifest = build_run_manifest(plan_result, seed=777, config_dump={"test": True})
 
-        deviation = structure["tension_deviation"]
-        for key in (
-            "mean_absolute_error",
-            "max_absolute_error",
-            "section_errors",
-            "target_peak_time",
-            "realized_peak_time",
-            "peak_timing_offset",
-            "shape_correlation",
-        ):
-            self.assertIn(key, deviation)
+        self.assertEqual(manifest.schema_version, "1.0.0")
+        self.assertEqual(manifest.seed, 777)
+        self.assertGreater(manifest.graph_stats.total_proposed, 0)
+        self.assertGreater(manifest.graph_stats.total_retained, 0)
+        self.assertGreater(manifest.endpoint_stats.pi0_support_size, 0)
+        self.assertGreater(manifest.endpoint_stats.piT_support_size, 0)
+        self.assertTrue(manifest.sb_stats.converged)
+        self.assertEqual(manifest.path_stats.path_mode, "map")
+        self.assertIsNotNone(manifest.path_stats.path_score)
+
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main()
