@@ -23,7 +23,7 @@ from aimusic.core.config import (
     MicrotonalRendering,
     StyleConfig,
 )
-from aimusic.core.diagnostics import RunManifest, SBDiagnostics
+from aimusic.core.diagnostics import RunManifest, SBDiagnostics, build_run_manifest
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, run_method_a
@@ -244,14 +244,9 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         edo=params.edo,
         tempo_bpm=params.tempo_bpm,
     )
-    structural_stats = _build_structural_diagnostics(
-        plan_result.path,
-        plan_result.vocabularies,
-        edo=params.edo,
-        sections=plan_result.endpoints.sections,
-    )
     track_instruments = _build_track_instruments(params)
-    manifest = RunManifest(
+    manifest = build_run_manifest(
+        plan_result,
         seed=params.seed,
         config_dump=_json_ready(
             {
@@ -265,8 +260,6 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
                 "track_instruments": track_instruments,
             }
         ),
-        structural_stats=structural_stats,
-        sb_stats=SBDiagnostics.from_solution(plan_result.sb_solution),
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
