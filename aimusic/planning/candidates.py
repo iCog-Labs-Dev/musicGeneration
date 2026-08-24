@@ -596,18 +596,24 @@ def get_valid_next_states(
         resolved_edo,
     )
 
-    # 3. Consume generator, breaking immediately upon reaching D_max capacity
+    # 3. Consume generator, recording rejections/deduplications/pruning
     for candidate in candidate_gen:
         if len(accepted) >= d_max:
-            break
+            rejections.append(
+                CandidateRejection(
+                    time_index=t,
+                    source_state=prev_state,
+                    candidate_state=candidate,
+                    reason="outdegree_pruning",
+                )
+            )
+            continue
 
         legal, reason = is_legal_transition(
             prev_state, candidate, resolved_style, resolved_vocabs
         )
 
-        if legal:
-            accepted.add(candidate)
-        else:
+        if not legal:
             rejections.append(
                 CandidateRejection(
                     time_index=t,
@@ -616,6 +622,17 @@ def get_valid_next_states(
                     reason=reason or "illegal_transition",
                 )
             )
+        elif candidate in accepted:
+            rejections.append(
+                CandidateRejection(
+                    time_index=t,
+                    source_state=prev_state,
+                    candidate_state=candidate,
+                    reason="duplicate_proposal",
+                )
+            )
+        else:
+            accepted.add(candidate)
 
     return CandidateGenerationResult(
         time_index=t,

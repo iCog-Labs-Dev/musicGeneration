@@ -383,7 +383,17 @@ def build_sparse_graph(
                 )
             )
             if len(source_edges) > resolved_sb.d_max:
-                outdegree_pruned_count += len(source_edges) - resolved_sb.d_max
+                excess_edges = source_edges[resolved_sb.d_max :]
+                outdegree_pruned_count += len(excess_edges)
+                for edge in excess_edges:
+                    rejected.append(
+                        CandidateRejection(
+                            time_index=current_time,
+                            source_state=source_state,
+                            candidate_state=edge.target,
+                            reason="outdegree_pruning",
+                        )
+                    )
             trimmed_edges = source_edges[: resolved_sb.d_max]
             kept_edges.extend(trimmed_edges)
             for edge in trimmed_edges:
