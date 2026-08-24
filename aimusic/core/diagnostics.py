@@ -7,6 +7,36 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SCHEMA_VERSION = "1.0.0"
 
+def _val_dict(val: Any, field_name: str) -> Dict[str, Any]:
+    if not isinstance(val, dict):
+        raise TypeError(f"{field_name} must be a dict, got {type(val).__name__}.")
+    return val
+
+def _val_list(val: Any, field_name: str) -> List[Any]:
+    if not isinstance(val, list):
+        raise TypeError(f"{field_name} must be a list, got {type(val).__name__}.")
+    return val
+
+def _val_int(val: Any, field_name: str) -> int:
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise TypeError(f"{field_name} must be an int, got {type(val).__name__}.")
+    return val
+
+def _val_float(val: Any, field_name: str) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise TypeError(f"{field_name} must be a float, got {type(val).__name__}.")
+    return float(val)
+
+def _val_bool(val: Any, field_name: str) -> bool:
+    if not isinstance(val, bool):
+        raise TypeError(f"{field_name} must be a bool, got {type(val).__name__}.")
+    return val
+
+def _val_str(val: Any, field_name: str) -> str:
+    if not isinstance(val, str):
+        raise TypeError(f"{field_name} must be a str, got {type(val).__name__}.")
+    return val
+
 @dataclass(frozen=True)
 class TimelineEvent:
     start_time: float
@@ -34,15 +64,29 @@ class StructuralDiagnostics:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "StructuralDiagnostics":
-        if not isinstance(data, dict):
-            raise TypeError("StructuralDiagnostics data must be a dict.")
+        _val_dict(data, "StructuralDiagnostics data")
+
+        def _parse_event(e: Any, name: str) -> TimelineEvent:
+            _val_dict(e, name)
+            return TimelineEvent(
+                start_time=_val_float(e.get("start_time"), f"{name}.start_time"),
+                end_time=_val_float(e.get("end_time"), f"{name}.end_time"),
+                label=_val_str(e.get("label"), f"{name}.label"),
+            )
+
+        def _parse_tension_pair(t: Any, idx: int) -> Tuple[float, float]:
+            _val_list(t, f"tension_curve[{idx}]")
+            if len(t) != 2:
+                raise TypeError(f"tension_curve[{idx}] must be a 2-element list.")
+            return (_val_float(t[0], f"tension_curve[{idx}][0]"), _val_float(t[1], f"tension_curve[{idx}][1]"))
+
         return cls(
-            key_timeline=[TimelineEvent(**e) for e in data.get("key_timeline", [])],
-            chord_timeline=[TimelineEvent(**e) for e in data.get("chord_timeline", [])],
-            role_timeline=[TimelineEvent(**e) for e in data.get("role_timeline", [])],
-            groove_timeline=[TimelineEvent(**e) for e in data.get("groove_timeline", [])],
-            boundaries=[float(b) for b in data.get("boundaries", [])],
-            tension_curve=[(float(t[0]), float(t[1])) for t in data.get("tension_curve", [])],
+            key_timeline=[_parse_event(e, "key_timeline") for e in _val_list(data.get("key_timeline", []), "key_timeline")],
+            chord_timeline=[_parse_event(e, "chord_timeline") for e in _val_list(data.get("chord_timeline", []), "chord_timeline")],
+            role_timeline=[_parse_event(e, "role_timeline") for e in _val_list(data.get("role_timeline", []), "role_timeline")],
+            groove_timeline=[_parse_event(e, "groove_timeline") for e in _val_list(data.get("groove_timeline", []), "groove_timeline")],
+            boundaries=[_val_float(b, "boundaries item") for b in _val_list(data.get("boundaries", []), "boundaries")],
+            tension_curve=[_parse_tension_pair(t, idx) for idx, t in enumerate(_val_list(data.get("tension_curve", []), "tension_curve"))],
         )
 
 @dataclass
@@ -59,15 +103,14 @@ class LayerGraphStats:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "LayerGraphStats":
-        if not isinstance(data, dict):
-            raise TypeError("LayerGraphStats data must be a dict.")
+        _val_dict(data, "LayerGraphStats data")
         return cls(
-            time_index=int(data.get("time_index", 0)),
-            proposed=int(data.get("proposed", 0)),
-            legal=int(data.get("legal", 0)),
-            scored=int(data.get("scored", 0)),
-            retained=int(data.get("retained", 0)),
-            pruned=int(data.get("pruned", 0)),
+            time_index=_val_int(data.get("time_index", 0), "time_index"),
+            proposed=_val_int(data.get("proposed", 0), "proposed"),
+            legal=_val_int(data.get("legal", 0), "legal"),
+            scored=_val_int(data.get("scored", 0), "scored"),
+            retained=_val_int(data.get("retained", 0), "retained"),
+            pruned=_val_int(data.get("pruned", 0), "pruned"),
         )
 
 @dataclass
@@ -97,19 +140,20 @@ class GraphDiagnosticsData:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GraphDiagnosticsData":
-        if not isinstance(data, dict):
-            raise TypeError("GraphDiagnosticsData data must be a dict.")
-        per_layer = [LayerGraphStats.from_dict(item) for item in data.get("per_layer_stats", [])]
+        _val_dict(data, "GraphDiagnosticsData data")
+        per_layer = [LayerGraphStats.from_dict(item) for item in _val_list(data.get("per_layer_stats", []), "per_layer_stats")]
+        rej_sum = _val_dict(data.get("rejection_summary", {}), "rejection_summary")
+        prun_sum = _val_dict(data.get("pruning_summary", {}), "pruning_summary")
         return cls(
-            layer_sizes=[int(x) for x in data.get("layer_sizes", [])],
+            layer_sizes=[_val_int(x, "layer_sizes item") for x in _val_list(data.get("layer_sizes", []), "layer_sizes")],
             per_layer_stats=per_layer,
-            rejection_summary={str(k): int(v) for k, v in data.get("rejection_summary", {}).items()},
-            pruning_summary={str(k): int(v) for k, v in data.get("pruning_summary", {}).items()},
-            total_proposed=int(data.get("total_proposed", 0)),
-            total_legal=int(data.get("total_legal", 0)),
-            total_scored=int(data.get("total_scored", 0)),
-            total_retained=int(data.get("total_retained", 0)),
-            total_pruned=int(data.get("total_pruned", 0)),
+            rejection_summary={_val_str(k, "rejection_summary key"): _val_int(v, "rejection_summary value") for k, v in rej_sum.items()},
+            pruning_summary={_val_str(k, "pruning_summary key"): _val_int(v, "pruning_summary value") for k, v in prun_sum.items()},
+            total_proposed=_val_int(data.get("total_proposed", 0), "total_proposed"),
+            total_legal=_val_int(data.get("total_legal", 0), "total_legal"),
+            total_scored=_val_int(data.get("total_scored", 0), "total_scored"),
+            total_retained=_val_int(data.get("total_retained", 0), "total_retained"),
+            total_pruned=_val_int(data.get("total_pruned", 0), "total_pruned"),
         )
 
 @dataclass
@@ -123,12 +167,11 @@ class EndpointDiagnosticsData:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EndpointDiagnosticsData":
-        if not isinstance(data, dict):
-            raise TypeError("EndpointDiagnosticsData data must be a dict.")
+        _val_dict(data, "EndpointDiagnosticsData data")
         return cls(
-            pi0_support_size=int(data.get("pi0_support_size", 0)),
-            piT_support_size=int(data.get("piT_support_size", 0)),
-            unreachable_probability_mass=float(data.get("unreachable_probability_mass", 0.0)),
+            pi0_support_size=_val_int(data.get("pi0_support_size", 0), "pi0_support_size"),
+            piT_support_size=_val_int(data.get("piT_support_size", 0), "piT_support_size"),
+            unreachable_probability_mass=_val_float(data.get("unreachable_probability_mass", 0.0), "unreachable_probability_mass"),
         )
 
 @dataclass
@@ -142,13 +185,13 @@ class PathDiagnosticsData:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PathDiagnosticsData":
-        if not isinstance(data, dict):
-            raise TypeError("PathDiagnosticsData data must be a dict.")
-        score = data.get("path_score")
+        _val_dict(data, "PathDiagnosticsData data")
+        score_val = data.get("path_score")
+        score = _val_float(score_val, "path_score") if score_val is not None else None
         return cls(
-            path_mode=str(data.get("path_mode", "map")),
-            path_score=float(score) if score is not None else None,
-            path_length=int(data.get("path_length", 0)),
+            path_mode=_val_str(data.get("path_mode", "map"), "path_mode"),
+            path_score=score,
+            path_length=_val_int(data.get("path_length", 0), "path_length"),
         )
 
 @dataclass
@@ -204,18 +247,17 @@ class SBDiagnostics:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SBDiagnostics":
-        if not isinstance(data, dict):
-            raise TypeError("SBDiagnostics data must be a dict.")
-        disc_nodes = data.get("disconnected_nodes", data.get("pruned_nodes", 0))
+        _val_dict(data, "SBDiagnostics data")
+        disc_val = data.get("disconnected_nodes", data.get("pruned_nodes", 0))
         return cls(
-            iterations_run=int(data.get("iterations_run", 0)),
-            converged=bool(data.get("converged", False)),
-            final_max_delta=float(data.get("final_max_delta", 0.0)),
-            layer_sizes=[int(x) for x in data.get("layer_sizes", [])],
-            disconnected_nodes=int(disc_nodes),
-            effective_entropy=float(data.get("effective_entropy", 0.0)),
-            residual_history=[float(x) for x in data.get("residual_history", [])],
-            layer_entropies=[float(x) for x in data.get("layer_entropies", [])],
+            iterations_run=_val_int(data.get("iterations_run", 0), "iterations_run"),
+            converged=_val_bool(data.get("converged", False), "converged"),
+            final_max_delta=_val_float(data.get("final_max_delta", 0.0), "final_max_delta"),
+            layer_sizes=[_val_int(x, "layer_sizes item") for x in _val_list(data.get("layer_sizes", []), "layer_sizes")],
+            disconnected_nodes=_val_int(disc_val, "disconnected_nodes"),
+            effective_entropy=_val_float(data.get("effective_entropy", 0.0), "effective_entropy"),
+            residual_history=[_val_float(x, "residual_history item") for x in _val_list(data.get("residual_history", []), "residual_history")],
+            layer_entropies=[_val_float(x, "layer_entropies item") for x in _val_list(data.get("layer_entropies", []), "layer_entropies")],
         )
 
 @dataclass
@@ -251,19 +293,22 @@ class RunManifest:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunManifest":
-        """Deserializes and validates a dictionary into a RunManifest instance."""
-        if not isinstance(data, dict):
-            raise TypeError(f"Manifest data must be a dict, got {type(data).__name__}.")
+        """Deserializes and strictly validates a dictionary into a RunManifest instance."""
+        _val_dict(data, "Manifest data")
 
         if "seed" not in data:
             raise ValueError("Manifest missing required field 'seed'.")
+        seed = _val_int(data["seed"], "seed")
+
         if "config" not in data and "config_dump" not in data:
             raise ValueError("Manifest missing required field 'config'.")
+        config_raw = data.get("config", data.get("config_dump"))
+        config_data = _val_dict(config_raw, "config")
 
         schema_ver = data.get("schema_version")
         if schema_ver is not None:
             if not isinstance(schema_ver, str):
-                raise ValueError("schema_version must be a string.")
+                raise TypeError("schema_version must be a string.")
             try:
                 major = int(schema_ver.split(".")[0])
             except (ValueError, IndexError):
@@ -271,24 +316,27 @@ class RunManifest:
             if major != 1:
                 raise ValueError(f"Unsupported schema version: {schema_ver}")
 
-        config_data = data.get("config", data.get("config_dump", {}))
-        struct_data = data.get("structure", {})
-        sb_data = data.get("sb_stats", {})
-        graph_data = data.get("graph_stats", {})
-        endpoint_data = data.get("endpoint_stats", {})
-        path_data = data.get("path_stats", {})
+        struct_data = _val_dict(data.get("structure", {}), "structure")
+        sb_data = _val_dict(data.get("sb_stats", {}), "sb_stats")
+        graph_data = _val_dict(data.get("graph_stats", {}), "graph_stats")
+        endpoint_data = _val_dict(data.get("endpoint_stats", {}), "endpoint_stats")
+        path_data = _val_dict(data.get("path_stats", {}), "path_stats")
+
+        run_id = _val_str(data.get("run_id", str(uuid.uuid4())), "run_id") if "run_id" in data else str(uuid.uuid4())
+        timestamp = _val_float(data.get("timestamp", time.time()), "timestamp") if "timestamp" in data else time.time()
+        version = _val_str(data.get("version", "0.1.0"), "version") if "version" in data else "0.1.0"
 
         return cls(
-            seed=int(data["seed"]),
+            seed=seed,
             config_dump=config_data,
             structural_stats=StructuralDiagnostics.from_dict(struct_data),
             sb_stats=SBDiagnostics.from_dict(sb_data),
             graph_stats=GraphDiagnosticsData.from_dict(graph_data),
             endpoint_stats=EndpointDiagnosticsData.from_dict(endpoint_data),
             path_stats=PathDiagnosticsData.from_dict(path_data),
-            run_id=str(data.get("run_id", str(uuid.uuid4()))),
-            timestamp=float(data.get("timestamp", time.time())),
-            version=str(data.get("version", "0.1.0")),
+            run_id=run_id,
+            timestamp=timestamp,
+            version=version,
             schema_version=schema_ver if schema_ver is not None else SCHEMA_VERSION,
         )
 
