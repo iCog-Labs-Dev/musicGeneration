@@ -351,6 +351,55 @@ class TestDiagnostics(unittest.TestCase):
         self.assertEqual(manifest.path_stats.path_mode, "map")
         self.assertIsNotNone(manifest.path_stats.path_score)
 
+    def test_manifest_strict_json_type_validation(self):
+        """Verifies that automatic type conversion is rejected and strict JSON types are enforced."""
+        valid_base = {"seed": 42, "config": {"edo": 12}}
+
+        # String seed rejected
+        with self.assertRaises((TypeError, ValueError)):
+            RunManifest.from_dict({"seed": "42", "config": {}})
+
+        # Boolean seed rejected
+        with self.assertRaises((TypeError, ValueError)):
+            RunManifest.from_dict({"seed": True, "config": {}})
+
+        # Non-dict config rejected
+        with self.assertRaises((TypeError, ValueError)):
+            RunManifest.from_dict({"seed": 42, "config": "not_a_dict"})
+
+        # String converged in sb_stats rejected
+        invalid_sb = dict(valid_base)
+        invalid_sb["sb_stats"] = {"converged": "True"}
+        with self.assertRaises((TypeError, ValueError)):
+            RunManifest.from_dict(invalid_sb)
+
+        # Invalid layer_sizes item in graph_stats rejected
+        invalid_graph = dict(valid_base)
+        invalid_graph["graph_stats"] = {"layer_sizes": [1, "invalid", 3]}
+        with self.assertRaises((TypeError, ValueError)):
+            RunManifest.from_dict(invalid_graph)
+
+        # Non-string schema_version rejected
+        with self.assertRaises((TypeError, ValueError)):
+            RunManifest.from_dict({"seed": 42, "config": {}, "schema_version": 1.0})
+
+    def test_graph_counts_traceability_and_accounting(self):
+        """Verifies that total_proposed strictly equals total_legal + sum(rejection_summary) with zero unexplained missing candidates."""
+        from aimusic.core.diagnostics import build_run_manifest
+        from aimusic.planning.plans import MethodARunConfig, run_method_a
+
+        config = MethodARunConfig(total_beats=4, seed=123)
+        plan_result = run_method_a(config)
+        manifest = build_run_manifest(plan_result, seed=123, config_dump={"test": True})
+
+        g_stats = manifest.graph_stats
+        total_rejections = sum(g_stats.rejection_summary.values())
+
+        # Exact accounting equation: proposed = legal + rejected
+        self.assertEqual(g_stats.total_proposed, g_stats.total_legal + total_rejections)
+        self.assertGreater(g_stats.total_proposed, 0)
+        self.assertGreater(g_stats.total_legal, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
