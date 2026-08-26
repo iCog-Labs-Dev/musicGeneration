@@ -16,14 +16,14 @@ import gradio as gr
 import mido
 import numpy as np
 
-from aimusic.app.cli import _build_structural_diagnostics, _json_ready
+from aimusic.app.cli import _json_ready
 from aimusic.core.config import (
     DecodeConfig,
     EDOConfig,
     MicrotonalRendering,
     StyleConfig,
 )
-from aimusic.core.diagnostics import RunManifest, SBDiagnostics, build_run_manifest
+from aimusic.core.diagnostics import build_run_manifest
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, run_method_a

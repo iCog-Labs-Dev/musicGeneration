@@ -1,26 +1,30 @@
 import tempfile
 import json
+import copy
 from pathlib import Path
 import unittest
 import dataclasses
 import math
+from typing import Any
 from unittest.mock import MagicMock
 
 # --- Diagnostics Imports ---
 from aimusic.core.diagnostics import (
-    TimelineEvent, 
-    StructuralDiagnostics, 
+    ManifestValidationError,
+    TimelineEvent,
+    StructuralDiagnostics,
     compute_tension_curve,
     RunManifest,
-    SBDiagnostics
+    SBDiagnostics,
+    build_run_manifest,
 )
 # --- Math Pipeline Imports ---
 from aimusic.core.config import SBConfig, SBBackend
 from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
 from aimusic.planning.graph import SparseGraph
 from aimusic.planning.sb import (
-    build_sb_problem, 
-    solve_sb, 
+    build_sb_problem,
+    solve_sb,
     map_bridge_path,
     solved_bridge_from_solution
 )
@@ -32,7 +36,7 @@ class TestDiagnostics(unittest.TestCase):
         """Ensures timeline events serialize properly using the standard asdict."""
         event = TimelineEvent(start_time=0.0, end_time=4.0, label="C Major")
         serialized = dataclasses.asdict(event)
-        
+
         self.assertEqual(serialized["start_time"], 0.0)
         self.assertEqual(serialized["end_time"], 4.0)
         self.assertEqual(serialized["label"], "C Major")
@@ -47,9 +51,9 @@ class TestDiagnostics(unittest.TestCase):
             boundaries=[0.0, 4.0],
             tension_curve=[(0.0, 0.1), (4.0, 0.9)]
         )
-        
+
         data = struct.to_dict()
-        
+
         # Exhaustively checking every single key to prevent silent failures
         self.assertIn("key_timeline", data)
         self.assertIn("chord_timeline", data)
@@ -57,7 +61,7 @@ class TestDiagnostics(unittest.TestCase):
         self.assertIn("groove_timeline", data)
         self.assertIn("boundaries", data)
         self.assertIn("tension_curve", data)
-        
+
         # Verify nested data is accurate
         self.assertEqual(data["key_timeline"][0]["label"], "C Major")
         self.assertEqual(data["chord_timeline"][0]["label"], "Cmaj7")
@@ -71,16 +75,16 @@ class TestDiagnostics(unittest.TestCase):
             TimelineEvent(0.0, 4.0, "Tonic"),
             TimelineEvent(4.0, 8.0, "Subdominant"),
             TimelineEvent(8.0, 12.0, "Dominant"),
-            TimelineEvent(12.0, 16.0, "Unknown") 
+            TimelineEvent(12.0, 16.0, "Unknown")
         ]
-        
+
         curve = compute_tension_curve(roles)
-        
+
         self.assertEqual(len(curve), 4)
         self.assertEqual(curve[0], (0.0, 0.1))
         self.assertEqual(curve[1], (4.0, 0.5))
         self.assertEqual(curve[2], (8.0, 0.9))
-        self.assertEqual(curve[3], (12.0, 0.5)) 
+        self.assertEqual(curve[3], (12.0, 0.5))
 
     def test_sb_diagnostics_extraction(self):
         """Tests that SB logs and Effective Entropy are correctly calculated from a solution."""
@@ -89,16 +93,16 @@ class TestDiagnostics(unittest.TestCase):
         mock_solution.trace.iterations = 42
         mock_solution.trace.converged = True
         mock_solution.trace.final_max_delta = 1e-6
-        
+
         mock_solution.problem.diagnostics.layer_sizes = (5, 10, 5)
         mock_solution.problem.diagnostics.zero_outdegree_count = 2
         mock_solution.problem.diagnostics.zero_indegree_count = 1
-        
+
         # Layer 1: Confident (entropy = 0)
         # Layer 2: 50/50 Split (entropy = approx 0.693)
         mock_solution.marginals.node_marginals_by_layer = [
-            (1.0, 0.0),      
-            (0.5, 0.5)       
+            (1.0, 0.0),
+            (0.5, 0.5)
         ]
 
         #Extract Data
@@ -120,17 +124,17 @@ class TestDiagnostics(unittest.TestCase):
         """Ensures the top-level manifest generates valid UUIDs and timestamps."""
         manifest = RunManifest(seed=42, config_dump={"edo": 12})
         data = manifest.to_dict()
-        
+
         self.assertEqual(data["seed"], 42)
         self.assertEqual(data["config"]["edo"], 12)
         self.assertIsNotNone(data["run_id"])
         self.assertIsNotNone(data["timestamp"])
         self.assertIn("structure", data)
-    
-    # END-TO-END PASSAGE FIXTURE 
+
+    # END-TO-END PASSAGE FIXTURE
     def test_e2e_produce_stable_short_passage(self):
         """
-        True E2E Fixture: 
+        True E2E Fixture:
         1. Runs the real math engine to get a deterministic path.
         2. Translates it into a musical passage (SymbolicNotes).
         3. PRODUCES physical output files (MIDI and Manifest).
@@ -138,24 +142,24 @@ class TestDiagnostics(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             out_dir = Path(tmpdir)
-            
+
             # SETUP THE MATH FIXTURE (The Short Passage)
             def _make_state(time_idx: int, var_id: int) -> BeatState:
                 return BeatState(
-                    meter_id=0, 
-                    beat_in_bar=time_idx, 
-                    boundary_lvl=0, 
-                    key_id=0, 
-                    chord_id=var_id, 
-                    role_id=0, 
-                    head_id=0, 
+                    meter_id=0,
+                    beat_in_bar=time_idx,
+                    boundary_lvl=0,
+                    key_id=0,
+                    chord_id=var_id,
+                    role_id=0,
+                    head_id=0,
                     groove_id=0
                 )
 
-            state_start = _make_state(0, 0)  
-            state_mid_a = _make_state(1, 1)  
-            state_mid_b = _make_state(1, 2)  
-            state_end = _make_state(2, 3)    
+            state_start = _make_state(0, 0)
+            state_mid_a = _make_state(1, 1)
+            state_mid_b = _make_state(1, 2)
+            state_end = _make_state(2, 3)
 
             layer_0 = Layer(time_index=0, states=(state_start,))
             layer_1 = Layer(time_index=1, states=(state_mid_a, state_mid_b))
@@ -171,11 +175,11 @@ class TestDiagnostics(unittest.TestCase):
             )
 
             graph = SparseGraph(
-                layers=(layer_0, layer_1, layer_2), 
+                layers=(layer_0, layer_1, layer_2),
                 edges_by_time=(edges_0, edges_1),
-                diagnostics=MagicMock() 
+                diagnostics=MagicMock()
             )
-            
+
             pi0 = EndpointDistribution(layer=layer_0, probabilities=(1.0,))
             piT = EndpointDistribution(layer=layer_2, probabilities=(1.0,))
             config = SBConfig(horizon_t=2, max_iterations=10, tolerance=1e-5, backend_selection=SBBackend.NUMPY)
@@ -185,7 +189,7 @@ class TestDiagnostics(unittest.TestCase):
             solution = solve_sb(problem)
             bridge = solved_bridge_from_solution(solution)
             path, best_score = map_bridge_path(bridge)
-            
+
             # Strict math assertion
             self.assertEqual(path, (state_start, state_mid_a, state_end))
 
@@ -196,7 +200,7 @@ class TestDiagnostics(unittest.TestCase):
                 state_mid_b: 65, # F4 (Should not be picked)
                 state_end: 67    # G4
             }
-            
+
             notes = []
             for i, state in enumerate(path):
                 notes.append(SymbolicNote(
@@ -208,11 +212,11 @@ class TestDiagnostics(unittest.TestCase):
             # PRODUCE PHYSICAL OUTPUTS (MIDI and Manifest)
             midi_path = out_dir / "stable_passage.mid"
             manifest_path = out_dir / "stable_passage_manifest.json"
-            
+
             # Produce MIDI
             edo_12 = EDO(EDOConfig(n=12, base_tuning=60, pitch_bend_range=48))
             render_midi(notes, edo_12, str(midi_path))
-            
+
             # Produce Manifest
             manifest = RunManifest(
                 seed=42,
@@ -225,7 +229,7 @@ class TestDiagnostics(unittest.TestCase):
             # REGRESSION TRAPS ON PRODUCED FILES
             self.assertTrue(midi_path.exists(), "Pipeline failed to produce MIDI file.")
             self.assertTrue(manifest_path.exists(), "Pipeline failed to produce Manifest file.")
-            
+
             with open(manifest_path, "r") as f:
                 saved_manifest = json.load(f)
             self.assertTrue(saved_manifest["sb_stats"]["converged"])
@@ -234,172 +238,160 @@ class TestDiagnostics(unittest.TestCase):
             self.assertEqual(len(notes), 3)
             self.assertEqual(notes[1].pitch_height, 64, "Regression: Pipeline picked wrong structural path")
 
-    def test_manifest_serialization_deserialization_round_trip(self):
-        """Tests that RunManifest.to_dict() and RunManifest.from_dict() perform lossless round-trips."""
-        from aimusic.core.diagnostics import (
-            EndpointDiagnosticsData,
-            GraphDiagnosticsData,
-            LayerGraphStats,
-            PathDiagnosticsData,
+class TestVersionedRunManifest(unittest.TestCase):
+    def _manifest(self, *, sample: bool = False) -> tuple[Any, RunManifest]:
+        from aimusic.planning.plans import MethodARunConfig, run_method_a
+
+        plan_result = run_method_a(
+            MethodARunConfig(total_beats=4, seed=123, use_sampling=sample)
         )
-        graph_stats = GraphDiagnosticsData(
-            layer_sizes=[1, 4, 1],
-            per_layer_stats=[
-                LayerGraphStats(time_index=1, proposed=10, legal=8, scored=8, retained=4, pruned=2)
-            ],
-            rejection_summary={"illegal_step": 2},
-            pruning_summary={"k_max_prune": 2},
-            total_proposed=10,
-            total_legal=8,
-            total_scored=8,
-            total_retained=4,
-            total_pruned=2,
+        return plan_result, build_run_manifest(
+            plan_result,
+            seed=123,
+            config_dump={"test": True},
         )
-        endpoint_stats = EndpointDiagnosticsData(pi0_support_size=1, piT_support_size=1, unreachable_probability_mass=0.0)
-        path_stats = PathDiagnosticsData(path_mode="map", path_score=-3.5, path_length=4)
 
-        manifest = RunManifest(
-            seed=42,
-            config_dump={"edo": 12},
-            graph_stats=graph_stats,
-            endpoint_stats=endpoint_stats,
-            path_stats=path_stats,
+    def test_complete_manifest_round_trip_is_lossless(self):
+        _, manifest = self._manifest()
+        self.assertEqual(RunManifest.from_dict(manifest.to_dict()), manifest)
+
+    def test_graph_totals_match_source_records(self):
+        plan_result, manifest = self._manifest()
+        source_layers = plan_result.graph.diagnostics.layer_diagnostics
+        graph = manifest.graph_stats
+
+        self.assertEqual(
+            graph.total_pruned,
+            sum(len(layer.pruned_states) for layer in source_layers),
         )
-        data = manifest.to_dict()
+        self.assertEqual(
+            graph.total_pruned_edges,
+            sum(
+                layer.outdegree_pruned_count + layer.state_pruned_edge_count
+                for layer in source_layers
+            ),
+        )
+        self.assertEqual(
+            graph.total_candidate_pruned,
+            sum(layer.d_max_pruned_candidate_count for layer in source_layers),
+        )
+        self.assertEqual(
+            graph.total_prune_operations,
+            sum(graph.pruning_summary.values()),
+        )
+        for source, serialized in zip(source_layers, graph.per_layer_stats):
+            self.assertEqual(serialized.proposed, source.raw_candidate_count)
+            self.assertEqual(serialized.legal, source.legal_candidate_count)
+            self.assertEqual(serialized.scored, source.scored_candidate_count)
+            self.assertEqual(serialized.retained, source.kept_candidate_count)
+            self.assertEqual(serialized.pruned, len(source.pruned_states))
 
-        self.assertEqual(data["schema_version"], "1.0.0")
-        self.assertEqual(data["seed"], 42)
+    def test_candidate_flow_accounts_for_duplicates_and_state_pruning(self):
+        _, manifest = self._manifest()
+        graph = manifest.graph_stats
+        self.assertEqual(
+            graph.total_legal,
+            graph.total_scored
+            + graph.total_duplicate_proposals
+            + graph.total_candidate_pruned,
+        )
+        self.assertEqual(
+            graph.total_proposed - graph.total_scored,
+            sum(graph.rejection_summary.values()),
+        )
+        for layer in graph.per_layer_stats:
+            self.assertEqual(
+                layer.legal,
+                layer.scored + layer.duplicate_proposals + layer.candidate_pruned,
+            )
+            self.assertLessEqual(layer.scored_unique_states, layer.scored)
 
-        deserialized = RunManifest.from_dict(data)
-        self.assertEqual(deserialized.seed, 42)
-        self.assertEqual(deserialized.schema_version, "1.0.0")
-        self.assertEqual(deserialized.graph_stats.total_proposed, 10)
-        self.assertEqual(deserialized.graph_stats.rejection_summary, {"illegal_step": 2})
-        self.assertEqual(deserialized.endpoint_stats.pi0_support_size, 1)
-        self.assertEqual(deserialized.path_stats.path_score, -3.5)
+    def test_original_and_solver_endpoint_support_are_both_preserved(self):
+        _, manifest = self._manifest()
+        endpoints = manifest.endpoint_stats
+        self.assertGreater(endpoints.original_pi0_support_size, endpoints.solver_pi0_support_size)
+        self.assertGreater(endpoints.original_piT_support_size, endpoints.solver_piT_support_size)
+        self.assertGreater(endpoints.unreachable_pi0_mass, 0.0)
+        self.assertGreater(endpoints.unreachable_piT_mass, 0.0)
 
-    def test_manifest_deserialization_invalid_or_missing_fields(self):
-        """Verifies that missing or invalid fields raise clear TypeError/ValueError exceptions."""
-        with self.assertRaises(TypeError):
-            RunManifest.from_dict("not a dict")  # type: ignore
+    def test_sampled_path_has_reproducible_log_probability(self):
+        first_result, first = self._manifest(sample=True)
+        second_result, second = self._manifest(sample=True)
+        self.assertEqual(first_result.path, second_result.path)
+        self.assertEqual(first.path_stats.path_mode, "sample")
+        self.assertIsNotNone(first.path_stats.path_score)
+        self.assertEqual(first.path_stats.path_score, second.path_stats.path_score)
+        self.assertEqual(
+            first.path_stats.path_score,
+            first_result.sampled_path.log_probability,
+        )
 
-        with self.assertRaises(ValueError):
-            RunManifest.from_dict({})
+    def test_strict_parser_rejects_malformed_nested_data(self):
+        _, manifest = self._manifest()
+        valid = manifest.to_dict()
+        cases = []
 
-        with self.assertRaises(ValueError):
-            RunManifest.from_dict({"seed": 42})  # missing config
+        wrong_seed = copy.deepcopy(valid)
+        wrong_seed["seed"] = "123"
+        cases.append((wrong_seed, "manifest.seed"))
 
-    def test_manifest_unsupported_schema_version_rejected(self):
-        """Verifies that unsupported major schema versions are rejected."""
-        with self.assertRaises(ValueError):
-            RunManifest.from_dict({"seed": 42, "config": {}, "schema_version": "2.0.0"})
+        wrong_config = copy.deepcopy(valid)
+        wrong_config["config"] = []
+        cases.append((wrong_config, "manifest.config"))
 
-        with self.assertRaises(ValueError):
-            RunManifest.from_dict({"seed": 42, "config": {}, "schema_version": "invalid"})
+        wrong_boolean = copy.deepcopy(valid)
+        wrong_boolean["sb_stats"]["converged"] = "false"
+        cases.append((wrong_boolean, "sb_stats.converged"))
 
-    def test_manifest_older_schema_migration_safe(self):
-        """Verifies that older unversioned manifests and legacy pruned_nodes migrate safely."""
-        legacy_data = {
-            "seed": 100,
-            "config": {"meter": "4/4"},
+        negative_count = copy.deepcopy(valid)
+        negative_count["graph_stats"]["per_layer_stats"][0]["proposed"] = -1
+        cases.append((negative_count, "proposed"))
+
+        inconsistent_total = copy.deepcopy(valid)
+        inconsistent_total["graph_stats"]["total_pruned"] += 1
+        cases.append((inconsistent_total, "total_pruned"))
+
+        non_finite = copy.deepcopy(valid)
+        non_finite["sb_stats"]["final_max_delta"] = float("nan")
+        cases.append((non_finite, "final_max_delta"))
+
+        missing_nested = copy.deepcopy(valid)
+        del missing_nested["path_stats"]["path_mode"]
+        cases.append((missing_nested, "path_stats"))
+
+        unsupported = copy.deepcopy(valid)
+        unsupported["schema_version"] = "1.99.0"
+        cases.append((unsupported, "schema_version"))
+
+        for data, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ManifestValidationError, message):
+                    RunManifest.from_dict(data)
+
+    def test_unversioned_manifest_migrates_with_warnings(self):
+        legacy = {
+            "run_id": "legacy-run",
+            "timestamp": 1.0,
+            "version": "0.1.0",
+            "seed": 7,
+            "config": {"edo": 12},
+            "structure": StructuralDiagnostics().to_dict(),
             "sb_stats": {
+                "iterations_run": 2,
                 "converged": True,
-                "iterations_run": 5,
-                "final_max_delta": 1e-6,
+                "final_max_delta": 0.01,
                 "layer_sizes": [1, 2, 1],
-                "pruned_nodes": 4,  # legacy field
-                "effective_entropy": 0.5,
+                "pruned_nodes": 3,
+                "effective_entropy": 0.4,
             },
         }
-
-        manifest = RunManifest.from_dict(legacy_data)
+        manifest = RunManifest.from_dict(legacy)
         self.assertEqual(manifest.schema_version, "1.0.0")
-        self.assertEqual(manifest.seed, 100)
-        self.assertEqual(manifest.sb_stats.disconnected_nodes, 4)
-        self.assertEqual(manifest.sb_stats.pruned_nodes, 4)
-
-    def test_manifest_pruning_totals_match_graph_diagnostic_records(self):
-        """Verifies that manifest pruning totals exactly match the underlying graph build diagnostics."""
-        from aimusic.core.diagnostics import build_run_manifest
-        from aimusic.planning.plans import MethodARunConfig, run_method_a
-
-        config = MethodARunConfig(total_beats=4, seed=123)
-        plan_result = run_method_a(config)
-        manifest = build_run_manifest(plan_result, seed=123, config_dump={"test": True})
-
-        expected_total_pruned = sum(
-            len(diag.pruned_states) for diag in plan_result.graph.diagnostics.layer_diagnostics
-        )
-        self.assertEqual(manifest.graph_stats.total_pruned, expected_total_pruned)
-
-    def test_generated_manifest_includes_all_diagnostics(self):
-        """End-to-end verification that generated manifests include graph, endpoint, solver, and path info."""
-        from aimusic.core.diagnostics import build_run_manifest
-        from aimusic.planning.plans import MethodARunConfig, run_method_a
-
-        config = MethodARunConfig(total_beats=4, seed=777)
-        plan_result = run_method_a(config)
-        manifest = build_run_manifest(plan_result, seed=777, config_dump={"test": True})
-
-        self.assertEqual(manifest.schema_version, "1.0.0")
-        self.assertEqual(manifest.seed, 777)
-        self.assertGreater(manifest.graph_stats.total_proposed, 0)
-        self.assertGreater(manifest.graph_stats.total_retained, 0)
-        self.assertGreater(manifest.endpoint_stats.pi0_support_size, 0)
-        self.assertGreater(manifest.endpoint_stats.piT_support_size, 0)
-        self.assertTrue(manifest.sb_stats.converged)
-        self.assertEqual(manifest.path_stats.path_mode, "map")
-        self.assertIsNotNone(manifest.path_stats.path_score)
-
-    def test_manifest_strict_json_type_validation(self):
-        """Verifies that automatic type conversion is rejected and strict JSON types are enforced."""
-        valid_base = {"seed": 42, "config": {"edo": 12}}
-
-        # String seed rejected
-        with self.assertRaises((TypeError, ValueError)):
-            RunManifest.from_dict({"seed": "42", "config": {}})
-
-        # Boolean seed rejected
-        with self.assertRaises((TypeError, ValueError)):
-            RunManifest.from_dict({"seed": True, "config": {}})
-
-        # Non-dict config rejected
-        with self.assertRaises((TypeError, ValueError)):
-            RunManifest.from_dict({"seed": 42, "config": "not_a_dict"})
-
-        # String converged in sb_stats rejected
-        invalid_sb = dict(valid_base)
-        invalid_sb["sb_stats"] = {"converged": "True"}
-        with self.assertRaises((TypeError, ValueError)):
-            RunManifest.from_dict(invalid_sb)
-
-        # Invalid layer_sizes item in graph_stats rejected
-        invalid_graph = dict(valid_base)
-        invalid_graph["graph_stats"] = {"layer_sizes": [1, "invalid", 3]}
-        with self.assertRaises((TypeError, ValueError)):
-            RunManifest.from_dict(invalid_graph)
-
-        # Non-string schema_version rejected
-        with self.assertRaises((TypeError, ValueError)):
-            RunManifest.from_dict({"seed": 42, "config": {}, "schema_version": 1.0})
-
-    def test_graph_counts_traceability_and_accounting(self):
-        """Verifies that total_proposed strictly equals total_legal + sum(rejection_summary) with zero unexplained missing candidates."""
-        from aimusic.core.diagnostics import build_run_manifest
-        from aimusic.planning.plans import MethodARunConfig, run_method_a
-
-        config = MethodARunConfig(total_beats=4, seed=123)
-        plan_result = run_method_a(config)
-        manifest = build_run_manifest(plan_result, seed=123, config_dump={"test": True})
-
-        g_stats = manifest.graph_stats
-        total_rejections = sum(g_stats.rejection_summary.values())
-
-        # Exact accounting equation: proposed = legal + rejected
-        self.assertEqual(g_stats.total_proposed, g_stats.total_legal + total_rejections)
-        self.assertGreater(g_stats.total_proposed, 0)
-        self.assertGreater(g_stats.total_legal, 0)
+        self.assertEqual(manifest.sb_stats.disconnected_nodes, 3)
+        self.assertEqual(manifest.path_stats.path_mode, "unknown")
+        self.assertIsNone(manifest.path_stats.path_score)
+        self.assertTrue(manifest.migration_warnings)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main()

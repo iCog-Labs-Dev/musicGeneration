@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence, Tuple, Iterator
 import numpy as np
@@ -207,6 +208,31 @@ class CandidateGenerationResult:
     @property
     def proposed_count(self) -> int:
         return len(self.states) + len(self.rejections)
+
+    @property
+    def illegal_count(self) -> int:
+        return sum(
+            item.reason not in {"duplicate_proposal", "outdegree_pruning"}
+            for item in self.rejections
+        )
+
+    @property
+    def duplicate_count(self) -> int:
+        return sum(item.reason == "duplicate_proposal" for item in self.rejections)
+
+    @property
+    def outdegree_pruned_count(self) -> int:
+        return sum(item.reason == "outdegree_pruning" for item in self.rejections)
+
+    @property
+    def legal_count(self) -> int:
+        """Proposal occurrences that passed the transition legality rules."""
+        return self.proposed_count - self.illegal_count
+
+    @property
+    def scored_count(self) -> int:
+        """Distinct, in-budget successor proposals sent to the scorer."""
+        return len(self.states)
 
 
 def apply_meter_constraints(
@@ -529,7 +555,7 @@ def _candidate_generator(
     edo: int,
 ) -> Iterator[BeatState]:
     """Yields candidate states iteratively to avoid combinatorial memory explosions."""
-    
+
     def _shuffled(items: Sequence[int]) -> list[int]:
         items_list = list(items)
         rng.shuffle(items_list)
@@ -574,7 +600,7 @@ def get_valid_next_states(
     edo: Optional[int] = None,
 ) -> CandidateGenerationResult:
     """Generate up to D_max legal BeatState successors for one source state."""
-    
+
     # 1. Resolve objects exactly once per function call
     resolved_vocabs = _resolved_vocabs(vocabularies)
     resolved_style = _resolved_style(style_config)
@@ -596,43 +622,40 @@ def get_valid_next_states(
         resolved_edo,
     )
 
-    # 3. Consume generator, recording rejections/deduplications/pruning
-    for candidate in candidate_gen:
-        if len(accepted) >= d_max:
-            rejections.append(
-                CandidateRejection(
-                    time_index=t,
-                    source_state=prev_state,
-                    candidate_state=candidate,
-                    reason="outdegree_pruning",
-                )
-            )
-            continue
+    # Enumerate the full proposal stream for truthful diagnostics. Once the
+    # historical d_max stopping point is reached, restore the RNG state after
+    # enumeration so diagnostics do not change later layers or fixed-seed runs.
+    rng_state_after_cap = None
+    try:
+        for candidate in candidate_gen:
+            if len(accepted) >= d_max and rng_state_after_cap is None:
+                rng_state_after_cap = copy.deepcopy(rng.bit_generator.state)
 
-        legal, reason = is_legal_transition(
-            prev_state, candidate, resolved_style, resolved_vocabs
-        )
+            legal, reason = is_legal_transition(
+                prev_state, candidate, resolved_style, resolved_vocabs
+            )
 
-        if not legal:
+            if not legal:
+                rejection_reason = reason or "illegal_transition"
+            elif candidate in accepted:
+                rejection_reason = "duplicate_proposal"
+            elif len(accepted) >= d_max:
+                rejection_reason = "outdegree_pruning"
+            else:
+                accepted.add(candidate)
+                continue
+
             rejections.append(
                 CandidateRejection(
                     time_index=t,
                     source_state=prev_state,
                     candidate_state=candidate,
-                    reason=reason or "illegal_transition",
+                    reason=rejection_reason,
                 )
             )
-        elif candidate in accepted:
-            rejections.append(
-                CandidateRejection(
-                    time_index=t,
-                    source_state=prev_state,
-                    candidate_state=candidate,
-                    reason="duplicate_proposal",
-                )
-            )
-        else:
-            accepted.add(candidate)
+    finally:
+        if rng_state_after_cap is not None:
+            rng.bit_generator.state = rng_state_after_cap
 
     return CandidateGenerationResult(
         time_index=t,

@@ -3,15 +3,12 @@ import dataclasses
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from aimusic.core.diagnostics import (
+    ManifestValidationError,
     RunManifest,
-    SBDiagnostics,
-    StructuralDiagnostics,
-    TimelineEvent,
     build_run_manifest,
-    build_structural_diagnostics,
 )
 from aimusic.core.config import (
     DecodeConfig,
@@ -26,14 +23,6 @@ from aimusic.planning.plans import MethodARunConfig, run_method_a
 from aimusic.render import TrackInstrumentConfig, render_midi
 from aimusic.theory.edo import EDO
 
-ROLE_TENSION = {
-    "hold": 0.20,
-    "prep": 0.45,
-    "change": 0.65,
-    "cad": 0.90,
-}
-
-
 def _json_ready(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _json_ready(dataclasses.asdict(value))
@@ -46,27 +35,6 @@ def _json_ready(value: Any) -> Any:
         if isinstance(enum_value, str):
             return enum_value
     return value
-
-
-def _segment_timeline(values: Iterable[str]) -> list[TimelineEvent]:
-    items = tuple(values)
-    if not items:
-        return []
-    events: list[TimelineEvent] = []
-    start = 0
-    current = items[0]
-    for index, label in enumerate(items[1:], start=1):
-        if label == current:
-            continue
-        events.append(TimelineEvent(float(start), float(index), current))
-        start = index
-        current = label
-    events.append(TimelineEvent(float(start), float(len(items)), current))
-    return events
-
-
-def _build_structural_diagnostics(path: tuple[Any, ...], vocabularies: Any) -> StructuralDiagnostics:
-    return build_structural_diagnostics(path, vocabularies)
 
 
 def _build_edo(args: argparse.Namespace) -> EDO:
@@ -159,6 +127,8 @@ def handle_generate(args: argparse.Namespace) -> None:
                 "groove_family": args.groove_family,
                 "tempo_bpm": args.tempo_bpm,
                 "output_dir": args.out,
+                "pitch_bend_range": args.pitch_bend_range,
+                "rendering_method": args.rendering_method,
                 "track_instruments": _build_track_instruments(args),
             }
         ),
@@ -224,58 +194,79 @@ def handle_inspect(args: argparse.Namespace) -> None:
 
     try:
         manifest = RunManifest.from_dict(data)
-    except Exception as exc:
+    except ManifestValidationError as exc:
         print(f"Error: {manifest_path} is not a valid run manifest ({exc}).")
         sys.exit(1)
 
     print(f"\n=== Inspection Report for Run: {manifest.run_id} ===")
     print(f"Schema Version: {manifest.schema_version}")
+    if manifest.migration_warnings:
+        print("\n--- Legacy Migration Warnings ---")
+        for warning in manifest.migration_warnings:
+            print(f"- {warning}")
 
-    # --- Graph Construction & Diagnostics ---
-    gstats = manifest.graph_stats
-    print("\n--- Graph Construction & Diagnostics ---")
-    print(f"Layer sizes:     {gstats.layer_sizes}")
-    print(f"Candidates proposed: {gstats.total_proposed}")
-    print(f"Legal transitions:   {gstats.total_legal}")
-    print(f"Transitions scored:  {gstats.total_scored}")
-    print(f"States retained:     {gstats.total_retained}")
-    print(f"States pruned:       {gstats.total_pruned}")
+    graph = manifest.graph_stats
+    print("\n--- Graph Candidate Flow ---")
+    print(f"Layer sizes: {graph.layer_sizes}")
+    print("Layer  Proposed  Legal  Scored  Duplicates  Candidate-pruned  Unique states  State-pruned  Retained")
+    for layer in graph.per_layer_stats:
+        print(
+            f"{layer.time_index:>5}  {layer.proposed:>8}  {layer.legal:>5}  "
+            f"{layer.scored:>6}  {layer.duplicate_proposals:>10}  "
+            f"{layer.candidate_pruned:>16}  {layer.scored_unique_states:>13}  "
+            f"{layer.pruned:>12}  {layer.retained:>8}"
+        )
+    print(
+        f"Totals: proposed={graph.total_proposed}, legal={graph.total_legal}, "
+        f"scored={graph.total_scored}, duplicates={graph.total_duplicate_proposals}, "
+        f"candidate-pruned={graph.total_candidate_pruned}, "
+        f"unique-states={graph.total_scored_unique_states}, "
+        f"state-pruned={graph.total_pruned}, retained={graph.total_retained}"
+    )
+    print("\n--- Graph Edge Flow ---")
+    print("Layer  Scored  Edge-pruned  Retained")
+    for layer in graph.per_layer_stats:
+        print(
+            f"{layer.time_index:>5}  {layer.scored_edges:>6}  "
+            f"{layer.pruned_edges:>11}  {layer.retained_edges:>8}"
+        )
+    if graph.rejection_summary:
+        print(f"Rejection reasons: {graph.rejection_summary}")
+    if graph.pruning_summary:
+        print(f"Pruning reasons: {graph.pruning_summary}")
 
-    if gstats.rejection_summary:
-        print("Rejection reasons:")
-        for reason, count in gstats.rejection_summary.items():
-            print(f"  {reason}: {count}")
-    if gstats.pruning_summary:
-        print("Pruning reasons:")
-        for reason, count in gstats.pruning_summary.items():
-            print(f"  {reason}: {count}")
+    endpoints = manifest.endpoint_stats
+    print("\n--- Endpoint Support ---")
+    print(
+        f"Original support: pi0={endpoints.original_pi0_support_size}, "
+        f"piT={endpoints.original_piT_support_size}"
+    )
+    print(
+        f"Solver support:   pi0={endpoints.solver_pi0_support_size}, "
+        f"piT={endpoints.solver_piT_support_size}"
+    )
+    print(
+        f"Unreachable mass: pi0={endpoints.unreachable_pi0_mass:.6f}, "
+        f"piT={endpoints.unreachable_piT_mass:.6f}"
+    )
 
-    # --- Endpoints ---
-    estats = manifest.endpoint_stats
-    print("\n--- Endpoint Distributions ---")
-    print(f"pi0 support size: {estats.pi0_support_size}")
-    print(f"piT support size: {estats.piT_support_size}")
-    print(f"Unreachable mass: {estats.unreachable_probability_mass:.4f}")
-
-    # --- Schrödinger Bridge Health ---
+    # --- SB Math Diagnostics ---
     sb = manifest.sb_stats
     print("\n--- Schrödinger Bridge Health ---")
     status = "Converged" if sb.converged else "FAILED"
     print(f"Status:             {status} (in {sb.iterations_run} iterations)")
     print(f"Max Delta:          {sb.final_max_delta}")
-    entropy_display = f"{sb.effective_entropy:.4f}" if sb.effective_entropy is not None else "n/a"
-    print(f"Entropy:            {entropy_display} (Lower = More Confident)")
-    print(f"Disconnected nodes: {sb.disconnected_nodes} nodes")
-    print(f"Layer sizes:        {sb.layer_sizes}")
-    if sb.residual_history:
-        print(f"Residual history:   {sb.residual_history}")
+    print(f"Residual history:   {sb.residual_history}")
+    print(f"Entropy by layer:   {sb.layer_entropies}")
+    print(f"Average entropy:    {sb.effective_entropy:.4f}")
+    print(f"Disconnected nodes: {sb.disconnected_nodes}")
 
-    # --- Final Path Selection ---
-    pstats = manifest.path_stats
+    path_stats = manifest.path_stats
+    score = "unavailable" if path_stats.path_score is None else f"{path_stats.path_score:.6f}"
     print("\n--- Final Path Selection ---")
-    print(f"Selection Mode: {pstats.path_mode}")
-    score_display = f"{pstats.path_score:.4f}" if pstats.path_score is not None else "n/a"
-    print(f"Path Score:     {score_display}")
+    print(f"Mode: {path_stats.path_mode}")
+    print(f"Score: {score}")
+    print(f"Transitions: {path_stats.path_transition_count}")
 
     # --- Structural Timelines ---
     structure = manifest.structural_stats.to_dict()
@@ -296,7 +287,6 @@ def handle_inspect(args: argparse.Namespace) -> None:
         bar = "#" * int(tension * 20)
         print(f"Beat {time_val:04.1f}: {bar} ({tension:.3f})")
     print("=========================================================\n")
-
 
 
 def handle_export(args: argparse.Namespace) -> None:
@@ -371,7 +361,7 @@ def main() -> None:
     ins_parser.add_argument("file", type=str)
     ins_parser.set_defaults(func=handle_inspect)
 
-    
+
     exp_parser = subparsers.add_parser("export", help="Export a generated score to MIDI")
     exp_parser.add_argument("file", type=str, help="Path to the score data")
     exp_parser.add_argument("--out", type=str, default=None, help="Output MIDI path")

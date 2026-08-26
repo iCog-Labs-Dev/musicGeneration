@@ -183,13 +183,23 @@ class LayerBuildDiagnostics:
     kept_candidate_count: int
     raw_edge_count: int
     kept_edge_count: int
+    legal_candidate_count: int = 0
+    scored_candidate_count: int = 0
+    scored_unique_state_count: int = 0
+    duplicate_candidate_count: int = 0
+    d_max_pruned_candidate_count: int = 0
     outdegree_pruned_count: int = 0
+    state_pruned_edge_count: int = 0
     rejected_proposals: Tuple[CandidateRejection, ...] = ()
     pruned_states: Tuple[PrunedState, ...] = ()
 
     @property
     def pruned_candidate_count(self) -> int:
         return len(self.pruned_states)
+
+    @property
+    def pruned_edge_count(self) -> int:
+        return self.outdegree_pruned_count + self.state_pruned_edge_count
 
 
 @dataclass(frozen=True)
@@ -311,8 +321,13 @@ def build_sparse_graph(
         steps_remaining = end_layer.time_index - next_time
 
         raw_candidate_count = 0
+        legal_candidate_count = 0
+        scored_candidate_count = 0
+        duplicate_candidate_count = 0
+        d_max_pruned_candidate_count = 0
         raw_edge_count = 0
         outdegree_pruned_count = 0
+        state_pruned_edge_count = 0
         rejected: list[CandidateRejection] = []
         kept_edges: list[Edge] = []
         best_incoming: dict[BeatState, float] = {}
@@ -335,11 +350,15 @@ def build_sparse_graph(
                     prior=resolved_prior,
                     context=_build_prior_context(source_state, end_layer, current_time),
                     edo=resolved_edo,
-                    rng=rng, 
+                    rng=rng,
                     d_max=d_max
                 )
 
             raw_candidate_count += candidate_result.proposed_count
+            legal_candidate_count += candidate_result.legal_count
+            scored_candidate_count += candidate_result.scored_count
+            duplicate_candidate_count += candidate_result.duplicate_count
+            d_max_pruned_candidate_count += candidate_result.outdegree_pruned_count
             rejected.extend(candidate_result.rejections)
 
             source_context = _build_prior_context(source_state, end_layer, current_time)
@@ -385,15 +404,6 @@ def build_sparse_graph(
             if len(source_edges) > resolved_sb.d_max:
                 excess_edges = source_edges[resolved_sb.d_max :]
                 outdegree_pruned_count += len(excess_edges)
-                for edge in excess_edges:
-                    rejected.append(
-                        CandidateRejection(
-                            time_index=current_time,
-                            source_state=source_state,
-                            candidate_state=edge.target,
-                            reason="outdegree_pruning",
-                        )
-                    )
             trimmed_edges = source_edges[: resolved_sb.d_max]
             kept_edges.extend(trimmed_edges)
             for edge in trimmed_edges:
@@ -453,7 +463,9 @@ def build_sparse_graph(
                             ),
                         )
                     )
+                edges_before_state_pruning = len(kept_edges)
                 kept_edges = [edge for edge in kept_edges if edge.target in kept_state_set]
+                state_pruned_edge_count = edges_before_state_pruning - len(kept_edges)
             else:
                 kept_states = unique_candidates
 
@@ -469,7 +481,13 @@ def build_sparse_graph(
                 kept_candidate_count=len(next_layer),
                 raw_edge_count=raw_edge_count,
                 kept_edge_count=len(edge_layers[-1]),
+                legal_candidate_count=legal_candidate_count,
+                scored_candidate_count=scored_candidate_count,
+                scored_unique_state_count=len(unique_candidates),
+                duplicate_candidate_count=duplicate_candidate_count,
+                d_max_pruned_candidate_count=d_max_pruned_candidate_count,
                 outdegree_pruned_count=outdegree_pruned_count,
+                state_pruned_edge_count=state_pruned_edge_count,
                 rejected_proposals=tuple(rejected),
                 pruned_states=tuple(pruned_states),
             )
