@@ -23,7 +23,7 @@ from aimusic.core.core_types import BeatState, EndpointDistribution, Layer, Scor
 from aimusic.core.rng import RNGKey, random_unit
 from aimusic.core.vocab import TonalContext, Vocabularies, build_tonal_context
 from aimusic.decode import decode_path_to_score
-from aimusic.planning.graph import SparseGraph, build_sparse_graph
+from aimusic.planning.graph import EdgeScoreDiagnostics, SparseGraph, build_sparse_graph
 from aimusic.render import render_midi
 from aimusic.planning.sb import (
     SBProblem,
@@ -192,6 +192,7 @@ class MethodAPlanResult:
     path_score: Optional[float]
     sampled_path: Optional[SampledBridgePath]
     diagnostics: MethodAPlanDiagnostics
+    path_edge_diagnostics: Tuple[EdgeScoreDiagnostics, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -648,6 +649,7 @@ def run_method_a(
         path_score=path_score,
         sampled_path=sampled_path,
         diagnostics=diagnostics,
+        path_edge_diagnostics=graph.diagnostics_for_path(path),
     )
 
 

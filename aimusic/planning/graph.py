@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Sequence, Tuple
 
 _logger = logging.getLogger(__name__)
 
@@ -19,8 +19,11 @@ from aimusic.scoring.priors import (
     Prior,
     PriorContext,
     PriorQuery,
+    TransitionScoreBreakdown,
     calculate_transition_log_weights,
+    calculate_transition_score_breakdowns,
 )
+from aimusic.scoring.gttm_features import FEATURE_REGISTRY, TransitionWindow
 from aimusic.theory.tonal import basic_space_distance, tonal_distance
 from aimusic.core.vocab import (
     DEFAULT_VOCABULARIES,
@@ -205,12 +208,114 @@ class GraphDiagnostics:
 
 
 @dataclass(frozen=True)
+class EdgeScoreDiagnostics:
+    """GTTM and prior contributions aligned with one retained graph edge."""
+
+    time_index: int
+    source: BeatState
+    target: BeatState
+    raw_feature_contributions: Mapping[str, float]
+    weighted_feature_contributions: Mapping[str, float]
+    data_logp: float
+    data_contribution: float
+    gttm_score: float
+    gttm_energy: float
+    gttm_contribution: float
+    final_log_weight: float
+    right_contexts: Tuple[BeatState, ...] = ()
+    context_strategy: str = "two_pass_successor_mean"
+
+    @property
+    def right_context_count(self) -> int:
+        return len(self.right_contexts)
+
+    def to_dict(self, vocabularies: Optional[Vocabularies] = None) -> dict[str, object]:
+        return {
+            "time_index": self.time_index,
+            "source": self.source.to_dict(vocabularies),
+            "target": self.target.to_dict(vocabularies),
+            "raw_feature_contributions": dict(self.raw_feature_contributions),
+            "weighted_feature_contributions": dict(self.weighted_feature_contributions),
+            "data_logp": self.data_logp,
+            "data_contribution": self.data_contribution,
+            "gttm_score": self.gttm_score,
+            "gttm_energy": self.gttm_energy,
+            "gttm_contribution": self.gttm_contribution,
+            "final_log_weight": self.final_log_weight,
+            "right_context_count": self.right_context_count,
+            "right_contexts": [state.to_dict(vocabularies) for state in self.right_contexts],
+            "context_strategy": self.context_strategy,
+        }
+
+
+@dataclass(frozen=True)
 class SparseGraph:
     """Sparse layered graph plus diagnostics for later SB inference."""
 
     layers: Tuple[Layer, ...]
     edges_by_time: Tuple[Tuple[Edge, ...], ...]
     diagnostics: GraphDiagnostics
+    edge_diagnostics_by_time: Tuple[Tuple[EdgeScoreDiagnostics, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.edge_diagnostics_by_time:
+            return
+        if len(self.edge_diagnostics_by_time) != len(self.edges_by_time):
+            raise ValueError("edge_diagnostics_by_time must align with edges_by_time.")
+        for time_index, (edges, diagnostics) in enumerate(
+            zip(self.edges_by_time, self.edge_diagnostics_by_time)
+        ):
+            if len(edges) != len(diagnostics):
+                raise ValueError(
+                    f"edge_diagnostics_by_time[{time_index}] must align 1:1 with edges."
+                )
+            for edge, item in zip(edges, diagnostics):
+                if (
+                    item.time_index != edge.time_index
+                    or item.source != edge.source
+                    or item.target != edge.target
+                ):
+                    raise ValueError("edge diagnostics must describe the aligned edge.")
+                if not np.isclose(item.final_log_weight, edge.log_weight, atol=1e-12):
+                    raise ValueError("edge diagnostic final_log_weight must match the edge.")
+
+    def diagnostics_for_path(
+        self,
+        path: Sequence[BeatState],
+    ) -> Tuple[EdgeScoreDiagnostics, ...]:
+        """Return retained-edge diagnostics for consecutive states on a path."""
+        path_items = tuple(path)
+        if len(path_items) < 2 or not self.edge_diagnostics_by_time:
+            return ()
+        if len(path_items) != len(self.layers):
+            raise ValueError("path must contain one state per graph layer.")
+        selected = []
+        for time_index, (source, target) in enumerate(zip(path_items, path_items[1:])):
+            matches = tuple(
+                item
+                for edge, item in zip(
+                    self.edges_by_time[time_index],
+                    self.edge_diagnostics_by_time[time_index],
+                )
+                if edge.source == source and edge.target == target
+            )
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Expected one retained edge for selected path transition {time_index}."
+                )
+            selected.append(matches[0])
+        return tuple(selected)
+
+    def inactive_feature_names(self, *, epsilon: float = 1e-12) -> Tuple[str, ...]:
+        """List registered features with no non-zero retained-edge activation."""
+        active = {
+            name
+            for layer in self.edge_diagnostics_by_time
+            for item in layer
+            for name, value in item.raw_feature_contributions.items()
+            if abs(float(value)) > epsilon
+        }
+        return tuple(name for name in FEATURE_REGISTRY if name not in active)
 
 
 def _build_prior_context(
@@ -224,6 +329,142 @@ def _build_prior_context(
         future_hints=future_hints,
         metadata=(("graph_time", str(time_index)),),
     )
+
+
+def _mean_score_breakdowns(
+    items: Sequence[TransitionScoreBreakdown],
+    *,
+    edge: Edge,
+    right_contexts: Sequence[BeatState],
+) -> EdgeScoreDiagnostics:
+    """Collapse bounded successor-specific scores into one first-order edge score."""
+    breakdowns = tuple(items)
+    if not breakdowns:
+        raise ValueError("At least one transition score breakdown is required.")
+    scale = 1.0 / len(breakdowns)
+    raw = {
+        name: float(sum(item.raw_feature_contributions[name] for item in breakdowns) * scale)
+        for name in FEATURE_REGISTRY
+    }
+    weighted = {
+        name: float(
+            sum(item.weighted_feature_contributions[name] for item in breakdowns) * scale
+        )
+        for name in FEATURE_REGISTRY
+    }
+    data_logp = float(sum(item.data_logp for item in breakdowns) * scale)
+    data_contribution = float(sum(item.data_contribution for item in breakdowns) * scale)
+    gttm_score = float(sum(weighted.values()))
+    gttm_energy = -gttm_score
+    gttm_contribution = float(sum(item.gttm_contribution for item in breakdowns) * scale)
+    final_log_weight = float(data_contribution + gttm_contribution)
+    return EdgeScoreDiagnostics(
+        time_index=edge.time_index,
+        source=edge.source,
+        target=edge.target,
+        raw_feature_contributions=raw,
+        weighted_feature_contributions=weighted,
+        data_logp=data_logp,
+        data_contribution=data_contribution,
+        gttm_score=gttm_score,
+        gttm_energy=gttm_energy,
+        gttm_contribution=gttm_contribution,
+        final_log_weight=final_log_weight,
+        right_contexts=tuple(right_contexts),
+    )
+
+
+def _rescore_retained_edges_with_windows(
+    edge_layers: Sequence[Sequence[Edge]],
+    *,
+    end_layer: Layer,
+    prior: Prior,
+    weights: Optional[PriorWeights],
+    vocabularies: Vocabularies,
+    edo: int,
+) -> tuple[Tuple[Tuple[Edge, ...], ...], Tuple[Tuple[EdgeScoreDiagnostics, ...], ...]]:
+    """Second pass: score retained edges against their bounded retained successors.
+
+    For an edge A->B, every retained B->C target supplies one right-context
+    window. Their scores are averaged uniformly. Since B has at most d_max
+    retained successors, this remains O(E * d_max) and does not alter support.
+    """
+    provisional_layers = tuple(tuple(layer) for layer in edge_layers)
+    rescored_layers: list[Tuple[Edge, ...]] = []
+    diagnostic_layers: list[Tuple[EdgeScoreDiagnostics, ...]] = []
+
+    for time_index, edges in enumerate(provisional_layers):
+        successor_targets: dict[BeatState, Tuple[BeatState, ...]] = {}
+        if time_index + 1 < len(provisional_layers):
+            grouped: dict[BeatState, set[BeatState]] = {}
+            for successor_edge in provisional_layers[time_index + 1]:
+                grouped.setdefault(successor_edge.source, set()).add(successor_edge.target)
+            successor_targets = {
+                source: tuple(sorted(targets, key=_state_sort_key))
+                for source, targets in grouped.items()
+            }
+
+        flattened_queries: list[PriorQuery] = []
+        flattened_windows: list[TransitionWindow | None] = []
+        group_sizes: list[int] = []
+        contexts_by_edge: list[Tuple[BeatState, ...]] = []
+        for edge in edges:
+            right_contexts = successor_targets.get(edge.target, ())
+            contexts_by_edge.append(right_contexts)
+            windows: tuple[TransitionWindow | None, ...]
+            if right_contexts:
+                windows = tuple(
+                    TransitionWindow(right_state=right_state)
+                    for right_state in right_contexts
+                )
+            else:
+                windows = (None,)
+            group_sizes.append(len(windows))
+            query = PriorQuery(
+                prev_state=edge.source,
+                next_state=edge.target,
+                time_index=edge.time_index,
+                context=_build_prior_context(edge.source, end_layer, edge.time_index),
+            )
+            flattened_queries.extend(query for _ in windows)
+            flattened_windows.extend(windows)
+
+        batch_breakdowns = calculate_transition_score_breakdowns(
+            flattened_queries,
+            prior=prior,
+            windows=flattened_windows,
+            weights=weights,
+            vocabularies=vocabularies,
+            edo=edo,
+        )
+        offset = 0
+        rescored_pairs: list[tuple[Edge, EdgeScoreDiagnostics]] = []
+        for edge, group_size, right_contexts in zip(
+            edges, group_sizes, contexts_by_edge
+        ):
+            edge_breakdowns = batch_breakdowns[offset : offset + group_size]
+            offset += group_size
+            diagnostic = _mean_score_breakdowns(
+                edge_breakdowns,
+                edge=edge,
+                right_contexts=right_contexts,
+            )
+            rescored_pairs.append(
+                (
+                    Edge(
+                        time_index=edge.time_index,
+                        source=edge.source,
+                        target=edge.target,
+                        log_weight=diagnostic.final_log_weight,
+                    ),
+                    diagnostic,
+                )
+            )
+        rescored_pairs.sort(key=lambda pair: _edge_sort_key(pair[0]))
+        rescored_layers.append(tuple(pair[0] for pair in rescored_pairs))
+        diagnostic_layers.append(tuple(pair[1] for pair in rescored_pairs))
+
+    return tuple(rescored_layers), tuple(diagnostic_layers)
 
 
 def _candidate_result_for_target_layer(
@@ -466,11 +707,20 @@ def build_sparse_graph(
         )
         _logger.debug(f"Layer {next_time}: {len(current_layer)} sources, {raw_candidate_count} candidates, {len(next_layer)} kept, {len(edge_layers[-1])} edges")
 
+    rescored_edge_layers, edge_diagnostics = _rescore_retained_edges_with_windows(
+        edge_layers,
+        end_layer=end_layer,
+        prior=resolved_prior,
+        weights=weights,
+        vocabularies=resolved_vocabs,
+        edo=resolved_edo,
+    )
     return SparseGraph(
         layers=tuple(layers),
-        edges_by_time=tuple(edge_layers),
+        edges_by_time=rescored_edge_layers,
         diagnostics=GraphDiagnostics(
             layer_sizes=tuple(len(layer) for layer in layers),
             layer_diagnostics=tuple(diagnostics),
         ),
+        edge_diagnostics_by_time=edge_diagnostics,
     )

@@ -152,6 +152,14 @@ class TransitionWindow:
     right_state: Optional[BeatState] = None
 
 
+class FeatureContextRequirement(str, Enum):
+    """State context a registered feature needs in production scoring."""
+
+    CURRENT = "current"
+    PREVIOUS_CURRENT = "previous_current"
+    PREVIOUS_CURRENT_RIGHT = "previous_current_right"
+
+
 @dataclass(frozen=True)
 class GTTMFeatureSpec:
     """Metadata for one named BeatState feature."""
@@ -160,6 +168,9 @@ class GTTMFeatureSpec:
     family: str
     func: Callable[..., float]
     base_weight: float = 1.0
+    context_requirement: FeatureContextRequirement = (
+        FeatureContextRequirement.PREVIOUS_CURRENT
+    )
 
 
 def beats_per_bar(
@@ -662,50 +673,73 @@ def groove_boundary_change_feature(
 
 
 FEATURE_REGISTRY: Dict[str, GTTMFeatureSpec] = {
-    "meter_stability": GTTMFeatureSpec("meter_stability", "meter", meter_stability_feature, 1.0),
+    "meter_stability": GTTMFeatureSpec(
+        "meter_stability", "meter", meter_stability_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
+    ),
     "beat_position_validity": GTTMFeatureSpec(
-        "beat_position_validity", "meter", beat_position_validity_feature, 1.0
+        "beat_position_validity", "meter", beat_position_validity_feature, 1.0,
+        FeatureContextRequirement.CURRENT,
     ),
     "boundary_placement": GTTMFeatureSpec(
-        "boundary_placement", "meter", boundary_placement_feature, 1.0
+        "boundary_placement", "meter", boundary_placement_feature, 1.0,
+        FeatureContextRequirement.CURRENT,
     ),
     "strong_beat_bias": GTTMFeatureSpec(
-        "strong_beat_bias", "meter", strong_beat_bias_feature, 1.0
+        "strong_beat_bias", "meter", strong_beat_bias_feature, 1.0,
+        FeatureContextRequirement.CURRENT,
     ),
-    "grouping_onset": GTTMFeatureSpec("grouping_onset", "grouping", grouping_onset_feature, 1.0),
+    "grouping_onset": GTTMFeatureSpec(
+        "grouping_onset", "grouping", grouping_onset_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
+    ),
     "grouping_boundary_resolution": GTTMFeatureSpec(
-        "grouping_boundary_resolution", "grouping", grouping_boundary_resolution_feature, 1.0
+        "grouping_boundary_resolution", "grouping", grouping_boundary_resolution_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT_RIGHT,
     ),
     "grouping_downbeat_alignment": GTTMFeatureSpec(
-        "grouping_downbeat_alignment", "grouping", grouping_downbeat_alignment_feature, 1.0
+        "grouping_downbeat_alignment", "grouping", grouping_downbeat_alignment_feature, 1.0,
+        FeatureContextRequirement.CURRENT,
     ),
     "harmonic_key_proximity": GTTMFeatureSpec(
-        "harmonic_key_proximity", "harmonic", harmonic_key_proximity_feature, 1.0
+        "harmonic_key_proximity", "harmonic", harmonic_key_proximity_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
     "harmonic_key_neighbor": GTTMFeatureSpec(
-        "harmonic_key_neighbor", "harmonic", harmonic_key_neighbor_feature, 0.8
+        "harmonic_key_neighbor", "harmonic", harmonic_key_neighbor_feature, 0.8,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
     "harmonic_chord_proximity": GTTMFeatureSpec(
-        "harmonic_chord_proximity", "harmonic", harmonic_chord_proximity_feature, 1.2
+        "harmonic_chord_proximity", "harmonic", harmonic_chord_proximity_feature, 1.2,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
     "cadential_harmonic_motion": GTTMFeatureSpec(
-        "cadential_harmonic_motion", "harmonic", cadential_harmonic_motion_feature, 1.0
+        "cadential_harmonic_motion", "harmonic", cadential_harmonic_motion_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
     "role_meter_alignment": GTTMFeatureSpec(
-        "role_meter_alignment", "prolongational_role", role_meter_alignment_feature, 1.0
+        "role_meter_alignment", "prolongational_role", role_meter_alignment_feature, 1.0,
+        FeatureContextRequirement.CURRENT,
     ),
     "role_transition": GTTMFeatureSpec(
-        "role_transition", "prolongational_role", role_transition_feature, 0.9
+        "role_transition", "prolongational_role", role_transition_feature, 0.9,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
-    "head_anchor": GTTMFeatureSpec("head_anchor", "melodic_head", head_anchor_feature, 1.0),
+    "head_anchor": GTTMFeatureSpec(
+        "head_anchor", "melodic_head", head_anchor_feature, 1.0,
+        FeatureContextRequirement.CURRENT,
+    ),
     "head_resolution": GTTMFeatureSpec(
-        "head_resolution", "melodic_head", head_resolution_feature, 1.0
+        "head_resolution", "melodic_head", head_resolution_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
     "groove_continuity": GTTMFeatureSpec(
-        "groove_continuity", "groove", groove_continuity_feature, 1.0
+        "groove_continuity", "groove", groove_continuity_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
     "groove_boundary_change": GTTMFeatureSpec(
-        "groove_boundary_change", "groove", groove_boundary_change_feature, 1.0
+        "groove_boundary_change", "groove", groove_boundary_change_feature, 1.0,
+        FeatureContextRequirement.PREVIOUS_CURRENT,
     ),
 }
 

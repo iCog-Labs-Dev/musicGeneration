@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
-from typing import Optional, Protocol, Sequence, Tuple, cast, runtime_checkable
+from typing import Mapping, Optional, Protocol, Sequence, Tuple, cast, runtime_checkable
 
 from aimusic.core.config import (
     NeuralPriorConfig,
@@ -13,7 +13,11 @@ from aimusic.core.config import (
     PriorWeights,
 )
 from aimusic.core.core_types import BeatState
-from aimusic.scoring.gttm_features import TransitionWindow, calculate_gttm_energy
+from aimusic.scoring.gttm_features import (
+    TransitionWindow,
+    transition_feature_vector,
+    weighted_feature_breakdown,
+)
 
 
 STRUCTURAL_STREAM_NAMES: Tuple[str, ...] = (
@@ -669,6 +673,132 @@ def prior_logps(prior: Prior, queries: Sequence[PriorQuery]) -> Tuple[float, ...
     )
 
 
+@dataclass(frozen=True)
+class TransitionScoreBreakdown:
+    """All components used to produce one production transition weight."""
+
+    raw_feature_contributions: Mapping[str, float]
+    weighted_feature_contributions: Mapping[str, float]
+    data_logp: float
+    data_contribution: float
+    gttm_score: float
+    gttm_energy: float
+    gttm_contribution: float
+    final_log_weight: float
+
+
+def _transition_score_breakdown_from_data_logp(
+    query: PriorQuery,
+    data_logp: float,
+    *,
+    window: Optional[TransitionWindow],
+    weights: PriorWeights,
+    meters=None,
+    vocabularies=None,
+    edo: Optional[int] = None,
+) -> TransitionScoreBreakdown:
+    raw = transition_feature_vector(
+        query.prev_state,
+        query.next_state,
+        query.time_index,
+        window=window,
+        meters=meters,
+        vocabularies=vocabularies,
+        edo=edo,
+    )
+    weighted = weighted_feature_breakdown(
+        query.prev_state,
+        query.next_state,
+        query.time_index,
+        window=window,
+        meters=meters,
+        vocabularies=vocabularies,
+        edo=edo,
+        weights=weights,
+    )
+    gttm_score = float(sum(weighted.values()))
+    gttm_energy = -gttm_score
+    data_contribution = float(weights.lambda_data * data_logp)
+    gttm_contribution = float(-weights.lambda_gttm * gttm_energy)
+    final_log_weight = float(data_contribution + gttm_contribution)
+    return TransitionScoreBreakdown(
+        raw_feature_contributions=dict(raw),
+        weighted_feature_contributions=dict(weighted),
+        data_logp=float(data_logp),
+        data_contribution=data_contribution,
+        gttm_score=gttm_score,
+        gttm_energy=gttm_energy,
+        gttm_contribution=gttm_contribution,
+        final_log_weight=final_log_weight,
+    )
+
+
+def calculate_transition_score_breakdown(
+    prev_state: BeatState,
+    next_state: BeatState,
+    t: int,
+    *,
+    prior: Prior,
+    context: Optional[PriorContext] = None,
+    window: Optional[TransitionWindow] = None,
+    weights: Optional[PriorWeights] = None,
+    meters=None,
+    vocabularies=None,
+    edo: Optional[int] = None,
+) -> TransitionScoreBreakdown:
+    """Scalar transition scoring with raw and weighted feature diagnostics."""
+    resolved_weights = PriorWeights() if weights is None else weights
+    query = PriorQuery(prev_state, next_state, t, context)
+    data_logp = float(prior.logp_next(prev_state, next_state, t, context))
+    return _transition_score_breakdown_from_data_logp(
+        query,
+        data_logp,
+        window=window,
+        weights=resolved_weights,
+        meters=meters,
+        vocabularies=vocabularies,
+        edo=edo,
+    )
+
+
+def calculate_transition_score_breakdowns(
+    queries: Sequence[PriorQuery],
+    *,
+    prior: Prior,
+    windows: Optional[Sequence[Optional[TransitionWindow]]] = None,
+    weights: Optional[PriorWeights] = None,
+    meters=None,
+    vocabularies=None,
+    edo: Optional[int] = None,
+) -> Tuple[TransitionScoreBreakdown, ...]:
+    """Batch transition scoring with windows aligned one-to-one with queries."""
+    query_items = tuple(queries)
+    resolved_weights = PriorWeights() if weights is None else weights
+    data_scores = prior_logps(prior, query_items)
+    if len(data_scores) != len(query_items):
+        raise ValueError("prior scoring must return one score per query.")
+
+    if windows is None:
+        window_items: tuple[TransitionWindow | None, ...] = (None,) * len(query_items)
+    else:
+        window_items = tuple(windows)
+        if len(window_items) != len(query_items):
+            raise ValueError("windows must align 1:1 with queries.")
+
+    return tuple(
+        _transition_score_breakdown_from_data_logp(
+            query,
+            data_scores[idx],
+            window=window_items[idx],
+            weights=resolved_weights,
+            meters=meters,
+            vocabularies=vocabularies,
+            edo=edo,
+        )
+        for idx, query in enumerate(query_items)
+    )
+
+
 def calculate_transition_log_weight(
     prev_state: BeatState,
     next_state: BeatState,
@@ -683,19 +813,18 @@ def calculate_transition_log_weight(
     edo: Optional[int] = None,
 ) -> float:
     """Combine prior data likelihood and GTTM energy into one graph-ready edge weight."""
-    resolved_weights = PriorWeights() if weights is None else weights
-    data_logp = float(prior.logp_next(prev_state, next_state, t, context))
-    gttm_energy = calculate_gttm_energy(
+    return calculate_transition_score_breakdown(
         prev_state,
         next_state,
         t,
+        prior=prior,
+        context=context,
         window=window,
+        weights=weights,
         meters=meters,
         vocabularies=vocabularies,
         edo=edo,
-        weights=resolved_weights,
-    )
-    return (resolved_weights.lambda_data * data_logp) - (resolved_weights.lambda_gttm * gttm_energy)
+    ).final_log_weight
 
 
 def calculate_transition_log_weights(
@@ -709,34 +838,18 @@ def calculate_transition_log_weights(
     edo: Optional[int] = None,
 ) -> Tuple[float, ...]:
     """Batch version of transition log-weight scoring."""
-    query_items = tuple(queries)
-    resolved_weights = PriorWeights() if weights is None else weights
-    data_scores = prior_logps(prior, query_items)
-
-    if windows is None:
-        window_items: tuple[TransitionWindow | None, ...] = (None,) * len(query_items)
-    else:
-        window_items = tuple(windows)
-        if len(window_items) != len(query_items):
-            raise ValueError("windows must align 1:1 with queries.")
-
-    results = []
-    for idx, query in enumerate(query_items):
-        gttm_energy = calculate_gttm_energy(
-            query.prev_state,
-            query.next_state,
-            query.time_index,
-            window=window_items[idx],
+    return tuple(
+        item.final_log_weight
+        for item in calculate_transition_score_breakdowns(
+            queries,
+            prior=prior,
+            windows=windows,
+            weights=weights,
             meters=meters,
             vocabularies=vocabularies,
             edo=edo,
-            weights=resolved_weights,
         )
-        results.append(
-            (resolved_weights.lambda_data * data_scores[idx])
-            - (resolved_weights.lambda_gttm * gttm_energy)
-        )
-    return tuple(float(value) for value in results)
+    )
 
 
 calculate_log_weight = calculate_transition_log_weight
