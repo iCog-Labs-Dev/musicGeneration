@@ -20,7 +20,10 @@ It targets the full symbolic music generation pipeline:
 7. MIDI rendering and export
 8. Diagnostics, CLI, and evaluation
 
-The immediate output remains symbolic score plus MIDI. Audio synthesis is out of scope for the MVP.
+The immediate output remains symbolic score plus MIDI. Full generative audio
+synthesis remains out of scope for the **symbolic MVP**. Optional post-MVP
+MIDI→audio integration (RenderPackage + `aimusic.audio`) is tracked as
+**EPIC 11** — see [`docs/audio-roadmap.md`](docs/audio-roadmap.md).
 
 ## Current Repository Baseline
 
@@ -296,6 +299,31 @@ The major missing pieces are:
 - [ ] Long-form planning no longer relies on one monolithic SB pass.
 - [ ] Method B and hybrid priors are integrated without destabilizing Method A.
 - [ ] The project can target 5-15 minute forms with bounded compute.
+
+### EPIC 11: Optional MIDI→Audio Production Pipeline (post-MVP)
+
+**Goal:** Quarantined audio path behind a RenderPackage file contract without
+compromising symbolic purity or core install weight.
+
+**Primary modules:** `aimusic/core/render_package.py`, `aimusic/audio/*`,
+`config/audio.default.yaml`
+
+**Docs:** `docs/audio-pipeline.md`, `docs/audio-roadmap.md`, `DECISIONS.md`
+
+**Tasks**
+
+- [x] M0: RenderPackage contract + architecture quarantine + always-emit from `generate`
+- [ ] M1: Deterministic spine (groove + stem render + orchestrator)
+- [ ] M1.5–M2: Microtonal routing + scorers
+- [ ] M3: One restyle endpoint end-to-end (mock in CI)
+- [ ] M4–M6: References, breadth, single-ref seams
+- [ ] B4 host-conditioned planning (deferred next quarter)
+
+**Definition of done**
+
+- [ ] `pip install aimusic` stays free of torch/librosa/demucs
+- [ ] Every `generate` run emits a valid `run_<hash>/` RenderPackage
+- [ ] Optional `[audio]` path can produce stems/master from fixtures under CI budget
 
 ## Phase Plan
 

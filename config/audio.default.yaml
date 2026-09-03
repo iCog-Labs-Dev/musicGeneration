@@ -1,0 +1,58 @@
+version: 1
+mode: corpus  # corpus | single_ref
+edo:
+  tolerance_cents: 8
+  allow_microtonal_diffusion: false
+groove:
+  author: spec_file
+  spec_file: null
+  template_from_refs: true
+  tension_coupling: {velocity_depth: 0.3, push_scale: 0.5}
+  models: {groovae_drums: false, midi_gpt: false}
+render:
+  sample_rate: 48000
+  headroom_dbfs: -12
+  backend: simple  # CI-safe default; use fluidsynth in production
+  allow_simple_fallback: true
+  routing:
+    drums: {default: fluidsynth, microtonal: fluidsynth}
+    bass: {default: simple, microtonal: simple}
+    comping: {default: simple, microtonal: simple}
+    lead: {default: simple, microtonal: simple}
+restyle:
+  endpoints: [stable_audio_a2a]
+  strength_base: {drums: 0.85, bass: 0.75, comping: 0.70, lead: 0.65}
+  microtonal_penalty: 0.35
+  tension_gain: 0.10
+  chunk: {overlap_bars: 2, seam_on_boundary_lvl: 3}
+scoring:
+  weights: {rhythm: 0.30, notes: 0.25, tuning: 0.10, clap: 0.15, fad: 0.20}
+  floors: {rhythm_f: 0.85, notes_f1: 0.70, tuning_cents_p95: 15.0}
+  role_overrides:
+    drums: {rhythm: 0.50, notes: 0.10}
+    lead: {notes: 0.40}
+search:
+  strength_grid: [0.6, 0.7, 0.8, 0.9]
+  prompt_variants: 3
+  seeds: 2
+  successive_halving: true
+budget:
+  max_endpoint_calls: 200
+  max_usd_estimate: 25.0
+mixmaster:
+  lufs_targets: {drums: -12, bass: -13, comping: -15, lead: -12, master: -10}
+  cover_blend: {enabled: false, level: 0.30, highpass_hz: 180}
+  master_reference: null
+stages:
+  analysis: true
+  expressivization: true
+  render: true
+  prompts: false
+  restyle: false
+  scoring: false
+  mixmaster: false
+paths:
+  cache_dir: .cache/aimusic_audio
+  output_dir: outputs/audio
+  soundfont: null
+  reference_corpus: []

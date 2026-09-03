@@ -20,16 +20,15 @@ from aimusic.core.config import (
 from aimusic.core.core_types import Score, ScoreValidationError
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
-from aimusic.planning.plans import MethodARunConfig, run_method_a
+from aimusic.planning.plans import MethodARunConfig, PlanningSection, run_method_a
 from aimusic.render import TrackInstrumentConfig, render_midi
+from aimusic.render.package import write_render_package
+from aimusic.scoring.tension import (
+    compare_tension_curves,
+    realized_tension_curve,
+    target_tension_curve,
+)
 from aimusic.theory.edo import EDO
-
-ROLE_TENSION = {
-    "hold": 0.20,
-    "prep": 0.45,
-    "change": 0.65,
-    "cad": 0.90,
-}
 
 
 def _json_ready(value: Any) -> Any:
@@ -63,24 +62,27 @@ def _segment_timeline(values: Iterable[str]) -> list[TimelineEvent]:
     return events
 
 
-def _build_structural_diagnostics(path: tuple[Any, ...], vocabularies: Any) -> StructuralDiagnostics:
+def _build_structural_diagnostics(
+    path: tuple[Any, ...],
+    vocabularies: Any,
+    edo: int,
+    sections: tuple[PlanningSection, ...] = (),
+) -> StructuralDiagnostics:
     decoded_states = path[:-1] if len(path) > 1 else path
     key_labels = [vocabularies.keys.token_for_id(state.key_id).label for state in decoded_states]
     chord_labels = [vocabularies.chords.token_for_id(state.chord_id).label for state in decoded_states]
     role_labels = [vocabularies.roles.token_for_id(state.role_id).label for state in decoded_states]
     groove_labels = [vocabularies.grooves.token_for_id(state.groove_id).label for state in decoded_states]
     boundaries = [float(index) for index, state in enumerate(decoded_states) if state.boundary_lvl > 0]
-    tension_curve = [
-        (
-            float(index),
-            min(
-                1.0,
-                ROLE_TENSION[vocabularies.roles.token_for_id(state.role_id).label]
-                + (0.05 * state.boundary_lvl),
-            ),
-        )
-        for index, state in enumerate(decoded_states)
-    ]
+
+    tension_curve = realized_tension_curve(decoded_states, vocabularies, edo)
+    tension_target_curve = target_tension_curve(sections) if sections else []
+    deviation = (
+        compare_tension_curves(tension_target_curve, tension_curve, sections)
+        if tension_target_curve
+        else None
+    )
+
     return StructuralDiagnostics(
         key_timeline=_segment_timeline(key_labels),
         chord_timeline=_segment_timeline(chord_labels),
@@ -88,6 +90,8 @@ def _build_structural_diagnostics(path: tuple[Any, ...], vocabularies: Any) -> S
         groove_timeline=_segment_timeline(groove_labels),
         boundaries=boundaries,
         tension_curve=tension_curve,
+        target_tension_curve=tension_target_curve,
+        tension_deviation=dataclasses.asdict(deviation) if deviation is not None else {},
     )
 
 
@@ -171,7 +175,12 @@ def handle_generate(args: argparse.Namespace) -> None:
         edo=args.edo,
         tempo_bpm=args.tempo_bpm,
     )
-    structural_stats = _build_structural_diagnostics(plan_result.path, plan_result.vocabularies)
+    structural_stats = _build_structural_diagnostics(
+        plan_result.path,
+        plan_result.vocabularies,
+        edo=args.edo,
+        sections=plan_result.endpoints.sections,
+    )
     manifest = RunManifest(
         seed=args.seed,
         config_dump=_json_ready(
@@ -193,6 +202,7 @@ def handle_generate(args: argparse.Namespace) -> None:
     score_path = out_dir / f"{manifest.run_id}_score.json"
     midi_path = out_dir / f"{manifest.run_id}.mid"
     manifest_path = out_dir / f"{manifest.run_id}_manifest.json"
+    track_instruments = _build_track_instruments(args)
 
     with score_path.open("w", encoding="utf-8") as f:
         json.dump(score.to_dict(), f, indent=2)
@@ -201,15 +211,35 @@ def handle_generate(args: argparse.Namespace) -> None:
         score,
         _build_edo(args),
         str(midi_path),
-        track_instruments=_build_track_instruments(args),
+        track_instruments=track_instruments,
     )
 
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest.to_dict(), f, indent=2)
 
+    track_programs = {
+        name: (None if cfg.is_drum else cfg.program)
+        for name, cfg in track_instruments.items()
+    }
+    package = write_render_package(
+        out_dir,
+        score=score,
+        midi_path=midi_path,
+        manifest=manifest,
+        path=plan_result.path,
+        vocabularies=plan_result.vocabularies,
+        edo=args.edo,
+        base_tuning=args.base_tuning,
+        pitch_bend_range=args.pitch_bend_range,
+        rendering_method=args.rendering_method,
+        track_programs=track_programs,
+        run_id=manifest.run_id,
+    )
+
     print(f"Generated score JSON: {score_path}")
     print(f"Generated multitrack MIDI: {midi_path}")
     print(f"Generated manifest: {manifest_path}")
+    print(f"Generated RenderPackage: {package.root}")
 
 def _load_json_file(path: Path, *, kind: str) -> Any:
     """Load a JSON file, converting missing/malformed files into actionable exits."""
@@ -283,10 +313,60 @@ def handle_inspect(args: argparse.Namespace) -> None:
     else:
         print("  (none)")
 
-    print("\n--- Tension Arc ---")
-    for time_val, tension in structure.get("tension_curve", []):
+    realized = structure.get("tension_curve", [])
+    target = structure.get("target_tension_curve", [])
+
+    print("\n--- Tension Arc (realized) ---")
+    for time_val, tension in realized:
         bar = "#" * int(tension * 20)
         print(f"Beat {time_val:04.1f}: {bar} ({tension:.3f})")
+
+    if target:
+        print("\n--- Target vs Realized Tension ---")
+        target_by_time = {t: v for t, v in target}
+        for time_val, r_tension in realized:
+            t_tension = target_by_time.get(time_val)
+            r_bar = "#" * int(r_tension * 20)
+            if t_tension is None:
+                print(f"  t={time_val:04.1f}  realized {r_bar:<20} ({r_tension:.3f})  target n/a")
+                continue
+            t_bar = "*" * int(t_tension * 20)
+            delta = r_tension - t_tension
+            sign = "+" if delta >= 0 else "-"
+            print(
+                f"  t={time_val:04.1f}  "
+                f"target   {t_bar:<20} ({t_tension:.3f})  |  "
+                f"realized {r_bar:<20} ({r_tension:.3f})  "
+                f"[{sign}{abs(delta):.3f}]"
+            )
+
+    deviation = structure.get("tension_deviation", {})
+    if deviation:
+        print("\n--- Tension Deviation Report ---")
+        mae = deviation.get("mean_absolute_error")
+        max_err = deviation.get("max_absolute_error")
+        peak_off = deviation.get("peak_timing_offset")
+        shape_corr = deviation.get("shape_correlation")
+        print(f"Mean absolute error:  {mae:.4f}" if isinstance(mae, (int, float)) else f"Mean absolute error:  {mae}")
+        print(f"Max absolute error:   {max_err:.4f}" if isinstance(max_err, (int, float)) else f"Max absolute error:   {max_err}")
+        print(f"Target peak time:     {deviation.get('target_peak_time')}")
+        print(f"Realized peak time:   {deviation.get('realized_peak_time')}")
+        print(
+            f"Peak timing offset:   {peak_off:+.2f} beats (realized - target)"
+            if isinstance(peak_off, (int, float))
+            else f"Peak timing offset:   {peak_off}"
+        )
+        print(
+            f"Shape correlation:    {shape_corr:.4f} (Pearson, -1..1)"
+            if isinstance(shape_corr, (int, float))
+            else f"Shape correlation:    {shape_corr}"
+        )
+        section_errors = deviation.get("section_errors", {})
+        if section_errors:
+            print("Section-level MAE:")
+            for name, err in section_errors.items():
+                print(f"  {name}: {err:.4f}" if isinstance(err, (int, float)) else f"  {name}: {err}")
+
     print("=========================================================\n")
 
 

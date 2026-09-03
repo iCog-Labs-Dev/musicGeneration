@@ -244,7 +244,12 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         edo=params.edo,
         tempo_bpm=params.tempo_bpm,
     )
-    structural_stats = _build_structural_diagnostics(plan_result.path, plan_result.vocabularies)
+    structural_stats = _build_structural_diagnostics(
+        plan_result.path,
+        plan_result.vocabularies,
+        edo=params.edo,
+        sections=plan_result.endpoints.sections,
+    )
     track_instruments = _build_track_instruments(params)
     manifest = RunManifest(
         seed=params.seed,
