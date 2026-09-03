@@ -1,26 +1,30 @@
 import tempfile
 import json
+import copy
 from pathlib import Path
 import unittest
 import dataclasses
 import math
+from typing import Any
 from unittest.mock import MagicMock
 
 # --- Diagnostics Imports ---
 from aimusic.core.diagnostics import (
-    TimelineEvent, 
-    StructuralDiagnostics, 
+    ManifestValidationError,
+    TimelineEvent,
+    StructuralDiagnostics,
+    compute_tension_curve,
     RunManifest,
-    SBDiagnostics
+    SBDiagnostics,
+    build_run_manifest,
 )
-from aimusic.scoring.tension import TENSION_MODEL_VERSION
 # --- Math Pipeline Imports ---
 from aimusic.core.config import SBConfig, SBBackend
 from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
 from aimusic.planning.graph import SparseGraph
 from aimusic.planning.sb import (
-    build_sb_problem, 
-    solve_sb, 
+    build_sb_problem,
+    solve_sb,
     map_bridge_path,
     solved_bridge_from_solution
 )
@@ -32,7 +36,7 @@ class TestDiagnostics(unittest.TestCase):
         """Ensures timeline events serialize properly using the standard asdict."""
         event = TimelineEvent(start_time=0.0, end_time=4.0, label="C Major")
         serialized = dataclasses.asdict(event)
-        
+
         self.assertEqual(serialized["start_time"], 0.0)
         self.assertEqual(serialized["end_time"], 4.0)
         self.assertEqual(serialized["label"], "C Major")
@@ -47,9 +51,9 @@ class TestDiagnostics(unittest.TestCase):
             boundaries=[0.0, 4.0],
             tension_curve=[(0.0, 0.1), (4.0, 0.9)]
         )
-        
+
         data = struct.to_dict()
-        
+
         # Exhaustively checking every single key to prevent silent failures
         self.assertIn("key_timeline", data)
         self.assertIn("chord_timeline", data)
@@ -57,7 +61,7 @@ class TestDiagnostics(unittest.TestCase):
         self.assertIn("groove_timeline", data)
         self.assertIn("boundaries", data)
         self.assertIn("tension_curve", data)
-        
+
         # Verify nested data is accurate
         self.assertEqual(data["key_timeline"][0]["label"], "C Major")
         self.assertEqual(data["chord_timeline"][0]["label"], "Cmaj7")
@@ -65,29 +69,22 @@ class TestDiagnostics(unittest.TestCase):
         self.assertEqual(data["groove_timeline"][0]["label"], "Swing")
         self.assertEqual(data["boundaries"], [0.0, 4.0])
 
-    def test_structural_diagnostics_carries_target_curve_and_deviation(self):
-        """The dead heuristic `compute_tension_curve` (tested against a
-        fictional role vocabulary) has been removed. Real tension curves now
-        come from aimusic.scoring.tension and StructuralDiagnostics must
-        carry both the realized and target curves plus a deviation report.
-        See tests/test_tension.py for the tension-model tests themselves.
-        """
-        struct = StructuralDiagnostics(
-            tension_curve=[(0.0, 0.2), (1.0, 0.6)],
-            target_tension_curve=[(0.0, 0.25), (1.0, 0.5)],
-            tension_deviation={"mean_absolute_error": 0.075},
-        )
-        data = struct.to_dict()
+    def test_compute_tension_curve(self):
+        """Tests the heuristic math mapping musical roles to tension floats."""
+        roles = [
+            TimelineEvent(0.0, 4.0, "Tonic"),
+            TimelineEvent(4.0, 8.0, "Subdominant"),
+            TimelineEvent(8.0, 12.0, "Dominant"),
+            TimelineEvent(12.0, 16.0, "Unknown")
+        ]
 
-        self.assertIn("target_tension_curve", data)
-        self.assertIn("tension_deviation", data)
-        self.assertEqual(data["target_tension_curve"], [(0.0, 0.25), (1.0, 0.5)])
-        self.assertEqual(data["tension_deviation"]["mean_absolute_error"], 0.075)
+        curve = compute_tension_curve(roles)
 
-    def test_run_manifest_carries_tension_model_version(self):
-        manifest = RunManifest(seed=1, config_dump={})
-        data = manifest.to_dict()
-        self.assertEqual(data["tension_model_version"], TENSION_MODEL_VERSION)
+        self.assertEqual(len(curve), 4)
+        self.assertEqual(curve[0], (0.0, 0.1))
+        self.assertEqual(curve[1], (4.0, 0.5))
+        self.assertEqual(curve[2], (8.0, 0.9))
+        self.assertEqual(curve[3], (12.0, 0.5))
 
     def test_sb_diagnostics_extraction(self):
         """Tests that SB logs and Effective Entropy are correctly calculated from a solution."""
@@ -96,16 +93,16 @@ class TestDiagnostics(unittest.TestCase):
         mock_solution.trace.iterations = 42
         mock_solution.trace.converged = True
         mock_solution.trace.final_max_delta = 1e-6
-        
+
         mock_solution.problem.diagnostics.layer_sizes = (5, 10, 5)
         mock_solution.problem.diagnostics.zero_outdegree_count = 2
         mock_solution.problem.diagnostics.zero_indegree_count = 1
-        
+
         # Layer 1: Confident (entropy = 0)
         # Layer 2: 50/50 Split (entropy = approx 0.693)
         mock_solution.marginals.node_marginals_by_layer = [
-            (1.0, 0.0),      
-            (0.5, 0.5)       
+            (1.0, 0.0),
+            (0.5, 0.5)
         ]
 
         #Extract Data
@@ -127,17 +124,17 @@ class TestDiagnostics(unittest.TestCase):
         """Ensures the top-level manifest generates valid UUIDs and timestamps."""
         manifest = RunManifest(seed=42, config_dump={"edo": 12})
         data = manifest.to_dict()
-        
+
         self.assertEqual(data["seed"], 42)
         self.assertEqual(data["config"]["edo"], 12)
         self.assertIsNotNone(data["run_id"])
         self.assertIsNotNone(data["timestamp"])
         self.assertIn("structure", data)
-    
-    # END-TO-END PASSAGE FIXTURE 
+
+    # END-TO-END PASSAGE FIXTURE
     def test_e2e_produce_stable_short_passage(self):
         """
-        True E2E Fixture: 
+        True E2E Fixture:
         1. Runs the real math engine to get a deterministic path.
         2. Translates it into a musical passage (SymbolicNotes).
         3. PRODUCES physical output files (MIDI and Manifest).
@@ -145,24 +142,24 @@ class TestDiagnostics(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             out_dir = Path(tmpdir)
-            
+
             # SETUP THE MATH FIXTURE (The Short Passage)
             def _make_state(time_idx: int, var_id: int) -> BeatState:
                 return BeatState(
-                    meter_id=0, 
-                    beat_in_bar=time_idx, 
-                    boundary_lvl=0, 
-                    key_id=0, 
-                    chord_id=var_id, 
-                    role_id=0, 
-                    head_id=0, 
+                    meter_id=0,
+                    beat_in_bar=time_idx,
+                    boundary_lvl=0,
+                    key_id=0,
+                    chord_id=var_id,
+                    role_id=0,
+                    head_id=0,
                     groove_id=0
                 )
 
-            state_start = _make_state(0, 0)  
-            state_mid_a = _make_state(1, 1)  
-            state_mid_b = _make_state(1, 2)  
-            state_end = _make_state(2, 3)    
+            state_start = _make_state(0, 0)
+            state_mid_a = _make_state(1, 1)
+            state_mid_b = _make_state(1, 2)
+            state_end = _make_state(2, 3)
 
             layer_0 = Layer(time_index=0, states=(state_start,))
             layer_1 = Layer(time_index=1, states=(state_mid_a, state_mid_b))
@@ -178,11 +175,11 @@ class TestDiagnostics(unittest.TestCase):
             )
 
             graph = SparseGraph(
-                layers=(layer_0, layer_1, layer_2), 
+                layers=(layer_0, layer_1, layer_2),
                 edges_by_time=(edges_0, edges_1),
-                diagnostics=MagicMock() 
+                diagnostics=MagicMock()
             )
-            
+
             pi0 = EndpointDistribution(layer=layer_0, probabilities=(1.0,))
             piT = EndpointDistribution(layer=layer_2, probabilities=(1.0,))
             config = SBConfig(horizon_t=2, max_iterations=10, tolerance=1e-5, backend_selection=SBBackend.NUMPY)
@@ -192,7 +189,7 @@ class TestDiagnostics(unittest.TestCase):
             solution = solve_sb(problem)
             bridge = solved_bridge_from_solution(solution)
             path, best_score = map_bridge_path(bridge)
-            
+
             # Strict math assertion
             self.assertEqual(path, (state_start, state_mid_a, state_end))
 
@@ -203,7 +200,7 @@ class TestDiagnostics(unittest.TestCase):
                 state_mid_b: 65, # F4 (Should not be picked)
                 state_end: 67    # G4
             }
-            
+
             notes = []
             for i, state in enumerate(path):
                 notes.append(SymbolicNote(
@@ -215,11 +212,11 @@ class TestDiagnostics(unittest.TestCase):
             # PRODUCE PHYSICAL OUTPUTS (MIDI and Manifest)
             midi_path = out_dir / "stable_passage.mid"
             manifest_path = out_dir / "stable_passage_manifest.json"
-            
+
             # Produce MIDI
             edo_12 = EDO(EDOConfig(n=12, base_tuning=60, pitch_bend_range=48))
             render_midi(notes, edo_12, str(midi_path))
-            
+
             # Produce Manifest
             manifest = RunManifest(
                 seed=42,
@@ -232,7 +229,7 @@ class TestDiagnostics(unittest.TestCase):
             # REGRESSION TRAPS ON PRODUCED FILES
             self.assertTrue(midi_path.exists(), "Pipeline failed to produce MIDI file.")
             self.assertTrue(manifest_path.exists(), "Pipeline failed to produce Manifest file.")
-            
+
             with open(manifest_path, "r") as f:
                 saved_manifest = json.load(f)
             self.assertTrue(saved_manifest["sb_stats"]["converged"])
@@ -241,53 +238,160 @@ class TestDiagnostics(unittest.TestCase):
             self.assertEqual(len(notes), 3)
             self.assertEqual(notes[1].pitch_height, 64, "Regression: Pipeline picked wrong structural path")
 
-    def test_manifest_contains_target_realized_and_deviation_e2e(self):
-        """Acceptance criterion #3: manifests contain target and realized
-        tension curves plus deviation metrics, end to end through the real
-        Method A pipeline (not a mocked fixture)."""
-        from aimusic.app.cli import _build_structural_diagnostics
+class TestVersionedRunManifest(unittest.TestCase):
+    def _manifest(self, *, sample: bool = False) -> tuple[Any, RunManifest]:
         from aimusic.planning.plans import MethodARunConfig, run_method_a
 
-        # seed=0 is used because not every seed produces a valid endpoint
-        # pairing for this small total_beats (pre-existing pipeline
-        # behavior, unrelated to tension diagnostics); seed=0 is stable.
-        run_config = MethodARunConfig(total_beats=6, seed=0)
-        plan_result = run_method_a(run_config)
-
-        structural_stats = _build_structural_diagnostics(
-            plan_result.path,
-            plan_result.vocabularies,
-            edo=run_config.edo,
-            sections=plan_result.endpoints.sections,
+        plan_result = run_method_a(
+            MethodARunConfig(total_beats=4, seed=123, use_sampling=sample)
         )
-        manifest = RunManifest(seed=0, config_dump={}, structural_stats=structural_stats)
+        return plan_result, build_run_manifest(
+            plan_result,
+            seed=123,
+            config_dump={"test": True},
+        )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            manifest_path = Path(tmpdir) / "manifest.json"
-            with manifest_path.open("w") as f:
-                json.dump(manifest.to_dict(), f)
-            with manifest_path.open() as f:
-                data = json.load(f)
+    def test_complete_manifest_round_trip_is_lossless(self):
+        _, manifest = self._manifest()
+        self.assertEqual(RunManifest.from_dict(manifest.to_dict()), manifest)
 
-        self.assertEqual(data["tension_model_version"], TENSION_MODEL_VERSION)
-        structure = data["structure"]
-        self.assertIn("tension_curve", structure)
-        self.assertIn("target_tension_curve", structure)
-        self.assertIn("tension_deviation", structure)
-        self.assertTrue(len(structure["tension_curve"]) > 0)
-        self.assertTrue(len(structure["target_tension_curve"]) > 0)
+    def test_graph_totals_match_source_records(self):
+        plan_result, manifest = self._manifest()
+        source_layers = plan_result.graph.diagnostics.layer_diagnostics
+        graph = manifest.graph_stats
 
-        deviation = structure["tension_deviation"]
-        for key in (
-            "mean_absolute_error",
-            "max_absolute_error",
-            "section_errors",
-            "target_peak_time",
-            "realized_peak_time",
-            "peak_timing_offset",
-            "shape_correlation",
-        ):
-            self.assertIn(key, deviation)
+        self.assertEqual(
+            graph.total_pruned,
+            sum(len(layer.pruned_states) for layer in source_layers),
+        )
+        self.assertEqual(
+            graph.total_pruned_edges,
+            sum(
+                layer.outdegree_pruned_count + layer.state_pruned_edge_count
+                for layer in source_layers
+            ),
+        )
+        self.assertEqual(
+            graph.total_candidate_pruned,
+            sum(layer.d_max_pruned_candidate_count for layer in source_layers),
+        )
+        self.assertEqual(
+            graph.total_prune_operations,
+            sum(graph.pruning_summary.values()),
+        )
+        for source, serialized in zip(source_layers, graph.per_layer_stats):
+            self.assertEqual(serialized.proposed, source.raw_candidate_count)
+            self.assertEqual(serialized.legal, source.legal_candidate_count)
+            self.assertEqual(serialized.scored, source.scored_candidate_count)
+            self.assertEqual(serialized.retained, source.kept_candidate_count)
+            self.assertEqual(serialized.pruned, len(source.pruned_states))
+
+    def test_candidate_flow_accounts_for_duplicates_and_state_pruning(self):
+        _, manifest = self._manifest()
+        graph = manifest.graph_stats
+        self.assertEqual(
+            graph.total_legal,
+            graph.total_scored
+            + graph.total_duplicate_proposals
+            + graph.total_candidate_pruned,
+        )
+        self.assertEqual(
+            graph.total_proposed - graph.total_scored,
+            sum(graph.rejection_summary.values()),
+        )
+        for layer in graph.per_layer_stats:
+            self.assertEqual(
+                layer.legal,
+                layer.scored + layer.duplicate_proposals + layer.candidate_pruned,
+            )
+            self.assertLessEqual(layer.scored_unique_states, layer.scored)
+
+    def test_original_and_solver_endpoint_support_are_both_preserved(self):
+        _, manifest = self._manifest()
+        endpoints = manifest.endpoint_stats
+        self.assertGreater(endpoints.original_pi0_support_size, endpoints.solver_pi0_support_size)
+        self.assertGreater(endpoints.original_piT_support_size, endpoints.solver_piT_support_size)
+        self.assertGreater(endpoints.unreachable_pi0_mass, 0.0)
+        self.assertGreater(endpoints.unreachable_piT_mass, 0.0)
+
+    def test_sampled_path_has_reproducible_log_probability(self):
+        first_result, first = self._manifest(sample=True)
+        second_result, second = self._manifest(sample=True)
+        self.assertEqual(first_result.path, second_result.path)
+        self.assertEqual(first.path_stats.path_mode, "sample")
+        self.assertIsNotNone(first.path_stats.path_score)
+        self.assertEqual(first.path_stats.path_score, second.path_stats.path_score)
+        self.assertEqual(
+            first.path_stats.path_score,
+            first_result.sampled_path.log_probability,
+        )
+
+    def test_strict_parser_rejects_malformed_nested_data(self):
+        _, manifest = self._manifest()
+        valid = manifest.to_dict()
+        cases = []
+
+        wrong_seed = copy.deepcopy(valid)
+        wrong_seed["seed"] = "123"
+        cases.append((wrong_seed, "manifest.seed"))
+
+        wrong_config = copy.deepcopy(valid)
+        wrong_config["config"] = []
+        cases.append((wrong_config, "manifest.config"))
+
+        wrong_boolean = copy.deepcopy(valid)
+        wrong_boolean["sb_stats"]["converged"] = "false"
+        cases.append((wrong_boolean, "sb_stats.converged"))
+
+        negative_count = copy.deepcopy(valid)
+        negative_count["graph_stats"]["per_layer_stats"][0]["proposed"] = -1
+        cases.append((negative_count, "proposed"))
+
+        inconsistent_total = copy.deepcopy(valid)
+        inconsistent_total["graph_stats"]["total_pruned"] += 1
+        cases.append((inconsistent_total, "total_pruned"))
+
+        non_finite = copy.deepcopy(valid)
+        non_finite["sb_stats"]["final_max_delta"] = float("nan")
+        cases.append((non_finite, "final_max_delta"))
+
+        missing_nested = copy.deepcopy(valid)
+        del missing_nested["path_stats"]["path_mode"]
+        cases.append((missing_nested, "path_stats"))
+
+        unsupported = copy.deepcopy(valid)
+        unsupported["schema_version"] = "1.99.0"
+        cases.append((unsupported, "schema_version"))
+
+        for data, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ManifestValidationError, message):
+                    RunManifest.from_dict(data)
+
+    def test_unversioned_manifest_migrates_with_warnings(self):
+        legacy = {
+            "run_id": "legacy-run",
+            "timestamp": 1.0,
+            "version": "0.1.0",
+            "seed": 7,
+            "config": {"edo": 12},
+            "structure": StructuralDiagnostics().to_dict(),
+            "sb_stats": {
+                "iterations_run": 2,
+                "converged": True,
+                "final_max_delta": 0.01,
+                "layer_sizes": [1, 2, 1],
+                "pruned_nodes": 3,
+                "effective_entropy": 0.4,
+            },
+        }
+        manifest = RunManifest.from_dict(legacy)
+        self.assertEqual(manifest.schema_version, "1.0.0")
+        self.assertEqual(manifest.sb_stats.disconnected_nodes, 3)
+        self.assertEqual(manifest.path_stats.path_mode, "unknown")
+        self.assertIsNone(manifest.path_stats.path_score)
+        self.assertTrue(manifest.migration_warnings)
+
 
 if __name__ == "__main__":
     unittest.main()

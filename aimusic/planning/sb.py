@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from math import isfinite
+from math import isfinite, log
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -152,6 +152,7 @@ class SampledBridgePath:
     path: tuple[BeatState, ...]
     edges: tuple[Edge, ...] = ()
     debug: tuple[Mapping[str, object], ...] = ()
+    log_probability: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1117,12 +1118,16 @@ def sample_bridge_path(
     graph = bridge.graph
     transition_tables = _build_conditioned_transition_table(graph, bridge.edge_probabilities_by_time)
 
+    log_probability = 0.0
     if start_state is None:
         if bridge.initial_distribution is None:
             start_state = graph.layers[0].states[0]
         else:
             idx, rng = _sample_categorical(rng, bridge.initial_distribution.probabilities)
             start_state = bridge.initial_distribution.layer.states[idx]
+            initial_total = float(sum(bridge.initial_distribution.probabilities))
+            initial_probability = float(bridge.initial_distribution.probabilities[idx]) / initial_total
+            log_probability += log(initial_probability)
     else:
         if start_state not in set(graph.layers[0].states):
             raise ValueError("start_state must come from the bridge start layer.")
@@ -1138,6 +1143,8 @@ def sample_bridge_path(
             raise ValueError(f"No outgoing bridge transitions from state at time {t}.")
         outgoing_edges, outgoing_probs = table[current]
         chosen_idx, rng = _sample_categorical(rng, outgoing_probs)
+        selected_probability = float(outgoing_probs[chosen_idx]) / float(sum(outgoing_probs))
+        log_probability += log(selected_probability)
         edge = outgoing_edges[chosen_idx]
         next_state = edge.target
         path.append(next_state)
@@ -1149,13 +1156,21 @@ def sample_bridge_path(
                     "time_index": t,
                     "source": edge.source,
                     "target": edge.target,
-                    "edge_probability": float(outgoing_probs[chosen_idx]) / float(sum(outgoing_probs)),
+                    "edge_probability": selected_probability,
                     "edge_log_weight": edge.log_weight,
                 }
             )
         current = next_state
 
-    return SampledBridgePath(path=tuple(path), edges=tuple(edges), debug=tuple(debug)), rng
+    return (
+        SampledBridgePath(
+            path=tuple(path),
+            edges=tuple(edges),
+            debug=tuple(debug),
+            log_probability=float(log_probability),
+        ),
+        rng,
+    )
 
 
 def uniform_bridge_from_graph(graph: SparseGraph) -> SolvedBridge:

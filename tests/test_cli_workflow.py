@@ -68,6 +68,12 @@ class TestCliGenerateInspectExportWorkflow(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("Schrödinger Bridge Health", result.stdout)
+        self.assertIn("Graph Candidate Flow", result.stdout)
+        self.assertIn("Graph Edge Flow", result.stdout)
+        self.assertIn("Original support", result.stdout)
+        self.assertIn("Residual history", result.stdout)
+        self.assertIn("Entropy by layer", result.stdout)
+        self.assertIn("Final Path Selection", result.stdout)
         self.assertIn("Key Timeline", result.stdout)
         self.assertIn("Chord Timeline", result.stdout)
         self.assertIn("Role Timeline", result.stdout)

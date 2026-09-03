@@ -3,13 +3,12 @@ import dataclasses
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from aimusic.core.diagnostics import (
+    ManifestValidationError,
     RunManifest,
-    SBDiagnostics,
-    StructuralDiagnostics,
-    TimelineEvent,
+    build_run_manifest,
 )
 from aimusic.core.config import (
     DecodeConfig,
@@ -20,7 +19,7 @@ from aimusic.core.config import (
 from aimusic.core.core_types import Score, ScoreValidationError
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
-from aimusic.planning.plans import MethodARunConfig, PlanningSection, run_method_a
+from aimusic.planning.plans import MethodARunConfig, run_method_a
 from aimusic.render import TrackInstrumentConfig, render_midi
 from aimusic.render.package import write_render_package
 from aimusic.scoring.tension import (
@@ -29,7 +28,6 @@ from aimusic.scoring.tension import (
     target_tension_curve,
 )
 from aimusic.theory.edo import EDO
-
 
 def _json_ready(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -43,56 +41,6 @@ def _json_ready(value: Any) -> Any:
         if isinstance(enum_value, str):
             return enum_value
     return value
-
-
-def _segment_timeline(values: Iterable[str]) -> list[TimelineEvent]:
-    items = tuple(values)
-    if not items:
-        return []
-    events: list[TimelineEvent] = []
-    start = 0
-    current = items[0]
-    for index, label in enumerate(items[1:], start=1):
-        if label == current:
-            continue
-        events.append(TimelineEvent(float(start), float(index), current))
-        start = index
-        current = label
-    events.append(TimelineEvent(float(start), float(len(items)), current))
-    return events
-
-
-def _build_structural_diagnostics(
-    path: tuple[Any, ...],
-    vocabularies: Any,
-    edo: int,
-    sections: tuple[PlanningSection, ...] = (),
-) -> StructuralDiagnostics:
-    decoded_states = path[:-1] if len(path) > 1 else path
-    key_labels = [vocabularies.keys.token_for_id(state.key_id).label for state in decoded_states]
-    chord_labels = [vocabularies.chords.token_for_id(state.chord_id).label for state in decoded_states]
-    role_labels = [vocabularies.roles.token_for_id(state.role_id).label for state in decoded_states]
-    groove_labels = [vocabularies.grooves.token_for_id(state.groove_id).label for state in decoded_states]
-    boundaries = [float(index) for index, state in enumerate(decoded_states) if state.boundary_lvl > 0]
-
-    tension_curve = realized_tension_curve(decoded_states, vocabularies, edo)
-    tension_target_curve = target_tension_curve(sections) if sections else []
-    deviation = (
-        compare_tension_curves(tension_target_curve, tension_curve, sections)
-        if tension_target_curve
-        else None
-    )
-
-    return StructuralDiagnostics(
-        key_timeline=_segment_timeline(key_labels),
-        chord_timeline=_segment_timeline(chord_labels),
-        role_timeline=_segment_timeline(role_labels),
-        groove_timeline=_segment_timeline(groove_labels),
-        boundaries=boundaries,
-        tension_curve=tension_curve,
-        target_tension_curve=tension_target_curve,
-        tension_deviation=dataclasses.asdict(deviation) if deviation is not None else {},
-    )
 
 
 def _build_edo(args: argparse.Namespace) -> EDO:
@@ -175,13 +123,8 @@ def handle_generate(args: argparse.Namespace) -> None:
         edo=args.edo,
         tempo_bpm=args.tempo_bpm,
     )
-    structural_stats = _build_structural_diagnostics(
-        plan_result.path,
-        plan_result.vocabularies,
-        edo=args.edo,
-        sections=plan_result.endpoints.sections,
-    )
-    manifest = RunManifest(
+    manifest = build_run_manifest(
+        plan_result,
         seed=args.seed,
         config_dump=_json_ready(
             {
@@ -190,11 +133,11 @@ def handle_generate(args: argparse.Namespace) -> None:
                 "groove_family": args.groove_family,
                 "tempo_bpm": args.tempo_bpm,
                 "output_dir": args.out,
+                "pitch_bend_range": args.pitch_bend_range,
+                "rendering_method": args.rendering_method,
                 "track_instruments": _build_track_instruments(args),
             }
         ),
-        structural_stats=structural_stats,
-        sb_stats=SBDiagnostics.from_solution(plan_result.sb_solution),
     )
 
     out_dir = Path(args.out)
@@ -276,31 +219,84 @@ def handle_inspect(args: argparse.Namespace) -> None:
     manifest_path = Path(args.file)
     data = _load_json_file(manifest_path, kind="manifest")
 
-    required_keys = ("run_id", "sb_stats", "structure")
-    missing = [key for key in required_keys if key not in data]
-    if missing:
-        print(
-            f"Error: {manifest_path} is not a valid run manifest "
-            f"(missing field(s): {', '.join(missing)})."
-        )
+    try:
+        manifest = RunManifest.from_dict(data)
+    except ManifestValidationError as exc:
+        print(f"Error: {manifest_path} is not a valid run manifest ({exc}).")
         sys.exit(1)
 
-    print(f"\n=== Inspection Report for Run: {data.get('run_id')} ===")
+    print(f"\n=== Inspection Report for Run: {manifest.run_id} ===")
+    print(f"Schema Version: {manifest.schema_version}")
+    if manifest.migration_warnings:
+        print("\n--- Legacy Migration Warnings ---")
+        for warning in manifest.migration_warnings:
+            print(f"- {warning}")
+
+    graph = manifest.graph_stats
+    print("\n--- Graph Candidate Flow ---")
+    print(f"Layer sizes: {graph.layer_sizes}")
+    print("Layer  Proposed  Legal  Scored  Duplicates  Candidate-pruned  Unique states  State-pruned  Retained")
+    for layer in graph.per_layer_stats:
+        print(
+            f"{layer.time_index:>5}  {layer.proposed:>8}  {layer.legal:>5}  "
+            f"{layer.scored:>6}  {layer.duplicate_proposals:>10}  "
+            f"{layer.candidate_pruned:>16}  {layer.scored_unique_states:>13}  "
+            f"{layer.pruned:>12}  {layer.retained:>8}"
+        )
+    print(
+        f"Totals: proposed={graph.total_proposed}, legal={graph.total_legal}, "
+        f"scored={graph.total_scored}, duplicates={graph.total_duplicate_proposals}, "
+        f"candidate-pruned={graph.total_candidate_pruned}, "
+        f"unique-states={graph.total_scored_unique_states}, "
+        f"state-pruned={graph.total_pruned}, retained={graph.total_retained}"
+    )
+    print("\n--- Graph Edge Flow ---")
+    print("Layer  Scored  Edge-pruned  Retained")
+    for layer in graph.per_layer_stats:
+        print(
+            f"{layer.time_index:>5}  {layer.scored_edges:>6}  "
+            f"{layer.pruned_edges:>11}  {layer.retained_edges:>8}"
+        )
+    if graph.rejection_summary:
+        print(f"Rejection reasons: {graph.rejection_summary}")
+    if graph.pruning_summary:
+        print(f"Pruning reasons: {graph.pruning_summary}")
+
+    endpoints = manifest.endpoint_stats
+    print("\n--- Endpoint Support ---")
+    print(
+        f"Original support: pi0={endpoints.original_pi0_support_size}, "
+        f"piT={endpoints.original_piT_support_size}"
+    )
+    print(
+        f"Solver support:   pi0={endpoints.solver_pi0_support_size}, "
+        f"piT={endpoints.solver_piT_support_size}"
+    )
+    print(
+        f"Unreachable mass: pi0={endpoints.unreachable_pi0_mass:.6f}, "
+        f"piT={endpoints.unreachable_piT_mass:.6f}"
+    )
 
     # --- SB Math Diagnostics ---
-    sb = data.get("sb_stats", {})
+    sb = manifest.sb_stats
     print("\n--- Schrödinger Bridge Health ---")
-    status = "Converged" if sb.get("converged") else "FAILED"
-    print(f"Status:      {status} (in {sb.get('iterations_run')} iterations)")
-    print(f"Max Delta:   {sb.get('final_max_delta')}")
-    entropy = sb.get("effective_entropy")
-    entropy_display = f"{entropy:.4f}" if isinstance(entropy, (int, float)) else "n/a"
-    print(f"Entropy:     {entropy_display} (Lower = More Confident)")
-    print(f"Pruned dead: {sb.get('pruned_nodes')} nodes")
-    print(f"Layer sizes: {sb.get('layer_sizes')}")
+    status = "Converged" if sb.converged else "FAILED"
+    print(f"Status:             {status} (in {sb.iterations_run} iterations)")
+    print(f"Max Delta:          {sb.final_max_delta}")
+    print(f"Residual history:   {sb.residual_history}")
+    print(f"Entropy by layer:   {sb.layer_entropies}")
+    print(f"Average entropy:    {sb.effective_entropy:.4f}")
+    print(f"Disconnected nodes: {sb.disconnected_nodes}")
+
+    path_stats = manifest.path_stats
+    score = "unavailable" if path_stats.path_score is None else f"{path_stats.path_score:.6f}"
+    print("\n--- Final Path Selection ---")
+    print(f"Mode: {path_stats.path_mode}")
+    print(f"Score: {score}")
+    print(f"Transitions: {path_stats.path_transition_count}")
 
     # --- Structural Timelines ---
-    structure = data.get("structure", {})
+    structure = manifest.structural_stats.to_dict()
     _print_timeline("Key Timeline", structure.get("key_timeline", []))
     _print_timeline("Chord Timeline", structure.get("chord_timeline", []))
     _print_timeline("Role Timeline", structure.get("role_timeline", []))
@@ -313,60 +309,10 @@ def handle_inspect(args: argparse.Namespace) -> None:
     else:
         print("  (none)")
 
-    realized = structure.get("tension_curve", [])
-    target = structure.get("target_tension_curve", [])
-
-    print("\n--- Tension Arc (realized) ---")
-    for time_val, tension in realized:
+    print("\n--- Tension Arc ---")
+    for time_val, tension in structure.get("tension_curve", []):
         bar = "#" * int(tension * 20)
         print(f"Beat {time_val:04.1f}: {bar} ({tension:.3f})")
-
-    if target:
-        print("\n--- Target vs Realized Tension ---")
-        target_by_time = {t: v for t, v in target}
-        for time_val, r_tension in realized:
-            t_tension = target_by_time.get(time_val)
-            r_bar = "#" * int(r_tension * 20)
-            if t_tension is None:
-                print(f"  t={time_val:04.1f}  realized {r_bar:<20} ({r_tension:.3f})  target n/a")
-                continue
-            t_bar = "*" * int(t_tension * 20)
-            delta = r_tension - t_tension
-            sign = "+" if delta >= 0 else "-"
-            print(
-                f"  t={time_val:04.1f}  "
-                f"target   {t_bar:<20} ({t_tension:.3f})  |  "
-                f"realized {r_bar:<20} ({r_tension:.3f})  "
-                f"[{sign}{abs(delta):.3f}]"
-            )
-
-    deviation = structure.get("tension_deviation", {})
-    if deviation:
-        print("\n--- Tension Deviation Report ---")
-        mae = deviation.get("mean_absolute_error")
-        max_err = deviation.get("max_absolute_error")
-        peak_off = deviation.get("peak_timing_offset")
-        shape_corr = deviation.get("shape_correlation")
-        print(f"Mean absolute error:  {mae:.4f}" if isinstance(mae, (int, float)) else f"Mean absolute error:  {mae}")
-        print(f"Max absolute error:   {max_err:.4f}" if isinstance(max_err, (int, float)) else f"Max absolute error:   {max_err}")
-        print(f"Target peak time:     {deviation.get('target_peak_time')}")
-        print(f"Realized peak time:   {deviation.get('realized_peak_time')}")
-        print(
-            f"Peak timing offset:   {peak_off:+.2f} beats (realized - target)"
-            if isinstance(peak_off, (int, float))
-            else f"Peak timing offset:   {peak_off}"
-        )
-        print(
-            f"Shape correlation:    {shape_corr:.4f} (Pearson, -1..1)"
-            if isinstance(shape_corr, (int, float))
-            else f"Shape correlation:    {shape_corr}"
-        )
-        section_errors = deviation.get("section_errors", {})
-        if section_errors:
-            print("Section-level MAE:")
-            for name, err in section_errors.items():
-                print(f"  {name}: {err:.4f}" if isinstance(err, (int, float)) else f"  {name}: {err}")
-
     print("=========================================================\n")
 
 
@@ -442,7 +388,7 @@ def main() -> None:
     ins_parser.add_argument("file", type=str)
     ins_parser.set_defaults(func=handle_inspect)
 
-    
+
     exp_parser = subparsers.add_parser("export", help="Export a generated score to MIDI")
     exp_parser.add_argument("file", type=str, help="Path to the score data")
     exp_parser.add_argument("--out", type=str, default=None, help="Output MIDI path")

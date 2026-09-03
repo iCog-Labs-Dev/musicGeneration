@@ -157,6 +157,8 @@ class MethodAEndpoints:
     start_choice: EndpointChoice
     end_choice: EndpointChoice
     sections: Tuple[PlanningSection, ...]
+    solver_pi0: Optional[EndpointDistribution] = None
+    solver_piT: Optional[EndpointDistribution] = None
 
 
 @dataclass(frozen=True)
@@ -601,11 +603,13 @@ def run_method_a(
     )
     _logger.info(f"Graph built: {len(graph.layers)} layers, {sum(len(l.states) for l in graph.layers)} states")
     aligned_endpoints = MethodAEndpoints(
-        pi0=_align_endpoint_distribution(endpoints.pi0, graph.layers[0]),
-        piT=_align_endpoint_distribution(endpoints.piT, graph.layers[-1]),
+        pi0=endpoints.pi0,
+        piT=endpoints.piT,
         start_choice=endpoints.start_choice,
         end_choice=endpoints.end_choice,
         sections=endpoints.sections,
+        solver_pi0=_align_endpoint_distribution(start_endpoint, graph.layers[0]),
+        solver_piT=_align_endpoint_distribution(end_endpoint, graph.layers[-1]),
     )
     problem = build_sb_problem(graph, start_endpoint, end_endpoint, sb_config=resolved_sb)
     solution = solve_sb(problem)
@@ -615,7 +619,7 @@ def run_method_a(
     if run_config.use_sampling:
         sampled_path, _ = sample_bridge_path(bridge, bridge_key, include_edges=True, include_debug=True)
         path = sampled_path.path
-        path_score = None
+        path_score = sampled_path.log_probability
         _logger.info(f"Sampled path: {len(path) - 1} beats")
     else:
         path, path_score = map_bridge_path(bridge)
