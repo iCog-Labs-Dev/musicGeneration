@@ -187,7 +187,7 @@ class TestTwoPassProductionScoring(unittest.TestCase):
         )
 
         self.assertEqual(len(graph.edge_diagnostics_by_time), len(graph.edges_by_time))
-        active_families = set()
+        active_families: set[str] = set()
         for edges, diagnostics in zip(
             graph.edges_by_time, graph.edge_diagnostics_by_time
         ):
