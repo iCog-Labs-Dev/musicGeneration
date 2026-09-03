@@ -24,6 +24,11 @@ ml = [
 clearml = [
   "clearml",
 ]
+audio = [
+  # M0 placeholder: YAML config loading for future aimusic.audio orchestrator.
+  # Heavy DSP (librosa/torch/demucs) is added in later milestones.
+  "PyYAML",
+]
 dev = [
   "pytest",
   "flake8",

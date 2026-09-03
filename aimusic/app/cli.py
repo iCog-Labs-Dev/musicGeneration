@@ -21,6 +21,12 @@ from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, run_method_a
 from aimusic.render import TrackInstrumentConfig, render_midi
+from aimusic.render.package import write_render_package
+from aimusic.scoring.tension import (
+    compare_tension_curves,
+    realized_tension_curve,
+    target_tension_curve,
+)
 from aimusic.theory.edo import EDO
 
 def _json_ready(value: Any) -> Any:
@@ -139,6 +145,7 @@ def handle_generate(args: argparse.Namespace) -> None:
     score_path = out_dir / f"{manifest.run_id}_score.json"
     midi_path = out_dir / f"{manifest.run_id}.mid"
     manifest_path = out_dir / f"{manifest.run_id}_manifest.json"
+    track_instruments = _build_track_instruments(args)
 
     with score_path.open("w", encoding="utf-8") as f:
         json.dump(score.to_dict(), f, indent=2)
@@ -147,15 +154,35 @@ def handle_generate(args: argparse.Namespace) -> None:
         score,
         _build_edo(args),
         str(midi_path),
-        track_instruments=_build_track_instruments(args),
+        track_instruments=track_instruments,
     )
 
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest.to_dict(), f, indent=2)
 
+    track_programs = {
+        name: (None if cfg.is_drum else cfg.program)
+        for name, cfg in track_instruments.items()
+    }
+    package = write_render_package(
+        out_dir,
+        score=score,
+        midi_path=midi_path,
+        manifest=manifest,
+        path=plan_result.path,
+        vocabularies=plan_result.vocabularies,
+        edo=args.edo,
+        base_tuning=args.base_tuning,
+        pitch_bend_range=args.pitch_bend_range,
+        rendering_method=args.rendering_method,
+        track_programs=track_programs,
+        run_id=manifest.run_id,
+    )
+
     print(f"Generated score JSON: {score_path}")
     print(f"Generated multitrack MIDI: {midi_path}")
     print(f"Generated manifest: {manifest_path}")
+    print(f"Generated RenderPackage: {package.root}")
 
 def _load_json_file(path: Path, *, kind: str) -> Any:
     """Load a JSON file, converting missing/malformed files into actionable exits."""

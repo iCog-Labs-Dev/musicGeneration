@@ -19,7 +19,10 @@ The goal is to produce coherent musical trajectories between endpoint passages w
 
 The design targets progressive rock and jazz fusion compositions of approximately **5–15 minutes**. It supports multiple equal divisions of the octave, including **12-EDO** and **19-EDO**, using a single configurable parameter.
 
-The immediate output format is **MIDI**. Audio rendering is considered a downstream task.
+The immediate output format is **MIDI**. Audio rendering is a downstream task.
+Optional MIDI→audio integration (RenderPackage contract, quarantined
+`aimusic.audio`) is documented under [`docs/audio-pipeline.md`](docs/audio-pipeline.md)
+and tracked in [`docs/audio-roadmap.md`](docs/audio-roadmap.md).
 
 ---
 
