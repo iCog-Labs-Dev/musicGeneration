@@ -184,7 +184,11 @@ class TestCandidateGeneration(unittest.TestCase):
             prev,
             4,
             self.key,
-            d_max=2000, # Use a high bound to guarantee we don't accidentally prune the target early
+            d_max=2000,
+            # REQ-13: search breadth is controlled by proposal_budget, not
+            # d_max. Use a high budget to guarantee we don't accidentally
+            # miss the target during (shuffled) generation.
+            proposal_budget=4096,
             style_config=self.style,
             vocabularies=VOCABS,
             prior=NeuralPrior(),
