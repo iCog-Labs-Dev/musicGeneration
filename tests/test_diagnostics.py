@@ -16,6 +16,7 @@ from aimusic.core.diagnostics import (
 from aimusic.scoring.tension import TENSION_MODEL_VERSION
 # --- Math Pipeline Imports ---
 from aimusic.core.config import SBConfig, SBBackend
+from aimusic.core.rng import RNGKey
 from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
 from aimusic.planning.graph import SparseGraph
 from aimusic.planning.sb import (
@@ -252,7 +253,7 @@ class TestDiagnostics(unittest.TestCase):
         # pairing for this small total_beats (pre-existing pipeline
         # behavior, unrelated to tension diagnostics); seed=0 is stable.
         run_config = MethodARunConfig(total_beats=6, seed=0)
-        plan_result = run_method_a(run_config)
+        plan_result, _ = run_method_a(run_config, key=RNGKey(seed=0))
 
         structural_stats = _build_structural_diagnostics(
             plan_result.path,

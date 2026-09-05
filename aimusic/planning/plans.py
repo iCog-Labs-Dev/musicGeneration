@@ -20,7 +20,7 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.core.core_types import BeatState, EndpointDistribution, Layer, Score
-from aimusic.core.rng import RNGKey, random_unit
+from aimusic.core.rng import RNGKey, allocate_named_keys, random_unit
 from aimusic.core.vocab import TonalContext, Vocabularies, build_tonal_context
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.graph import EdgeScoreDiagnostics, SparseGraph, build_sparse_graph
@@ -174,6 +174,7 @@ class MethodAPlanDiagnostics:
     graph_layer_sizes: Tuple[int, ...]
     bridge_iterations: int
     bridge_converged: bool
+    rng_stream_ids: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -220,11 +221,6 @@ def _resolved_sb_config(run_config: MethodARunConfig) -> SBConfig:
     if run_config.sb_config is not None:
         return run_config.sb_config
     return SBConfig(horizon_t=run_config.total_beats)
-
-
-def _numpy_generator_from_key(key: RNGKey) -> np.random.Generator:
-    seed = key.generator().randrange(0, 2**63)
-    return np.random.default_rng(seed)
 
 
 def _softmax(scores: Sequence[float], temperature: float) -> Tuple[float, ...]:
@@ -527,21 +523,22 @@ def generate_method_a_endpoints(
     run_config: MethodARunConfig,
     *,
     vocabularies: Optional[Vocabularies] = None,
-    selection_key: Optional[RNGKey] = None,
+    key: RNGKey,
     sample_endpoints: bool = False,
-) -> MethodAEndpoints:
+) -> tuple[MethodAEndpoints, RNGKey]:
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
     resolved_vocabs = _resolved_vocabs(
         vocabularies, run_config.style_config, run_config.edo
     )
     pi0 = generate_start_endpoint_distribution(run_config, vocabularies=resolved_vocabs)
     piT = generate_end_endpoint_distribution(run_config, vocabularies=resolved_vocabs)
-    root_key = RNGKey(seed=run_config.seed) if selection_key is None else selection_key
     start_choice, next_key = _choose_endpoint_state(
         pi0,
-        key=root_key,
+        key=key,
         sample=sample_endpoints,
     )
-    end_choice, _ = _choose_endpoint_state(
+    end_choice, next_key = _choose_endpoint_state(
         piT,
         key=next_key,
         sample=sample_endpoints,
@@ -552,15 +549,16 @@ def generate_method_a_endpoints(
         start_choice=start_choice,
         end_choice=end_choice,
         sections=build_section_plan(run_config),
-    )
+    ), next_key
 
 
 def run_method_a(
     run_config: MethodARunConfig,
     *,
+    key: RNGKey,
     prior: Optional[Prior] = None,
     vocabularies: Optional[Vocabularies] = None,
-) -> MethodAPlanResult:
+) -> tuple[MethodAPlanResult, RNGKey]:
     """Run Method A from endpoint planning through SB path extraction."""
     _logger.info(f"Method A: {run_config.total_beats} beats, seed={run_config.seed}")
     tonal_context = build_tonal_context(
@@ -570,12 +568,17 @@ def run_method_a(
     )
     resolved_vocabs = tonal_context.vocabularies
     resolved_sb = _resolved_sb_config(run_config)
-    root_key = RNGKey(seed=run_config.seed)
-    endpoint_key, graph_key, bridge_key = root_key.split(3)
-    endpoints = generate_method_a_endpoints(
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
+    stream_ids = (
+        "endpoint_choice", "candidate_proposal", "bridge_sampling",
+        "decoder.comping", "decoder.bass", "decoder.lead", "decoder.drums",
+    )
+    streams, next_key = allocate_named_keys(key, stream_ids)
+    endpoints, _ = generate_method_a_endpoints(
         run_config,
         vocabularies=resolved_vocabs,
-        selection_key=endpoint_key,
+        key=streams["endpoint_choice"],
         sample_endpoints=run_config.use_sampling,
     )
     _logger.info(f"Endpoints: start={endpoints.start_choice.state} end={endpoints.end_choice.state}")
@@ -587,7 +590,7 @@ def run_method_a(
         endpoints.end_choice.state,
         time_index=run_config.total_beats,
     )
-    graph = build_sparse_graph(
+    graph, _ = build_sparse_graph(
         start_layer=start_endpoint.layer,
         end_layer=end_endpoint.layer,
         total_beats=run_config.total_beats,
@@ -597,7 +600,7 @@ def run_method_a(
         prior=NullPrior() if prior is None else prior,
         weights=run_config.prior_weights,
         edo=run_config.edo,
-        rng=_numpy_generator_from_key(graph_key),
+        key=streams["candidate_proposal"],
         d_max=resolved_sb.d_max,
     )
     _logger.info(f"Graph built: {len(graph.layers)} layers, {sum(len(l.states) for l in graph.layers)} states")
@@ -614,7 +617,7 @@ def run_method_a(
     _logger.info(f"SB solved: converged={solution.trace.converged}, iterations={solution.trace.iterations}")
 
     if run_config.use_sampling:
-        sampled_path, _ = sample_bridge_path(bridge, bridge_key, include_edges=True, include_debug=True)
+        sampled_path, _ = sample_bridge_path(bridge, streams["bridge_sampling"], include_edges=True, include_debug=True)
         path = sampled_path.path
         path_score = None
         _logger.info(f"Sampled path: {len(path) - 1} beats")
@@ -635,6 +638,7 @@ def run_method_a(
         graph_layer_sizes=graph.diagnostics.layer_sizes,
         bridge_iterations=solution.trace.iterations,
         bridge_converged=solution.trace.converged,
+        rng_stream_ids=stream_ids,
     )
     return MethodAPlanResult(
         run_config=run_config,
@@ -650,7 +654,7 @@ def run_method_a(
         sampled_path=sampled_path,
         diagnostics=diagnostics,
         path_edge_diagnostics=graph.diagnostics_for_path(path),
-    )
+    ), next_key
 
 
 def render_exact_bridge_demo(
@@ -683,13 +687,14 @@ def render_exact_bridge_demo(
         decode_config=resolved_decode,
         edo=edo,
     )
-    plan_result = run_method_a(run_config)
-    score = decode_path_to_score(
+    plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=seed))
+    score, _ = decode_path_to_score(
         plan_result.path,
         decode_config=resolved_decode,
         vocabularies=plan_result.vocabularies,
         edo=plan_result.tonal_context.n,
         tempo_bpm=tempo_bpm,
+        key=next_key,
     )
     render_midi(
         score,

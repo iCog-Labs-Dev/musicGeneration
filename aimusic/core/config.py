@@ -261,6 +261,12 @@ class SBConfig:
     temperature: float = 1.0
     k_max: int = 64
     d_max: int = 8
+    # REQ-13: proposal budget is a beam width over *raw proposals*, tracked
+    # independently of d_max. It must not be derived from d_max -- d_max
+    # controls retained outgoing edges only (see aimusic/planning/candidates.py
+    # and aimusic/planning/graph.py).
+    proposal_budget: int = 256
+    prior_guided_proposals: bool = False
     log_underflow_floor: float = -745.0
     raise_on_non_convergence: bool = False
     backend_selection: SBBackend = SBBackend.NUMPY
@@ -276,6 +282,9 @@ class SBConfig:
             raise ValueError("temperature must be > 0.")
         _require_int("k_max", self.k_max, minimum=1)
         _require_int("d_max", self.d_max, minimum=1)
+        _require_int("proposal_budget", self.proposal_budget, minimum=1)
+        if not isinstance(self.prior_guided_proposals, bool):
+            raise TypeError("prior_guided_proposals must be a bool.")
         _require_real("log_underflow_floor", self.log_underflow_floor)
         if self.log_underflow_floor > 0.0:
             raise ValueError(

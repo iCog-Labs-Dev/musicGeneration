@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence, Tuple, Iterator
-import numpy as np
 
 from aimusic.core.config import StyleConfig
 from aimusic.core.core_types import BeatState
+from aimusic.core.rng import RNGKey, shuffle
 from aimusic.scoring.gttm_features import beats_per_bar
 from aimusic.scoring.priors import NullPrior, Prior, PriorContext, PriorQuery, prior_logps
 from aimusic.theory.tonal import get_fifth_steps, nearest_roots
@@ -198,15 +198,36 @@ class CandidateRejection:
 
 @dataclass(frozen=True)
 class CandidateGenerationResult:
-    """Deterministic candidate-generation output plus rejection diagnostics."""
+    """Deterministic candidate-generation output plus rejection diagnostics.
+
+    Counts are tracked separately at every pipeline stage (see REQ-13):
+    ``proposed`` -> ``unique`` -> ``legal`` (``states``) -> ``scored``.
+    Retention against ``D_max`` happens one layer up, at the edge level in
+    ``aimusic.planning.graph``, so it is intentionally not tracked here.
+    """
     time_index: int
     source_state: BeatState
     states: Tuple[BeatState, ...]
     rejections: Tuple[CandidateRejection, ...] = ()
+    proposed_count: int = 0
+    unique_count: int = 0
+    scores: Tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.scores and len(self.scores) != len(self.states):
+            raise ValueError("scores must be empty or aligned 1:1 with states.")
 
     @property
-    def proposed_count(self) -> int:
-        return len(self.states) + len(self.rejections)
+    def legal_count(self) -> int:
+        return len(self.states)
+
+    @property
+    def rejected_count(self) -> int:
+        return len(self.rejections)
+
+    @property
+    def scored_count(self) -> int:
+        return len(self.scores)
 
 
 def apply_meter_constraints(
@@ -525,15 +546,20 @@ def _candidate_generator(
     vocabs: Vocabularies,
     prior: Prior,
     context: Optional[PriorContext],
-    rng: np.random.Generator,
+    key: RNGKey,
     edo: int,
+    key_state: Optional[list[RNGKey]] = None,
 ) -> Iterator[BeatState]:
     """Yields candidate states iteratively to avoid combinatorial memory explosions."""
     
-    def _shuffled(items: Sequence[int]) -> list[int]:
-        items_list = list(items)
-        rng.shuffle(items_list)
-        return items_list
+    current_key = key
+
+    def _shuffled(items: Sequence[int]) -> Tuple[int, ...]:
+        nonlocal current_key
+        shuffled, current_key = shuffle(current_key, items)
+        if key_state is not None:
+            key_state[0] = current_key
+        return shuffled
 
     for meter_id in _shuffled(propose_meter_ids(prev_state, style, vocabs)):
         beat_in_bar = _next_beat_index(prev_state, meter_id, vocabs)
@@ -562,51 +588,91 @@ def _candidate_generator(
                                 )
 
 
+DEFAULT_PROPOSAL_BUDGET = 256
+"""Default proposal budget (REQ-13): how many raw candidates are generated,
+deduplicated, validated, and (optionally) scored before D_max is ever
+consulted. Deliberately *not* derived from D_max -- D_max controls retained
+outgoing edges only, and must stay decoupled from how broadly we search."""
+
+
 def get_valid_next_states(
     prev_state: BeatState,
     t: int,
-    rng: np.random.Generator,
+    key: RNGKey,
     d_max: int,
     style_config: Optional[StyleConfig] = None,
     vocabularies: Optional[Vocabularies] = None,
     prior: Optional[Prior] = None,
     context: Optional[PriorContext] = None,
     edo: Optional[int] = None,
-) -> CandidateGenerationResult:
-    """Generate up to D_max legal BeatState successors for one source state."""
-    
-    # 1. Resolve objects exactly once per function call
+    proposal_budget: Optional[int] = None,
+    prior_guided_proposals: bool = False,
+) -> tuple[CandidateGenerationResult, RNGKey]:
+    """Generate a bounded pool of legal BeatState successors for one source state.
+
+    REQ-13: proposal generation is bounded by ``proposal_budget`` (a beam
+    width over *raw proposals*), not by ``d_max``. The full budgeted pool is
+    deduplicated, legality-checked, and -- when ``prior_guided_proposals`` is
+    set and a real prior is supplied -- batch-scored and ranked by prior
+    log-probability with deterministic tie-breaking. ``d_max`` is not applied
+    here at all; it is consulted exactly once, downstream, when
+    ``aimusic.planning.graph.build_sparse_graph`` trims *scored edges* to the
+    retained outdegree. This keeps D_max's two former meanings (proposal
+    stopping condition vs. retained-edge cap) from colliding.
+
+    ``d_max`` is still accepted (and still validated) here for API stability
+    and because callers commonly want to size their own budget relative to
+    it, but it no longer bounds what this function returns.
+    """
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
+    if not isinstance(d_max, int) or isinstance(d_max, bool) or d_max < 1:
+        raise ValueError("d_max must be a positive int.")
+    resolved_budget = DEFAULT_PROPOSAL_BUDGET if proposal_budget is None else proposal_budget
+    if not isinstance(resolved_budget, int) or isinstance(resolved_budget, bool) or resolved_budget < 1:
+        raise ValueError("proposal_budget must be a positive int.")
+
     resolved_vocabs = _resolved_vocabs(vocabularies)
     resolved_style = _resolved_style(style_config)
     resolved_prior = _resolved_prior(prior)
     resolved_edo = _edo_size(resolved_vocabs) if edo is None else edo
     validate_vocabulary_compatibility(resolved_vocabs, resolved_edo)
 
-    accepted: set[BeatState] = set()
+    seen: set[BeatState] = set()
+    accepted: list[BeatState] = []
     rejections: list[CandidateRejection] = []
+    proposed_count = 0
 
-    # 2. Utilize the generator to lazily produce candidates
+    # 1. Generate: consume the (shuffled, lazy) generator up to the proposal
+    #    budget -- this is the only place raw-proposal volume is bounded.
+    key_state = [key]
     candidate_gen = _candidate_generator(
         prev_state,
         resolved_style,
         resolved_vocabs,
         resolved_prior,
         context,
-        rng,
+        key,
         resolved_edo,
+        key_state,
     )
 
-    # 3. Consume generator, breaking immediately upon reaching D_max capacity
     for candidate in candidate_gen:
-        if len(accepted) >= d_max:
+        if proposed_count >= resolved_budget:
             break
+        proposed_count += 1
 
+        # 2. Deduplicate.
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        # 3. Validate (legality checks are never bypassed, prior-guided or not).
         legal, reason = is_legal_transition(
             prev_state, candidate, resolved_style, resolved_vocabs
         )
-
         if legal:
-            accepted.add(candidate)
+            accepted.append(candidate)
         else:
             rejections.append(
                 CandidateRejection(
@@ -617,9 +683,37 @@ def get_valid_next_states(
                 )
             )
 
-    return CandidateGenerationResult(
+    unique_count = len(seen)
+    legal_states = tuple(sorted(accepted, key=_state_sort_key))
+    scores: Tuple[float, ...] = ()
+
+    # 4. Batch-score (optional prior-guided ranking of the legal pool only).
+    if prior_guided_proposals and legal_states and not isinstance(resolved_prior, NullPrior):
+        queries = tuple(
+            PriorQuery(
+                prev_state=prev_state,
+                next_state=candidate_state,
+                time_index=t,
+                context=context,
+            )
+            for candidate_state in legal_states
+        )
+        logps = prior_logps(resolved_prior, queries)
+        ranked = sorted(
+            zip(logps, legal_states),
+            key=lambda item: (-item[0], _state_sort_key(item[1])),
+        )
+        legal_states = tuple(candidate_state for _, candidate_state in ranked)
+        scores = tuple(float(logp) for logp, _ in ranked)
+
+    result = CandidateGenerationResult(
         time_index=t,
         source_state=prev_state,
-        states=tuple(sorted(accepted, key=_state_sort_key)),
+        states=legal_states,
         rejections=tuple(rejections),
+        proposed_count=proposed_count,
+        unique_count=unique_count,
+        scores=scores,
     )
+    # Only proposal work actually performed advances the supplied stream.
+    return result, key_state[0]

@@ -15,13 +15,16 @@ from aimusic.core.config import (
     DecodeConfig,
     EDOConfig,
     MicrotonalRendering,
+    PriorWeights,
     StyleConfig,
 )
 from aimusic.core.core_types import Score, ScoreValidationError
+from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, PlanningSection, run_method_a
 from aimusic.render import TrackInstrumentConfig, render_midi
+from aimusic.scoring.priors import NullPrior, Prior
 from aimusic.render.package import write_render_package
 from aimusic.scoring.tension import (
     compare_tension_curves,
@@ -152,9 +155,15 @@ def handle_generate(args: argparse.Namespace) -> None:
         use_sampling=args.sample_path,
         style_config=style_config,
         decode_config=decode_config,
+        prior_weights=PriorWeights(
+            lambda_data=getattr(args, "lambda_data", PriorWeights().lambda_data),
+            lambda_gttm=getattr(args, "lambda_gttm", PriorWeights().lambda_gttm),
+        ),
         edo=args.edo,
     )
-    prior = None
+    prior: Prior | None = (
+        NullPrior() if getattr(args, "null_prior", False) else None
+    )
     prior_bundle = getattr(args, "prior_bundle", None)
     if prior_bundle:
         try:
@@ -167,13 +176,14 @@ def handle_generate(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
         prior = load_trained_neural_prior(prior_bundle)
-    plan_result = run_method_a(run_config, prior=prior)
-    score = decode_path_to_score(
+    plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=args.seed), prior=prior)
+    score, _ = decode_path_to_score(
         plan_result.path,
         decode_config=decode_config,
         vocabularies=plan_result.vocabularies,
         edo=args.edo,
         tempo_bpm=args.tempo_bpm,
+        key=next_key,
     )
     structural_stats = _build_structural_diagnostics(
         plan_result.path,
@@ -191,6 +201,7 @@ def handle_generate(args: argparse.Namespace) -> None:
                 "tempo_bpm": args.tempo_bpm,
                 "output_dir": args.out,
                 "track_instruments": _build_track_instruments(args),
+                "prior_type": "null" if isinstance(prior, NullPrior) else "configured",
             }
         ),
         structural_stats=structural_stats,

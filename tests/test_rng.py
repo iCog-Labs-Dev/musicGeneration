@@ -1,6 +1,14 @@
 import unittest
 
-from aimusic.core.rng import RNGKey, choice, randint, random_unit, shuffle
+from aimusic.core.rng import (
+    RNGKey,
+    allocate_named_keys,
+    choice,
+    derive_named_key,
+    randint,
+    random_unit,
+    shuffle,
+)
 
 
 class TestRNGKey(unittest.TestCase):
@@ -27,6 +35,20 @@ class TestRNGKey(unittest.TestCase):
         key = RNGKey(seed=99, stream=3)
         self.assertEqual(key.spawn(5), key.spawn(5))
         self.assertNotEqual(key.spawn(5), key.spawn(6))
+
+    def test_named_derivation_is_stable_and_isolated(self):
+        key = RNGKey(seed=99, stream=3)
+        streams_a, returned_a = allocate_named_keys(
+            key, ("endpoint_choice", "candidate_proposal", "decoder.lead")
+        )
+        streams_b, returned_b = allocate_named_keys(
+            key, ("endpoint_choice", "candidate_proposal", "decoder.lead")
+        )
+        self.assertEqual(streams_a, streams_b)
+        self.assertEqual(returned_a, key.next_key())
+        self.assertEqual(returned_b, key.next_key())
+        self.assertEqual(streams_a["decoder.lead"], derive_named_key(key, "decoder.lead"))
+        self.assertNotEqual(streams_a["endpoint_choice"], streams_a["candidate_proposal"])
 
 
 class TestPureSamplingHelpers(unittest.TestCase):

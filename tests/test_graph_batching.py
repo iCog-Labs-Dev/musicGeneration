@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-import numpy as np
+from aimusic.core.rng import RNGKey
 
 from aimusic.core.config import SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Layer
@@ -95,7 +95,7 @@ class TestSparseGraphBatchScoring(unittest.TestCase):
             style_config=style,
             vocabularies=VOCABS,
             prior=prior,
-            rng=np.random.default_rng(42),
+            key=RNGKey(seed=42),
             d_max=sb_config.d_max,
         )
 

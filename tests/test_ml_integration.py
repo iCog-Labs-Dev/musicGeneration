@@ -7,6 +7,7 @@ from aimusic.core.config import PriorWeights, StyleConfig
 from aimusic.core.core_types import BeatState
 from aimusic.core.vocab import DEFAULT_VOCABULARIES
 from aimusic.planning.plans import MethodARunConfig, run_method_a
+from aimusic.core.rng import RNGKey
 from aimusic.scoring.priors import NullPrior, calculate_transition_log_weight
 from tests.conftest import HAS_JAX, requires_jax, skip_unless_jax
 from tests.test_midi_ingest import write_simple_c_g_progression
@@ -49,7 +50,7 @@ class TestMLIntegration(unittest.TestCase):
                 seed=7,
                 style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight", "syncopated", "swing")),
             )
-            result = run_method_a(run_config, prior=prior)
+            result, _ = run_method_a(run_config, key=RNGKey(seed=7), prior=prior)
 
         self.assertGreater(len(result.path), 1)
 

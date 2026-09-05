@@ -14,6 +14,7 @@ from aimusic.planning.candidates import (
 )
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Edge, Layer
+from aimusic.core.rng import RNGKey
 from aimusic.scoring.priors import (
     NullPrior,
     Prior,
@@ -30,7 +31,6 @@ from aimusic.core.vocab import (
     Vocabularies,
     validate_vocabulary_compatibility,
 )
-import numpy as np
 
 def _state_sort_key(state: BeatState) -> tuple[int, int, int, int, int, int, int, int]:
     return (
@@ -177,7 +177,17 @@ class PrunedState:
 
 @dataclass(frozen=True)
 class LayerBuildDiagnostics:
-    """Per-layer diagnostics for sparse graph expansion."""
+    """Per-layer diagnostics for sparse graph expansion.
+
+    REQ-13: proposed / legal / unique / scored / retained are tracked as
+    separate counters end-to-end. ``raw_candidate_count`` is the sum of each
+    source state's proposal-budget-bounded raw count (proposed);
+    ``legal_candidate_count`` sums post-legality-check candidates per source
+    (legal); ``unique_candidate_count`` is the layer-wide merged support
+    (unique); ``scored_candidate_count`` sums prior-guided-ranking scores
+    when enabled (scored, 0 otherwise); ``kept_edge_count`` is what D_max
+    actually retains (retained) -- the only count D_max controls.
+    """
 
     time_index: int
     source_state_count: int
@@ -187,12 +197,24 @@ class LayerBuildDiagnostics:
     raw_edge_count: int
     kept_edge_count: int
     outdegree_pruned_count: int = 0
+    legal_candidate_count: int = 0
+    scored_candidate_count: int = 0
     rejected_proposals: Tuple[CandidateRejection, ...] = ()
     pruned_states: Tuple[PrunedState, ...] = ()
 
     @property
     def pruned_candidate_count(self) -> int:
         return len(self.pruned_states)
+
+    @property
+    def scored_edge_count(self) -> int:
+        """Alias: every raw edge is batch-scored via calculate_transition_log_weights."""
+        return self.raw_edge_count
+
+    @property
+    def retained_edge_count(self) -> int:
+        """Alias: the only count D_max controls."""
+        return self.kept_edge_count
 
 
 @dataclass(frozen=True)
@@ -276,7 +298,7 @@ class SparseGraph:
                     or item.target != edge.target
                 ):
                     raise ValueError("edge diagnostics must describe the aligned edge.")
-                if not np.isclose(item.final_log_weight, edge.log_weight, atol=1e-12):
+                if abs(item.final_log_weight - edge.log_weight) > 1e-12:
                     raise ValueError("edge diagnostic final_log_weight must match the edge.")
 
     def diagnostics_for_path(
@@ -514,16 +536,28 @@ def build_sparse_graph(
     prior: Optional[Prior] = None,
     weights: Optional[PriorWeights] = None,
     edo: Optional[int] = None,
-    rng: np.random.Generator,
-    d_max: int
-) -> SparseGraph:
-    """Build a bounded sparse graph of BeatState transitions."""
+    key: RNGKey,
+    d_max: int,
+    proposal_budget: Optional[int] = None,
+    prior_guided_proposals: Optional[bool] = None,
+) -> tuple[SparseGraph, RNGKey]:
+    """Build a bounded sparse graph of BeatState transitions.
+
+    ``d_max`` controls retained outgoing edges only (REQ-13): candidate
+    proposal is bounded separately by ``proposal_budget`` (falls back to
+    ``sb_config.proposal_budget``). The full budgeted, deduplicated, legal
+    candidate pool is batch-scored here via ``calculate_transition_log_weights``
+    and only *then* trimmed to ``d_max`` by score, with deterministic
+    tie-breaking (``_state_sort_key``).
+    """
     if not isinstance(start_layer, Layer):
         raise TypeError("start_layer must be a Layer.")
     if not isinstance(end_layer, Layer):
         raise TypeError("end_layer must be a Layer.")
     if not isinstance(total_beats, int) or total_beats < 1:
         raise ValueError("total_beats must be >= 1.")
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
 
     resolved_sb = SBConfig() if sb_config is None else sb_config
     resolved_style = StyleConfig() if style_config is None else style_config
@@ -531,6 +565,14 @@ def build_sparse_graph(
     resolved_prior = _resolved_prior(prior)
     resolved_edo = _edo_size(resolved_vocabs) if edo is None else edo
     validate_vocabulary_compatibility(resolved_vocabs, resolved_edo)
+    resolved_proposal_budget = (
+        resolved_sb.proposal_budget if proposal_budget is None else proposal_budget
+    )
+    resolved_prior_guided_proposals = (
+        resolved_sb.prior_guided_proposals
+        if prior_guided_proposals is None
+        else prior_guided_proposals
+    )
 
     expected_end_time = start_layer.time_index + total_beats
     if end_layer.time_index != expected_end_time:
@@ -543,6 +585,7 @@ def build_sparse_graph(
     layers = [start_layer]
     edge_layers: list[Tuple[Edge, ...]] = []
     diagnostics: list[LayerBuildDiagnostics] = []
+    current_key = key
 
     for step in range(total_beats):
         current_layer = layers[-1]
@@ -557,6 +600,8 @@ def build_sparse_graph(
         rejected: list[CandidateRejection] = []
         kept_edges: list[Edge] = []
         best_incoming: dict[BeatState, float] = {}
+        legal_candidate_count = 0
+        scored_candidate_count = 0
 
         for source_state in current_layer.states:
             if final_step:
@@ -568,7 +613,7 @@ def build_sparse_graph(
                     vocabularies=resolved_vocabs,
                 )
             else:
-                candidate_result = get_valid_next_states(
+                candidate_result, current_key = get_valid_next_states(
                     source_state,
                     current_time,
                     style_config=resolved_style,
@@ -576,11 +621,15 @@ def build_sparse_graph(
                     prior=resolved_prior,
                     context=_build_prior_context(source_state, end_layer, current_time),
                     edo=resolved_edo,
-                    rng=rng, 
-                    d_max=d_max
+                    key=current_key,
+                    d_max=d_max,
+                    proposal_budget=resolved_proposal_budget,
+                    prior_guided_proposals=resolved_prior_guided_proposals,
                 )
 
             raw_candidate_count += candidate_result.proposed_count
+            legal_candidate_count += candidate_result.legal_count
+            scored_candidate_count += candidate_result.scored_count
             rejected.extend(candidate_result.rejections)
 
             source_context = _build_prior_context(source_state, end_layer, current_time)
@@ -594,12 +643,19 @@ def build_sparse_graph(
                 for candidate_state in candidate_result.states
             )
             raw_edge_count += len(queries)
-            log_weights = calculate_transition_log_weights(
-                queries,
-                prior=resolved_prior,
-                weights=weights,
-                vocabularies=resolved_vocabs,
-                edo=resolved_edo,
+            # Skip the batch call entirely when there is nothing to score --
+            # a source with zero surviving candidates should never trigger a
+            # wasteful zero-item call into the (possibly expensive) prior.
+            log_weights: Tuple[float, ...] = (
+                calculate_transition_log_weights(
+                    queries,
+                    prior=resolved_prior,
+                    weights=weights,
+                    vocabularies=resolved_vocabs,
+                    edo=resolved_edo,
+                )
+                if queries
+                else ()
             )
             source_edges = [
                 Edge(
@@ -701,6 +757,8 @@ def build_sparse_graph(
                 raw_edge_count=raw_edge_count,
                 kept_edge_count=len(edge_layers[-1]),
                 outdegree_pruned_count=outdegree_pruned_count,
+                legal_candidate_count=legal_candidate_count,
+                scored_candidate_count=scored_candidate_count,
                 rejected_proposals=tuple(rejected),
                 pruned_states=tuple(pruned_states),
             )
@@ -723,4 +781,4 @@ def build_sparse_graph(
             layer_diagnostics=tuple(diagnostics),
         ),
         edge_diagnostics_by_time=edge_diagnostics,
-    )
+    ), current_key

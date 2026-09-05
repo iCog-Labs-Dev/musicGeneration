@@ -12,15 +12,38 @@ from aimusic.decode import (
     DEFAULT_TICKS_PER_BEAT,
     _cleanup_events,
     build_subbeat_grid,
-    decode_path_to_score,
-    generate_bass_events,
-    generate_comping_events,
-    generate_lead_events,
+    decode_path_to_score as _decode_path_to_score,
+    generate_bass_events as _generate_bass_events,
+    generate_comping_events as _generate_comping_events,
+    generate_lead_events as _generate_lead_events,
 )
+from aimusic.core.rng import RNGKey
 from aimusic.theory.tonal import chord_pitch_classes
 
 
 VOCABS = DEFAULT_VOCABULARIES
+
+
+# MUS-19 adapters keep the pre-existing musical assertions focused on their
+# subject while exercising the new required key-in/key-out APIs.
+def decode_path_to_score(*args, **kwargs):
+    score, _ = _decode_path_to_score(*args, key=RNGKey(seed=0), **kwargs)
+    return score
+
+
+def generate_bass_events(*args, **kwargs):
+    events, _ = _generate_bass_events(*args, key=RNGKey(seed=0), **kwargs)
+    return events
+
+
+def generate_comping_events(*args, **kwargs):
+    events, _ = _generate_comping_events(*args, key=RNGKey(seed=0), **kwargs)
+    return events
+
+
+def generate_lead_events(*args, **kwargs):
+    events, _ = _generate_lead_events(*args, key=RNGKey(seed=0), **kwargs)
+    return events
 
 
 def state(
@@ -60,6 +83,29 @@ class TestDecodeGrid(unittest.TestCase):
 
 
 class TestDecodeTracks(unittest.TestCase):
+    def test_track_keys_are_isolated_when_another_track_changes_density(self):
+        path = (state(beat=0), state(beat=1))
+        root = RNGKey(seed=17)
+        lead_key = root.derive("decoder.lead")
+        baseline, baseline_next = _generate_lead_events(
+            path, key=lead_key, vocabularies=VOCABS, include_terminal_state=True,
+        )
+        _generate_comping_events(
+            path, key=root.derive("decoder.comping"), vocabularies=VOCABS,
+            decode_config=DecodeConfig(comping_density=1.0), include_terminal_state=True,
+        )
+        replay, replay_next = _generate_lead_events(
+            path, key=lead_key, vocabularies=VOCABS, include_terminal_state=True,
+        )
+        self.assertEqual((baseline, baseline_next), (replay, replay_next))
+
+    def test_decode_advances_parent_after_allocating_track_streams(self):
+        key = RNGKey(seed=18)
+        _, next_key = _decode_path_to_score(
+            (state(),), key=key, vocabularies=VOCABS, include_terminal_state=True,
+        )
+        self.assertEqual(next_key, key.next_key())
+
     def test_19_edo_pitch_classes_and_registers_are_preserved(self):
         context = build_tonal_context(
             19,

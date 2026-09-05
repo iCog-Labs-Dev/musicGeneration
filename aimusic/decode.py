@@ -7,6 +7,7 @@ _logger = logging.getLogger(__name__)
 
 from aimusic.core.config import DecodeConfig
 from aimusic.core.core_types import BeatState, NoteEvent, Score
+from aimusic.core.rng import RNGKey, allocate_named_keys
 from aimusic.core.vocab import (
     ChordToken,
     GrooveToken,
@@ -280,12 +281,15 @@ def _cleanup_events(events: Sequence[NoteEvent]) -> Tuple[NoteEvent, ...]:
 def generate_bass_events(
     path: Sequence[BeatState],
     *,
+    key: RNGKey,
     decode_config: Optional[DecodeConfig] = None,
     vocabularies: Vocabularies,
     edo: int = 12,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
-) -> Tuple[NoteEvent, ...]:
+) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
@@ -323,18 +327,21 @@ def generate_bass_events(
             track="bass",
         )
         prev_pitch = pitch
-    return _cleanup_events(events)
+    return _cleanup_events(events), key
 
 
 def generate_comping_events(
     path: Sequence[BeatState],
     *,
+    key: RNGKey,
     decode_config: Optional[DecodeConfig] = None,
     vocabularies: Vocabularies,
     edo: int = 12,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
-) -> Tuple[NoteEvent, ...]:
+) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
@@ -386,18 +393,21 @@ def generate_comping_events(
                     expression=_unit_to_expression(tension, resolved_decode),
                     track="comping",
                 )
-    return _cleanup_events(events)
+    return _cleanup_events(events), key
 
 
 def generate_lead_events(
     path: Sequence[BeatState],
     *,
+    key: RNGKey,
     decode_config: Optional[DecodeConfig] = None,
     vocabularies: Vocabularies,
     edo: int = 12,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
-) -> Tuple[NoteEvent, ...]:
+) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
@@ -436,17 +446,20 @@ def generate_lead_events(
             track="lead",
         )
         prev_pitch = pitch
-    return _cleanup_events(events)
+    return _cleanup_events(events), key
 
 
 def generate_drum_events(
     path: Sequence[BeatState],
     *,
+    key: RNGKey,
     decode_config: Optional[DecodeConfig] = None,
     vocabularies: Vocabularies,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
-) -> Tuple[NoteEvent, ...]:
+) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
     events: list[NoteEvent] = []
@@ -481,67 +494,68 @@ def generate_drum_events(
                 expression=_unit_to_expression(tension, resolved_decode),
                 track="drums",
             )
-    return _cleanup_events(events)
+    return _cleanup_events(events), key
 
 
 def decode_path_to_score(
     path: Sequence[BeatState],
     *,
+    key: RNGKey,
     decode_config: Optional[DecodeConfig] = None,
     vocabularies: Vocabularies,
     edo: int = 12,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     tempo_bpm: float = 120.0,
     include_terminal_state: bool = False,
-) -> Score:
+) -> tuple[Score, RNGKey]:
     """Decode a BeatState path into a multi-track symbolic score."""
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
-    events = (
-        list(
-            generate_comping_events(
-                states,
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                edo=edo,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
-        )
-        + list(
-            generate_bass_events(
-                states,
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                edo=edo,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
-        )
-        + list(
-            generate_lead_events(
-                states,
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                edo=edo,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
-        )
-        + list(
-            generate_drum_events(
-                states,
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
-        )
+    track_keys, next_key = allocate_named_keys(
+        key, ("decoder.comping", "decoder.bass", "decoder.lead", "decoder.drums")
     )
+    comping, _ = generate_comping_events(
+                states,
+                key=track_keys["decoder.comping"],
+                decode_config=resolved_decode,
+                vocabularies=vocabularies,
+                edo=edo,
+                ticks_per_beat=ticks_per_beat,
+                include_terminal_state=True,
+            )
+    bass, _ = generate_bass_events(
+                states,
+                key=track_keys["decoder.bass"],
+                decode_config=resolved_decode,
+                vocabularies=vocabularies,
+                edo=edo,
+                ticks_per_beat=ticks_per_beat,
+                include_terminal_state=True,
+            )
+    lead, _ = generate_lead_events(
+                states,
+                key=track_keys["decoder.lead"],
+                decode_config=resolved_decode,
+                vocabularies=vocabularies,
+                edo=edo,
+                ticks_per_beat=ticks_per_beat,
+                include_terminal_state=True,
+            )
+    drums, _ = generate_drum_events(
+                states,
+                key=track_keys["decoder.drums"],
+                decode_config=resolved_decode,
+                vocabularies=vocabularies,
+                ticks_per_beat=ticks_per_beat,
+                include_terminal_state=True,
+            )
+    events = list(comping) + list(bass) + list(lead) + list(drums)
     _logger.info(f"Decoded {len(events)} note events ({len(states)} beats)")
     return Score(
         note_events=_cleanup_events(events),
         ticks_per_beat=ticks_per_beat,
         tempo_bpm=tempo_bpm,
-    )
+    ), next_key

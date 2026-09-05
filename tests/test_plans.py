@@ -11,6 +11,7 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.decode import decode_path_to_score
+from aimusic.core.rng import RNGKey
 from aimusic.planning.plans import (
     MethodARunConfig,
     build_section_plan,
@@ -19,6 +20,7 @@ from aimusic.planning.plans import (
     generate_start_endpoint_distribution,
     run_method_a,
 )
+from aimusic.planning.sb import sample_bridge_path
 from aimusic.render import render_midi
 from aimusic.theory.edo import EDO
 
@@ -78,7 +80,7 @@ class TestMethodAOrchestration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             for n in (12, 19):
                 with self.subTest(edo=n):
-                    result = run_method_a(
+                    result, next_key = run_method_a(
                         MethodARunConfig(
                             total_beats=4,
                             seed=31,
@@ -87,12 +89,13 @@ class TestMethodAOrchestration(unittest.TestCase):
                                 allowed_meters=("4/4",),
                                 groove_families=("straight",),
                             ),
-                        )
+                        ), key=RNGKey(seed=31)
                     )
-                    score = decode_path_to_score(
+                    score, _ = decode_path_to_score(
                         result.path,
                         vocabularies=result.vocabularies,
                         edo=result.tonal_context.n,
+                        key=next_key,
                     )
                     midi_path = Path(temp_dir) / f"{n}-edo.mid"
                     render_midi(
@@ -120,7 +123,7 @@ class TestMethodAOrchestration(unittest.TestCase):
     def test_generate_method_a_endpoints_returns_sections(self):
         run_config = MethodARunConfig(total_beats=4)
 
-        endpoints = generate_method_a_endpoints(run_config)
+        endpoints, _ = generate_method_a_endpoints(run_config, key=RNGKey(seed=0))
 
         self.assertEqual(endpoints.pi0.layer.time_index, 0)
         self.assertEqual(endpoints.piT.layer.time_index, 4)
@@ -135,7 +138,8 @@ class TestMethodAOrchestration(unittest.TestCase):
             style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight",)),
         )
 
-        result = run_method_a(run_config)
+        input_key = RNGKey(seed=11)
+        result, next_key = run_method_a(run_config, key=input_key)
 
         self.assertEqual(len(result.path), run_config.total_beats + 1)
         self.assertEqual(result.path[0], result.diagnostics.chosen_start_state)
@@ -150,6 +154,14 @@ class TestMethodAOrchestration(unittest.TestCase):
         self.assertEqual(result.diagnostics.path_mode, "map")
         self.assertIsNotNone(result.path_score)
         self.assertTrue(result.sb_solution.trace.converged)
+        self.assertEqual(next_key, input_key.next_key())
+        self.assertEqual(
+            result.diagnostics.rng_stream_ids,
+            (
+                "endpoint_choice", "candidate_proposal", "bridge_sampling",
+                "decoder.comping", "decoder.bass", "decoder.lead", "decoder.drums",
+            ),
+        )
 
     def test_run_method_a_sampling_is_seed_reproducible(self):
         run_config = MethodARunConfig(
@@ -159,8 +171,8 @@ class TestMethodAOrchestration(unittest.TestCase):
             style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight",)),
         )
 
-        first = run_method_a(run_config)
-        second = run_method_a(run_config)
+        first, _ = run_method_a(run_config, key=RNGKey(seed=23))
+        second, _ = run_method_a(run_config, key=RNGKey(seed=23))
 
         self.assertEqual(first.path, second.path)
         self.assertEqual(first.sampled_path, second.sampled_path)
@@ -168,6 +180,17 @@ class TestMethodAOrchestration(unittest.TestCase):
         self.assertEqual(first.diagnostics.endpoint_selection_mode, "sample")
         self.assertEqual(first.endpoints.start_choice, second.endpoints.start_choice)
         self.assertEqual(first.endpoints.end_choice, second.endpoints.end_choice)
+
+    def test_bridge_key_cannot_change_candidate_support(self):
+        run_config = MethodARunConfig(
+            total_beats=4,
+            style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight",)),
+        )
+        result, _ = run_method_a(run_config, key=RNGKey(seed=45))
+        support = result.graph.layers
+        sample_bridge_path(result.bridge, RNGKey(seed=1))
+        sample_bridge_path(result.bridge, RNGKey(seed=2))
+        self.assertEqual(result.graph.layers, support)
 
     def test_run_method_a_section_wise_smoke(self):
         run_config = MethodARunConfig(
@@ -180,7 +203,7 @@ class TestMethodAOrchestration(unittest.TestCase):
             ),
         )
 
-        result = run_method_a(run_config)
+        result, _ = run_method_a(run_config, key=RNGKey(seed=5))
 
         self.assertEqual(result.diagnostics.section_tags, ("intro", "outro"))
         self.assertEqual(len(result.endpoints.sections), 2)

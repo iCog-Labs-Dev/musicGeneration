@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Sequence, Tuple, TypeVar
+from typing import Mapping, Sequence, Tuple, TypeVar
 
 
 T = TypeVar("T")
@@ -32,6 +32,16 @@ def _seed_for(seed: int, stream: int) -> int:
     return _mix64(seed ^ (stream * 0x9E3779B97F4A7C15))
 
 
+def _stable_tag(tag: str) -> int:
+    """Return a process-independent integer for a logical stream name."""
+    if not isinstance(tag, str) or not tag:
+        raise ValueError("tag must be a non-empty string.")
+    value = 0xCBF29CE484222325  # FNV-1a, deliberately not Python's salted hash.
+    for byte in tag.encode("utf-8"):
+        value = ((value ^ byte) * 0x100000001B3) & _MASK_64
+    return value
+
+
 @dataclass(frozen=True)
 class RNGKey:
     """Immutable random key with explicit stream threading."""
@@ -59,6 +69,18 @@ class RNGKey:
         _require_int("tag", tag, minimum=0)
         derived_stream = _mix64(self.stream ^ (tag + 1)) & 0x7FFFFFFF
         return RNGKey(seed=self.seed, stream=derived_stream)
+
+    def derive(self, name: str) -> "RNGKey":
+        """Derive an isolated, stable child key for a logical stream name.
+
+        Derivation never consumes this key.  That makes named subsystem streams
+        independent: adding decoder randomness cannot perturb graph proposals.
+        """
+        tag = _stable_tag(name)
+        return RNGKey(
+            seed=_mix64(self.seed ^ tag),
+            stream=_mix64(self.stream ^ (tag * 0x9E3779B97F4A7C15)),
+        )
 
     def generator(self) -> random.Random:
         """Create an isolated Python RNG for the current key."""
@@ -95,3 +117,27 @@ def shuffle(key: RNGKey, values: Sequence[T]) -> tuple[Tuple[T, ...], RNGKey]:
     shuffled = list(values)
     rng.shuffle(shuffled)
     return tuple(shuffled), key.next_key()
+
+
+def derive_named_key(key: RNGKey, name: str) -> RNGKey:
+    """Functional spelling of :meth:`RNGKey.derive`."""
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
+    return key.derive(name)
+
+
+def allocate_named_keys(
+    key: RNGKey, names: Sequence[str]
+) -> tuple[Mapping[str, RNGKey], RNGKey]:
+    """Allocate unique named child streams and advance the parent once.
+
+    Derivation remains order-independent, while the advanced parent prevents a
+    later allocation from reusing this set of child streams.  Child keys are
+    independently threaded by the owning subsystem.
+    """
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
+    labels = tuple(names)
+    if len(set(labels)) != len(labels):
+        raise ValueError("names must be unique.")
+    return {name: key.derive(name) for name in labels}, key.next_key()

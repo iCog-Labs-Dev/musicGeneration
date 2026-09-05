@@ -16,6 +16,7 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.core.core_types import Score
+from aimusic.core.rng import RNGKey
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, run_method_a
 from aimusic.render import render_midi
@@ -128,13 +129,14 @@ class TestLongHorizonDeterministicFixture(unittest.TestCase):
             decode_config=decode_config,
             edo=fixture["edo"],
         )
-        result = run_method_a(run_config)
-        score = decode_path_to_score(
+        result, next_key = run_method_a(run_config, key=RNGKey(seed=fixture["seed"]))
+        score, _ = decode_path_to_score(
             result.path,
             decode_config=decode_config,
             vocabularies=result.vocabularies,
             edo=fixture["edo"],
             tempo_bpm=fixture["tempo_bpm"],
+            key=next_key,
         )
         render_midi(
             score,

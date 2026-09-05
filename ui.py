@@ -24,6 +24,7 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.core.diagnostics import RunManifest, SBDiagnostics
+from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, run_method_a
@@ -236,13 +237,14 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         edo=params.edo,
     )
 
-    plan_result = run_method_a(run_config)
-    score = decode_path_to_score(
+    plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=params.seed))
+    score, _ = decode_path_to_score(
         plan_result.path,
         decode_config=decode_config,
         vocabularies=plan_result.vocabularies,
         edo=params.edo,
         tempo_bpm=params.tempo_bpm,
+        key=next_key,
     )
     structural_stats = _build_structural_diagnostics(
         plan_result.path,

@@ -1,5 +1,5 @@
 import unittest
-import numpy as np
+from aimusic.core.rng import RNGKey
 
 from aimusic.planning.candidates import (
     apply_meter_constraints,
@@ -125,7 +125,7 @@ class TestCandidateGeneration(unittest.TestCase):
             groove_families=("straight", "syncopated", "swing"),
         )
         # Initialize a deterministic RNG for consistent testing
-        self.rng = np.random.default_rng(42)
+        self.key = RNGKey(seed=42)
 
     def test_candidate_generation_is_deduplicated_and_legal(self):
         prev = state(
@@ -137,10 +137,10 @@ class TestCandidateGeneration(unittest.TestCase):
             groove="straight_8ths",
         )
 
-        result = get_valid_next_states(
+        result, _ = get_valid_next_states(
             prev,
             4,
-            self.rng,
+            self.key,
             d_max=100,  
             style_config=self.style,
             vocabularies=VOCABS,
@@ -161,6 +161,13 @@ class TestCandidateGeneration(unittest.TestCase):
             )
         )
 
+        replay, replay_key = get_valid_next_states(
+            prev, 4, RNGKey(seed=42), d_max=100, style_config=self.style,
+            vocabularies=VOCABS, prior=NeuralPrior(),
+        )
+        self.assertEqual(replay, result)
+        self.assertEqual(replay_key, _)
+
     def test_candidate_generation_includes_cadence_targets(self):
         prev = state(
             beat=3,
@@ -173,11 +180,15 @@ class TestCandidateGeneration(unittest.TestCase):
         cadence_chord_id = VOCABS.chords.token_for_label("Cmaj").id
         cadence_role_id = VOCABS.roles.token_for_label("cad").id
 
-        result = get_valid_next_states(
+        result, _ = get_valid_next_states(
             prev,
             4,
-            self.rng,
-            d_max=2000, # Use a high bound to guarantee we don't accidentally prune the target early
+            self.key,
+            d_max=2000,
+            # REQ-13: search breadth is controlled by proposal_budget, not
+            # d_max. Use a high budget to guarantee we don't accidentally
+            # miss the target during (shuffled) generation.
+            proposal_budget=4096,
             style_config=self.style,
             vocabularies=VOCABS,
             prior=NeuralPrior(),
@@ -192,6 +203,24 @@ class TestCandidateGeneration(unittest.TestCase):
                 for candidate in result.states
             )
         )
+
+    def test_decoder_stream_derivation_cannot_change_candidate_replay(self):
+        prev = state(
+            beat=3, key="C", chord="G7", role="prep",
+            head="upper_approach", groove="straight_8ths",
+        )
+        root = RNGKey(seed=81)
+        proposal_key = root.derive("candidate_proposal")
+        first, first_next = get_valid_next_states(
+            prev, 4, proposal_key, d_max=100, style_config=self.style,
+            vocabularies=VOCABS, prior=NeuralPrior(),
+        )
+        _ = root.derive("decoder.lead")
+        second, second_next = get_valid_next_states(
+            prev, 4, proposal_key, d_max=100, style_config=self.style,
+            vocabularies=VOCABS, prior=NeuralPrior(),
+        )
+        self.assertEqual((first, first_next), (second, second_next))
 
     def test_19_edo_tonal_search_uses_19_step_fifth(self):
         context = build_tonal_context(19, self.style)

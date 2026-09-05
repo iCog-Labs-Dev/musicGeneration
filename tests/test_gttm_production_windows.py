@@ -3,10 +3,9 @@ from __future__ import annotations
 import math
 import unittest
 
-import numpy as np
-
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Edge, Layer
+from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_VOCABULARIES
 from aimusic.planning.candidates import is_legal_transition
 from aimusic.planning.graph import (
@@ -173,7 +172,7 @@ class TestTwoPassProductionScoring(unittest.TestCase):
             chord="Cmaj",
             role="cad",
         )
-        graph = build_sparse_graph(
+        graph, _ = build_sparse_graph(
             Layer(0, (start,)),
             Layer(3, (end,)),
             3,
@@ -182,7 +181,7 @@ class TestTwoPassProductionScoring(unittest.TestCase):
             vocabularies=VOCABS,
             prior=NullPrior(),
             weights=PriorWeights(),
-            rng=np.random.default_rng(42),
+            key=RNGKey(seed=42),
             d_max=sb.d_max,
         )
 
@@ -261,12 +260,17 @@ class TestTwoPassProductionScoring(unittest.TestCase):
     def test_selected_path_exposes_retained_edge_contributions(self) -> None:
         for use_sampling in (False, True):
             with self.subTest(use_sampling=use_sampling):
-                result = run_method_a(
+                result, _ = run_method_a(
                     MethodARunConfig(
                         total_beats=4,
                         seed=123,
                         use_sampling=use_sampling,
-                    )
+                        style_config=StyleConfig(
+                            allowed_meters=("4/4",),
+                            groove_families=("straight",),
+                        ),
+                    ),
+                    key=RNGKey(seed=123),
                 )
                 self.assertEqual(
                     len(result.path_edge_diagnostics), len(result.path) - 1

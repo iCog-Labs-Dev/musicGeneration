@@ -1,5 +1,5 @@
 import unittest
-import numpy as np
+from aimusic.core.rng import RNGKey
 
 from aimusic.planning.candidates import is_legal_transition
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
@@ -65,7 +65,7 @@ class TestSparseGraphBuilder(unittest.TestCase):
         self.end_layer = Layer(time_index=3, states=(self.end_state,))
 
     def test_build_sparse_graph_bounds_layers_and_outdegrees(self):
-        graph = build_sparse_graph(
+        graph, _ = build_sparse_graph(
             self.start_layer,
             self.end_layer,
             3,
@@ -74,7 +74,7 @@ class TestSparseGraphBuilder(unittest.TestCase):
             vocabularies=VOCABS,
             prior=self.prior,
             weights=self.weights,
-            rng=np.random.default_rng(42), 
+            key=RNGKey(seed=42),
             d_max=self.sb_config.d_max
         )
 
@@ -99,8 +99,16 @@ class TestSparseGraphBuilder(unittest.TestCase):
                 self.assertIsInstance(edge.log_weight, float)
             self.assertTrue(all(count <= self.sb_config.d_max for count in by_source.values()))
 
+        replay, replay_key = build_sparse_graph(
+            self.start_layer, self.end_layer, 3, sb_config=self.sb_config,
+            style_config=self.style, vocabularies=VOCABS, prior=self.prior,
+            weights=self.weights, key=RNGKey(seed=42), d_max=self.sb_config.d_max,
+        )
+        self.assertEqual(replay, graph)
+        self.assertEqual(replay_key, _)
+
     def test_graph_diagnostics_report_rejections_and_pruning(self):
-        graph = build_sparse_graph(
+        graph, _ = build_sparse_graph(
             self.start_layer,
             self.end_layer,
             3,
@@ -109,7 +117,7 @@ class TestSparseGraphBuilder(unittest.TestCase):
             vocabularies=VOCABS,
             prior=self.prior,
             weights=self.weights,
-            rng=np.random.default_rng(42), 
+            key=RNGKey(seed=42),
             d_max=self.sb_config.d_max
         )
 
