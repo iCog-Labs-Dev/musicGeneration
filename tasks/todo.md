@@ -1,10 +1,11 @@
-# Todo: MIDI→Audio PR1 (M0)
+# Todo: M1 PR2 — Native audio entry spine
 
-- [x] Create `feature/midi2audio-integration` (fork only; no iCog upstream)
-- [x] Land PDF-derived docs (pipeline, contract, roadmap, stages, B4, testing, config, next-steps)
-- [x] Seed `DECISIONS.md`, `AGENTS.md`, `docs/decisions/*`, readme/epics pointers
-- [x] Add `aimusic/audio` stub + `[audio]` extra placeholder + `tests/test_architecture.py`
-- [x] Port `aimusic/core/render_package.py` + thin `aimusic/render/package.py`
-- [x] Wire `handle_generate` to emit RenderPackage (keep legacy flats)
-- [x] Add `tests/test_render_package.py`; run lint/typecheck/tests
-- [x] Push branch; `gh pr create` → fork `main`; monitor CI (all green)
+- [x] Create `feature/m1-audio-spine` from fork `main`
+- [x] Add `aimusic/audio/config.py` (YAML loader)
+- [x] Add `aimusic/audio/from_score.py` + `aimusic/audio/entry.py`
+- [x] Wire lazy `render-audio` CLI in `aimusic/app/cli.py`
+- [x] Declare `[audio-bridge]` in `pyproject.toml`
+- [x] Add `tests/test_audio_entry.py`; CI tests job uses `.[audio]`
+- [x] Update `docs/audio-next-steps.md`, `docs/audio-pipeline.md`
+- [x] Run lint/typecheck/tests locally
+- [x] Push branch + open PR → https://github.com/arsenylosev/musicGeneration/pull/3

@@ -8,19 +8,20 @@ Ordered backlog. Prefer one P0/P1 item per session. Full roadmap:
 - [x] Document architecture / ADRs / contract / roadmap in this repo
 - [x] Architecture quarantine tests + `aimusic.audio` stub
 - [x] RenderPackage producer + always emit from `generate`
-- [ ] Merge PR to fork `main`; keep CI green
+- [x] Merge PR to fork `main`; keep CI green
 
 ## P1 — Bridge / deterministic spine
 
-- [ ] Optional `[audio-bridge]` on tagged `midi2audio-generative@v0.1.0`
-- [ ] CLI `render-audio` with lazy import; mock restyle only in CI
-- [ ] Port M1: `from_score`, groove apply, simple/fluidsynth render, orchestrator
-- [ ] Prefer `from_score` when `structure.json` exists; CI reconcile on fixtures
+- [x] Optional `[audio-bridge]` extra declared (runtime bridge deferred to PR3)
+- [x] CLI `render-audio` with lazy import; validate-only default in PR2
+- [x] Native `from_score` loader; prefer planner `structure.json`
+- [ ] Port M1 remainder: groove apply, simple/fluidsynth render, orchestrator
+- [ ] CI reconcile on fixtures
 
 ## P2 — Safe generative loop
 
 - [ ] Profile with prompts+restyle+scoring (mock only)
-- [ ] Optional CI job with `.[audio]` + `tests/test_audio_*.py`
+- [x] CI tests install PyYAML via `requirements.txt` for `tests/test_audio_*.py`
 - [ ] Never require live API keys in default CI
 
 ## P3 — B3 microtonal integrity

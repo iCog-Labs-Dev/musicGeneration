@@ -29,6 +29,10 @@ audio = [
   # Heavy DSP (librosa/torch/demucs) is added in later milestones.
   "PyYAML",
 ]
+audio-bridge = [
+  "aimusic[audio]",
+  # TODO PR3: pin git tag midi2audio-generative@v0.1.0 once URL confirmed
+]
 dev = [
   "pytest",
   "flake8",

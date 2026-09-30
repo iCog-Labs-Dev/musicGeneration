@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import (
+    Generic,
+    Iterable,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 _logger = logging.getLogger(__name__)
 
 from aimusic.core.config import DecodeConfig
 from aimusic.core.core_types import BeatState, NoteEvent, Score
-from aimusic.core.rng import RNGKey, allocate_named_keys
+from aimusic.core.rng import RNGKey, allocate_named_keys, random_unit
 from aimusic.core.vocab import (
     ChordToken,
     GrooveToken,
@@ -24,6 +33,176 @@ DRUM_PITCHES = {
     "hat_closed": 42,
     "hat_open": 46,
 }
+
+
+# ---------------------------------------------------------------------------
+# REQ-11: pure state/window/RNG track-generator contract.
+#
+# Each track generator (`gen_bass`, `gen_comping`, `gen_lead`, `gen_drums`)
+# is a pure function of exactly:
+#   - `state`          the current beat's structural BeatState,
+#   - `window`         read-only local context (prev/next states, section),
+#   - `decoder_state`  explicit per-track memory (voice-leading, motif, ...),
+#   - `key`            an RNGKey scoped to this track's own stream,
+#   - `decode_config` / `vocabularies` / `edo` / `ticks_per_beat`.
+# It returns a `TrackStepResult`: the events for that one beat, the next
+# decoder state, and the advanced key. No track generator loops over a path,
+# mutates shared/closure state, or reads another track's state or key.
+# Composition into full-path tracks (looping + windowing + decoder-state
+# threading) lives entirely in `_run_track`, below.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BeatWindow:
+    """Read-only local context around one beat in a path.
+
+    `beat_index` / `total_beats` give position; `prev_state` / `next_state`
+    are the immediate structural neighbors (``None`` at a path boundary);
+    `is_first_beat` / `is_last_beat` / `is_phrase_start` / `is_phrase_end`
+    summarize section context so a generator never needs the whole path to
+    know where it sits in it.
+    """
+
+    beat_index: int
+    total_beats: int
+    prev_state: Optional[BeatState]
+    next_state: Optional[BeatState]
+    is_first_beat: bool
+    is_last_beat: bool
+    is_phrase_start: bool
+    is_phrase_end: bool
+
+
+@dataclass(frozen=True)
+class BassDecoderState:
+    """Explicit voice-leading memory for `gen_bass`."""
+
+    prev_pitch: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CompingDecoderState:
+    """Explicit voicing memory for `gen_comping`."""
+
+    previous_voicing: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class LeadDecoderState:
+    """Explicit voice-leading memory for `gen_lead`."""
+
+    prev_pitch: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class DrumDecoderState:
+    """`gen_drums` needs no cross-beat memory today; kept explicit (rather
+    than omitted) so all four tracks share one composition contract."""
+
+
+DecoderStateT = TypeVar("DecoderStateT")
+
+
+@dataclass(frozen=True)
+class TrackStepResult(Generic[DecoderStateT]):
+    """One beat's output from a pure track generator."""
+
+    events: Tuple[NoteEvent, ...]
+    decoder_state: DecoderStateT
+    key: RNGKey
+
+
+class TrackGenerator(Protocol[DecoderStateT]):
+    """Shared per-beat contract every track generator implements."""
+
+    def __call__(
+        self,
+        state: BeatState,
+        window: BeatWindow,
+        *,
+        decoder_state: DecoderStateT,
+        key: RNGKey,
+        decode_config: DecodeConfig,
+        vocabularies: Vocabularies,
+        edo: int,
+        ticks_per_beat: int,
+    ) -> TrackStepResult[DecoderStateT]:
+        ...
+
+
+def _build_windows(states: Sequence[BeatState]) -> Tuple[BeatWindow, ...]:
+    total = len(states)
+    windows = []
+    for beat_index, state in enumerate(states):
+        prev_state = states[beat_index - 1] if beat_index > 0 else None
+        next_state = states[beat_index + 1] if beat_index + 1 < total else None
+        windows.append(
+            BeatWindow(
+                beat_index=beat_index,
+                total_beats=total,
+                prev_state=prev_state,
+                next_state=next_state,
+                is_first_beat=beat_index == 0,
+                is_last_beat=beat_index == total - 1,
+                is_phrase_start=state.boundary_lvl > 0 and prev_state is None,
+                is_phrase_end=state.boundary_lvl > 0 and next_state is None,
+            )
+        )
+    return tuple(windows)
+
+
+def _activation_unit(
+    key: RNGKey, decode_config: DecodeConfig, window: BeatWindow
+) -> Tuple[float, RNGKey]:
+    """Per-beat activation draw in [0, 1), plus the advanced key.
+
+    `decode_config.deterministic_activation=True` (the default) reproduces
+    the original beat-index-hash policy exactly -- a fixed policy that still
+    advances the key once per beat. Setting it False draws a genuine random
+    unit from `key` instead: the seam where a probabilistic activation
+    policy plugs in without touching any `gen_*` call site.
+    """
+    if decode_config.deterministic_activation:
+        return ((window.beat_index * 37) % 100) / 100.0, key.next_key()
+    return random_unit(key)
+
+
+def _run_track(
+    states: Sequence[BeatState],
+    windows: Sequence[BeatWindow],
+    *,
+    key: RNGKey,
+    initial_decoder_state: DecoderStateT,
+    generator: TrackGenerator[DecoderStateT],
+    decode_config: DecodeConfig,
+    vocabularies: Vocabularies,
+    edo: int,
+    ticks_per_beat: int,
+) -> Tuple[Tuple[NoteEvent, ...], RNGKey, DecoderStateT]:
+    """Compose a full-path track from a pure per-beat `TrackGenerator`.
+
+    This is the *only* place that loops over a path for a track and the
+    *only* place decoder state and key are threaded from one beat to the
+    next -- there is no other mutable state anywhere in the pipeline.
+    """
+    events: list[NoteEvent] = []
+    decoder_state = initial_decoder_state
+    for state, window in zip(states, windows):
+        step = generator(
+            state,
+            window,
+            decoder_state=decoder_state,
+            key=key,
+            decode_config=decode_config,
+            vocabularies=vocabularies,
+            edo=edo,
+            ticks_per_beat=ticks_per_beat,
+        )
+        events.extend(step.events)
+        decoder_state = step.decoder_state
+        key = step.key
+    return tuple(events), key, decoder_state
 
 
 def _require_non_empty_path(path: Sequence[BeatState]) -> Tuple[BeatState, ...]:
@@ -93,13 +272,12 @@ def _unit_to_expression(tension: float, decode_config: DecodeConfig) -> float:
 
 
 def _should_emit(
-    track_density: float, beat_index: int, tension: float, *, strong: bool
+    track_density: float, activation_unit: float, tension: float, *, strong: bool
 ) -> bool:
     if track_density <= 0.0:
         return False
     activation = track_density + (0.15 * tension) + (0.2 if strong else 0.0)
-    cycle = ((beat_index * 37) % 100) / 100.0
-    return cycle < min(1.0, activation)
+    return activation_unit < min(1.0, activation)
 
 
 def build_subbeat_grid(
@@ -278,6 +456,55 @@ def _cleanup_events(events: Sequence[NoteEvent]) -> Tuple[NoteEvent, ...]:
     )
 
 
+def gen_bass(
+    state: BeatState,
+    window: BeatWindow,
+    *,
+    decoder_state: BassDecoderState,
+    key: RNGKey,
+    decode_config: DecodeConfig,
+    vocabularies: Vocabularies,
+    edo: int = 12,
+    ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
+) -> TrackStepResult[BassDecoderState]:
+    """Pure per-beat bass generator (REQ-11)."""
+    activation_unit, key = _activation_unit(key, decode_config, window)
+    tension = _tension_level(state, vocabularies)
+    strong = state.beat_in_bar in _strong_beats(state, vocabularies)
+    if not _should_emit(decode_config.bass_density, activation_unit, tension, strong=strong):
+        return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
+
+    chord = _chord_token(state, vocabularies)
+    role = _role_label(state, vocabularies)
+    pitch_pc = chord.root_pc if role != "prep" else pc(chord.root_pc - 1, edo)
+    prev_pitch = decoder_state.prev_pitch
+    pitch = _nearest_pitch(
+        prev_pitch,
+        (pitch_pc, pc(chord.root_pc + get_fifth_steps(edo), edo)),
+        decode_config.bass_register,
+        edo,
+    )
+    if state.boundary_lvl > 0:
+        pitch = _fit_pitch_to_register(chord.root_pc, decode_config.bass_register, edo)
+    ton = window.beat_index * ticks_per_beat
+    duration = ticks_per_beat if role != "change" else ticks_per_beat // 2
+    events: list[NoteEvent] = []
+    _append_event(
+        events,
+        ton=ton,
+        duration=duration,
+        pitch=pitch,
+        velocity=_unit_to_velocity(tension, decode_config),
+        expression=_unit_to_expression(tension, decode_config),
+        track="bass",
+    )
+    return TrackStepResult(
+        events=tuple(events),
+        decoder_state=BassDecoderState(prev_pitch=pitch),
+        key=key,
+    )
+
+
 def generate_bass_events(
     path: Sequence[BeatState],
     *,
@@ -288,46 +515,91 @@ def generate_bass_events(
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    """Whole-path bass track, composed from `gen_bass` via `_run_track`."""
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
+    windows = _build_windows(states)
+    events, next_key, _ = _run_track(
+        states,
+        windows,
+        key=key,
+        initial_decoder_state=BassDecoderState(),
+        generator=gen_bass,
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        edo=edo,
+        ticks_per_beat=ticks_per_beat,
+    )
+    return _cleanup_events(events), next_key
+
+
+def gen_comping(
+    state: BeatState,
+    window: BeatWindow,
+    *,
+    decoder_state: CompingDecoderState,
+    key: RNGKey,
+    decode_config: DecodeConfig,
+    vocabularies: Vocabularies,
+    edo: int = 12,
+    ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
+) -> TrackStepResult[CompingDecoderState]:
+    """Pure per-beat comping generator (REQ-11)."""
+    # Comping has no probabilistic activation gate (unlike bass/lead/drums),
+    # but the key is still advanced once per beat for a uniform contract.
+    key = key.next_key()
+    if decode_config.comping_density <= 0.0:
+        return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
+
+    groove = _groove_token(state, vocabularies)
+    offsets = _family_offsets(groove, decode_config.subbeats_per_beat)
+    tension = _tension_level(state, vocabularies)
+    chord = _chord_token(state, vocabularies)
+    pitch_classes = tuple(sorted(chord_pitch_classes(chord.root_pc, chord.quality, edo)))
+    voice_count = max(
+        decode_config.min_comping_voices,
+        min(decode_config.max_comping_voices, len(pitch_classes)),
+    )
+    if state.boundary_lvl > 0:
+        voice_count = decode_config.max_comping_voices
+
+    previous_voicing = decoder_state.previous_voicing
+    voices: list[int] = []
+    for voice_idx in range(voice_count):
+        target_pc = pitch_classes[voice_idx % len(pitch_classes)]
+        prev_pitch = (
+            None
+            if voice_idx >= len(previous_voicing)
+            else previous_voicing[voice_idx]
+        )
+        voices.append(
+            _nearest_pitch(prev_pitch, (target_pc,), decode_config.comping_register, edo)
+        )
+    next_voicing = tuple(sorted(voices))
+
     events: list[NoteEvent] = []
-    prev_pitch: Optional[int] = None
-    for beat_index, state in enumerate(states):
-        tension = _tension_level(state, vocabularies)
-        strong = state.beat_in_bar in _strong_beats(state, vocabularies)
-        if not _should_emit(
-            resolved_decode.bass_density, beat_index, tension, strong=strong
-        ):
-            continue
-        chord = _chord_token(state, vocabularies)
-        role = _role_label(state, vocabularies)
-        pitch_pc = chord.root_pc if role != "prep" else pc(chord.root_pc - 1, edo)
-        pitch = _nearest_pitch(
-            prev_pitch,
-            (pitch_pc, pc(chord.root_pc + get_fifth_steps(edo), edo)),
-            resolved_decode.bass_register,
-            edo,
+    for offset in offsets[: max(1, round(decode_config.comping_density * len(offsets)))]:
+        ton = (window.beat_index * ticks_per_beat) + (
+            (ticks_per_beat // decode_config.subbeats_per_beat) * offset
         )
-        if state.boundary_lvl > 0:
-            pitch = _fit_pitch_to_register(
-                chord.root_pc, resolved_decode.bass_register, edo
+        for pitch in next_voicing:
+            _append_event(
+                events,
+                ton=ton,
+                duration=ticks_per_beat // 2,
+                pitch=pitch,
+                velocity=_unit_to_velocity(tension, decode_config),
+                expression=_unit_to_expression(tension, decode_config),
+                track="comping",
             )
-        ton = beat_index * ticks_per_beat
-        duration = ticks_per_beat if role != "change" else ticks_per_beat // 2
-        _append_event(
-            events,
-            ton=ton,
-            duration=duration,
-            pitch=pitch,
-            velocity=_unit_to_velocity(tension, resolved_decode),
-            expression=_unit_to_expression(tension, resolved_decode),
-            track="bass",
-        )
-        prev_pitch = pitch
-    return _cleanup_events(events), key
+    return TrackStepResult(
+        events=tuple(events),
+        decoder_state=CompingDecoderState(previous_voicing=next_voicing),
+        key=key,
+    )
 
 
 def generate_comping_events(
@@ -340,60 +612,73 @@ def generate_comping_events(
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    """Whole-path comping track, composed from `gen_comping` via `_run_track`."""
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
+    windows = _build_windows(states)
+    events, next_key, _ = _run_track(
+        states,
+        windows,
+        key=key,
+        initial_decoder_state=CompingDecoderState(),
+        generator=gen_comping,
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        edo=edo,
+        ticks_per_beat=ticks_per_beat,
+    )
+    return _cleanup_events(events), next_key
+
+
+def gen_lead(
+    state: BeatState,
+    window: BeatWindow,
+    *,
+    decoder_state: LeadDecoderState,
+    key: RNGKey,
+    decode_config: DecodeConfig,
+    vocabularies: Vocabularies,
+    edo: int = 12,
+    ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
+) -> TrackStepResult[LeadDecoderState]:
+    """Pure per-beat lead generator (REQ-11)."""
+    activation_unit, key = _activation_unit(key, decode_config, window)
+    tension = _tension_level(state, vocabularies)
+    strong = state.beat_in_bar in _strong_beats(state, vocabularies)
+    if not _should_emit(decode_config.lead_density, activation_unit, tension, strong=strong):
+        return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
+    head = _head_label(state, vocabularies)
+    if head == "rest" and state.boundary_lvl == 0:
+        return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
+
+    prev_pitch = decoder_state.prev_pitch
+    head_pc = _head_pitch_class(state, vocabularies, edo)
+    pitch = _nearest_pitch(prev_pitch, (head_pc,), decode_config.lead_register, edo)
+    pitch = _clamp_leap(
+        prev_pitch,
+        pitch,
+        decode_config.max_lead_leap_steps,
+        edo=edo,
+        register=decode_config.lead_register,
+    )
+    ton = window.beat_index * ticks_per_beat
+    duration = ticks_per_beat if state.boundary_lvl > 0 else ticks_per_beat // 2
     events: list[NoteEvent] = []
-    previous_voicing: Optional[Tuple[int, ...]] = None
-    for beat_index, state in enumerate(states):
-        if resolved_decode.comping_density <= 0.0:
-            continue
-        groove = _groove_token(state, vocabularies)
-        offsets = _family_offsets(groove, resolved_decode.subbeats_per_beat)
-        tension = _tension_level(state, vocabularies)
-        chord = _chord_token(state, vocabularies)
-        pitch_classes = tuple(
-            sorted(chord_pitch_classes(chord.root_pc, chord.quality, edo))
-        )
-        voice_count = max(
-            resolved_decode.min_comping_voices,
-            min(resolved_decode.max_comping_voices, len(pitch_classes)),
-        )
-        if state.boundary_lvl > 0:
-            voice_count = resolved_decode.max_comping_voices
-        voices: list[int] = []
-        for voice_idx in range(voice_count):
-            target_pc = pitch_classes[voice_idx % len(pitch_classes)]
-            prev_pitch = (
-                None
-                if previous_voicing is None or voice_idx >= len(previous_voicing)
-                else previous_voicing[voice_idx]
-            )
-            voices.append(
-                _nearest_pitch(
-                    prev_pitch, (target_pc,), resolved_decode.comping_register, edo
-                )
-            )
-        previous_voicing = tuple(sorted(voices))
-        for offset in offsets[
-            : max(1, round(resolved_decode.comping_density * len(offsets)))
-        ]:
-            ton = (beat_index * ticks_per_beat) + (
-                (ticks_per_beat // resolved_decode.subbeats_per_beat) * offset
-            )
-            for pitch in previous_voicing:
-                _append_event(
-                    events,
-                    ton=ton,
-                    duration=ticks_per_beat // 2,
-                    pitch=pitch,
-                    velocity=_unit_to_velocity(tension, resolved_decode),
-                    expression=_unit_to_expression(tension, resolved_decode),
-                    track="comping",
-                )
-    return _cleanup_events(events), key
+    _append_event(
+        events,
+        ton=ton,
+        duration=duration,
+        pitch=pitch,
+        velocity=_unit_to_velocity(tension, decode_config),
+        expression=_unit_to_expression(tension, decode_config),
+        track="lead",
+    )
+    return TrackStepResult(
+        events=tuple(events), decoder_state=LeadDecoderState(prev_pitch=pitch), key=key
+    )
 
 
 def generate_lead_events(
@@ -406,47 +691,72 @@ def generate_lead_events(
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    """Whole-path lead track, composed from `gen_lead` via `_run_track`."""
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
+    windows = _build_windows(states)
+    events, next_key, _ = _run_track(
+        states,
+        windows,
+        key=key,
+        initial_decoder_state=LeadDecoderState(),
+        generator=gen_lead,
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        edo=edo,
+        ticks_per_beat=ticks_per_beat,
+    )
+    return _cleanup_events(events), next_key
+
+
+def gen_drums(
+    state: BeatState,
+    window: BeatWindow,
+    *,
+    decoder_state: DrumDecoderState,
+    key: RNGKey,
+    decode_config: DecodeConfig,
+    vocabularies: Vocabularies,
+    edo: int = 12,
+    ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
+) -> TrackStepResult[DrumDecoderState]:
+    """Pure per-beat drum generator (REQ-11). `edo` is accepted (unused) only
+    to satisfy the shared `TrackGenerator` call signature -- drum pitches are
+    fixed MIDI numbers, not EDO-relative."""
+    del edo
+    activation_unit, key = _activation_unit(key, decode_config, window)
+    tension = _tension_level(state, vocabularies)
+    strong = state.beat_in_bar in _strong_beats(state, vocabularies)
+    if not _should_emit(decode_config.drum_density, activation_unit, tension, strong=strong):
+        return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
+
+    step_ticks = ticks_per_beat // decode_config.subbeats_per_beat
+    groove = _groove_token(state, vocabularies)
+    offsets = _family_offsets(groove, decode_config.subbeats_per_beat)
+    offset_count = max(1, round(decode_config.drum_density * len(offsets)))
     events: list[NoteEvent] = []
-    prev_pitch: Optional[int] = None
-    for beat_index, state in enumerate(states):
-        tension = _tension_level(state, vocabularies)
-        strong = state.beat_in_bar in _strong_beats(state, vocabularies)
-        if not _should_emit(
-            resolved_decode.lead_density, beat_index, tension, strong=strong
-        ):
-            continue
-        head = _head_label(state, vocabularies)
-        if head == "rest" and state.boundary_lvl == 0:
-            continue
-        head_pc = _head_pitch_class(state, vocabularies, edo)
-        pitch = _nearest_pitch(
-            prev_pitch, (head_pc,), resolved_decode.lead_register, edo
+    for offset in offsets[:offset_count]:
+        ton = (window.beat_index * ticks_per_beat) + (offset * step_ticks)
+        pitch = (
+            DRUM_PITCHES["kick"] if strong and offset == 0 else DRUM_PITCHES["hat_closed"]
         )
-        pitch = _clamp_leap(
-            prev_pitch,
-            pitch,
-            resolved_decode.max_lead_leap_steps,
-            edo=edo,
-            register=resolved_decode.lead_register,
-        )
-        ton = beat_index * ticks_per_beat
-        duration = ticks_per_beat if state.boundary_lvl > 0 else ticks_per_beat // 2
+        if offset == 0 and not strong:
+            pitch = DRUM_PITCHES["snare"]
+        if state.boundary_lvl > 1 and offset == 0:
+            pitch = DRUM_PITCHES["kick"]
         _append_event(
             events,
             ton=ton,
-            duration=duration,
+            duration=max(step_ticks // 2, 1),
             pitch=pitch,
-            velocity=_unit_to_velocity(tension, resolved_decode),
-            expression=_unit_to_expression(tension, resolved_decode),
-            track="lead",
+            velocity=_unit_to_velocity(tension, decode_config),
+            expression=_unit_to_expression(tension, decode_config),
+            track="drums",
         )
-        prev_pitch = pitch
-    return _cleanup_events(events), key
+    return TrackStepResult(events=tuple(events), decoder_state=decoder_state, key=key)
 
 
 def generate_drum_events(
@@ -458,43 +768,24 @@ def generate_drum_events(
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
+    """Whole-path drum track, composed from `gen_drums` via `_run_track`."""
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
-    events: list[NoteEvent] = []
-    step_ticks = ticks_per_beat // resolved_decode.subbeats_per_beat
-    for beat_index, state in enumerate(states):
-        tension = _tension_level(state, vocabularies)
-        strong = state.beat_in_bar in _strong_beats(state, vocabularies)
-        if not _should_emit(
-            resolved_decode.drum_density, beat_index, tension, strong=strong
-        ):
-            continue
-        groove = _groove_token(state, vocabularies)
-        offsets = _family_offsets(groove, resolved_decode.subbeats_per_beat)
-        offset_count = max(1, round(resolved_decode.drum_density * len(offsets)))
-        for offset in offsets[:offset_count]:
-            ton = (beat_index * ticks_per_beat) + (offset * step_ticks)
-            pitch = (
-                DRUM_PITCHES["kick"]
-                if strong and offset == 0
-                else DRUM_PITCHES["hat_closed"]
-            )
-            if offset == 0 and not strong:
-                pitch = DRUM_PITCHES["snare"]
-            if state.boundary_lvl > 1 and offset == 0:
-                pitch = DRUM_PITCHES["kick"]
-            _append_event(
-                events,
-                ton=ton,
-                duration=max(step_ticks // 2, 1),
-                pitch=pitch,
-                velocity=_unit_to_velocity(tension, resolved_decode),
-                expression=_unit_to_expression(tension, resolved_decode),
-                track="drums",
-            )
-    return _cleanup_events(events), key
+    windows = _build_windows(states)
+    events, next_key, _ = _run_track(
+        states,
+        windows,
+        key=key,
+        initial_decoder_state=DrumDecoderState(),
+        generator=gen_drums,
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        edo=12,
+        ticks_per_beat=ticks_per_beat,
+    )
+    return _cleanup_events(events), next_key
 
 
 def decode_path_to_score(

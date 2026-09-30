@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -413,6 +414,31 @@ def handle_export(args: argparse.Namespace) -> None:
     )
     print(f"Exported multitrack MIDI to: {output_path}")
 
+
+def handle_render_audio(args: argparse.Namespace) -> None:
+    """Validate (or eventually render) a RenderPackage directory."""
+    package_root = Path(args.package)
+    if not package_root.is_dir():
+        print(f"Error: RenderPackage directory not found: {package_root}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        entry = importlib.import_module("aimusic.audio.entry")
+    except ImportError:
+        print(
+            "Error: render-audio requires optional audio dependencies.\n"
+            "Install with: pip install -e '.[audio]'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    profile = Path(args.profile) if args.profile else None
+    exit_code = entry.render_audio(
+        package_root,
+        profile=profile,
+        validate_only=args.validate_only,
+    )
+    sys.exit(exit_code)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="GTTM + SB Symbolic Music Generator")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -502,6 +528,29 @@ def main() -> None:
         help="Treat the named symbolic track as percussion; repeatable.",
     )
     exp_parser.set_defaults(func=handle_export)
+
+    render_parser = subparsers.add_parser(
+        "render-audio",
+        help="Validate or render audio from a RenderPackage directory",
+    )
+    render_parser.add_argument(
+        "package",
+        type=str,
+        help="Path to run_<hash>/ RenderPackage directory",
+    )
+    render_parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Audio config YAML (default: config/audio.default.yaml)",
+    )
+    render_parser.add_argument(
+        "--validate-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Validate RenderPackage only (default). Use --no-validate-only to attempt full render.",
+    )
+    render_parser.set_defaults(func=handle_render_audio)
 
     args = parser.parse_args()
     args.func(args)

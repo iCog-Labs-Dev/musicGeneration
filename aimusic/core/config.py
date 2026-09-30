@@ -317,6 +317,12 @@ class DecodeConfig:
     max_lead_leap_steps: int = 7
     tension_velocity_range: ValueRange = (0.55, 1.0)
     tension_expression_range: ValueRange = (0.0, 1.0)
+    # REQ-11: per-beat activation policy. True (default) reproduces the
+    # original beat-index-hash activation exactly -- a fixed, RNG-independent
+    # policy. False draws a genuine random unit from the per-beat RNG key
+    # instead, so a probabilistic activation policy can be swapped in without
+    # touching gen_bass/gen_comping/gen_lead/gen_drums.
+    deterministic_activation: bool = True
 
     def __post_init__(self) -> None:
         _require_int("subbeats_per_beat", self.subbeats_per_beat, minimum=1)
@@ -349,6 +355,8 @@ class DecodeConfig:
             "tension_expression_range",
             _coerce_unit_range("tension_expression_range", self.tension_expression_range),
         )
+        if not isinstance(self.deterministic_activation, bool):
+            raise TypeError("deterministic_activation must be a bool.")
 
 
 @dataclass(frozen=True)

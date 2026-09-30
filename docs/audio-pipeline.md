@@ -1,6 +1,7 @@
 # MIDI → Audio Pipeline Architecture
 
-**Status:** M0 landed (RenderPackage contract); audio DSP stages follow the roadmap.  
+**Status:** M0 landed (RenderPackage contract); M1 PR2 adds native entry spine
+(`from_score`, validate-only `render-audio` CLI). Full DSP stages follow the roadmap.  
 **Canonical design:** sibling repo `midi2audio_generative/AUDIO_PIPELINE_ARCHITECTURE.pdf`
 (*From BeatState to Master*, v0.1). This document is the in-repo product digest.
 
@@ -58,6 +59,12 @@ tests/test_render_package.py
 3. Importing `aimusic.core` must not pull `torch`, `librosa`, `madmom`, or `demucs`.
 
 See [test_architecture.py](../tests/test_architecture.py) and [DECISIONS.md](../DECISIONS.md).
+
+## Backend selection (M1 PR2+)
+
+Native `aimusic.audio` is the default product path. During the m2a port, an optional
+bridge may be selected with ``AIMUSIC_AUDIO_BACKEND=m2a`` (install ``.[audio-bridge]``).
+Default is ``native``. PR2 wires validate-only CLI; runtime bridge delegation lands in PR3.
 
 ## Determinism, caching, provenance
 
