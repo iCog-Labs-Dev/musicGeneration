@@ -268,7 +268,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
             }
         ),
         structural_stats=structural_stats,
-        sb_stats=SBDiagnostics.from_solution(plan_result.sb_solution),
+        sb_stats=SBDiagnostics.from_plan(plan_result),
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

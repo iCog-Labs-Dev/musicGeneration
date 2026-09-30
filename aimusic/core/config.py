@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
 from typing import Optional, Sequence, Tuple
@@ -270,9 +270,12 @@ class SBConfig:
     log_underflow_floor: float = -745.0
     raise_on_non_convergence: bool = False
     backend_selection: SBBackend = SBBackend.NUMPY
+    max_horizon_per_solve: Optional[int] = None
 
     def __post_init__(self) -> None:
         _require_int("horizon_t", self.horizon_t, minimum=1)
+        if self.max_horizon_per_solve is not None:
+            _require_int("max_horizon_per_solve", self.max_horizon_per_solve, minimum=1)
         _require_int("max_iterations", self.max_iterations, minimum=1)
         _require_real("tolerance", self.tolerance, minimum=0.0)
         if self.tolerance == 0.0:
@@ -349,6 +352,31 @@ class DecodeConfig:
 
 
 @dataclass(frozen=True)
+class StitchingConfig:
+    """Normalized boundary-transition distances, weighted in log-score units.
+
+    max_cost is an acceptance limit on each transition entering/leaving a
+    shared endpoint. Costs below that limit remain soft preferences.
+    """
+
+    key_weight: float = 1.0
+    chord_weight: float = 1.0
+    meter_weight: float = 1.0
+    groove_weight: float = 1.0
+    role_weight: float = 1.0
+    head_weight: float = 1.0
+    boundary_weight: float = 1.0
+    max_cost: float = 7.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "key_weight", "chord_weight", "meter_weight", "groove_weight",
+            "role_weight", "head_weight", "boundary_weight", "max_cost",
+        ):
+            _require_real(name, getattr(self, name), minimum=0.0)
+
+
+@dataclass(frozen=True)
 class PlanConfig:
     """High-level generation-plan controls."""
 
@@ -360,10 +388,13 @@ class PlanConfig:
     start_anchor_weight: float = 1.0
     end_anchor_weight: float = 1.0
     section_names: Tuple[str, ...] = ()
+    stitching: StitchingConfig = field(default_factory=StitchingConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.method, PlanMethod):
             raise TypeError("method must be a PlanMethod value.")
+        if not isinstance(self.stitching, StitchingConfig):
+            raise TypeError("stitching must be a StitchingConfig value.")
         if not isinstance(self.sectioning_strategy, SectioningStrategy):
             raise TypeError("sectioning_strategy must be a SectioningStrategy value.")
         if self.loop_midpoint is not None:

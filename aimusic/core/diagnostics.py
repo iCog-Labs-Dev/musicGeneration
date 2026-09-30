@@ -3,7 +3,7 @@ import time
 import uuid
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from aimusic.scoring.tension import TENSION_MODEL_VERSION
 
@@ -45,6 +45,35 @@ class SBDiagnostics:
     layer_sizes: List[int] = field(default_factory=list)
     pruned_nodes: int = 0
     effective_entropy: float = 0.0
+    sections: List[Dict[str, Any]] = field(default_factory=list)
+    joins: List[Dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_solutions(cls, solutions: Sequence[Any]) -> "SBDiagnostics":
+        """Aggregate independent solves, counting shared boundary layers once."""
+        if not solutions:
+            raise ValueError("At least one solution is required.")
+        parts = [cls.from_solution(solution) for solution in solutions]
+        layers = parts[0].layer_sizes + [size for part in parts[1:] for size in part.layer_sizes[1:]]
+        # Shared anchors have zero entropy, so removing duplicates changes only the divisor.
+        return cls(
+            iterations_run=sum(part.iterations_run for part in parts),
+            converged=all(part.converged for part in parts),
+            final_max_delta=max(part.final_max_delta for part in parts),
+            layer_sizes=layers, pruned_nodes=sum(part.pruned_nodes for part in parts),
+            effective_entropy=sum(part.effective_entropy * len(part.layer_sizes) for part in parts) / len(layers),
+        )
+
+    @classmethod
+    def from_plan(cls, plan: Any) -> "SBDiagnostics":
+        result = cls.from_solutions(plan.solutions)
+        for section in getattr(plan, "section_results", ()):
+            item = cls.from_solution(section.sb_solution).to_dict()
+            item.update(dataclasses.asdict(section.section))
+            item["rng_stream_id"] = section.rng_stream_id
+            result.sections.append(item)
+        result.joins = [dataclasses.asdict(join) for join in getattr(plan, "joins", ())]
+        return result
 
     @classmethod
     def from_solution(cls, solution: Any) -> "SBDiagnostics":
