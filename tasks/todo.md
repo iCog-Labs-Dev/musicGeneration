@@ -1,11 +1,8 @@
-# Todo: M1 PR2 — Native audio entry spine
+# Todo: M1 PR3 — CI-safe spine + m2a bridge
 
-- [x] Create `feature/m1-audio-spine` from fork `main`
-- [x] Add `aimusic/audio/config.py` (YAML loader)
-- [x] Add `aimusic/audio/from_score.py` + `aimusic/audio/entry.py`
-- [x] Wire lazy `render-audio` CLI in `aimusic/app/cli.py`
-- [x] Declare `[audio-bridge]` in `pyproject.toml`
-- [x] Add `tests/test_audio_entry.py`; CI tests job uses `.[audio]`
-- [x] Update `docs/audio-next-steps.md`, `docs/audio-pipeline.md`
-- [x] Run lint/typecheck/tests locally
-- [x] Push branch + open PR → https://github.com/arsenylosev/musicGeneration/pull/3
+- [x] Create `feature/m1-simple-spine` from fork `main`
+- [x] Expand `[audio]` + pin `[audio-bridge]` to midi2audio_generative@46b3dfe
+- [x] Port groove, analysis, simple render, orchestrator, bridge
+- [x] Wire `render-audio --no-validate-only`; update tests + fixtures
+- [x] Update docs / DECISIONS / backlog
+- [x] Push branch + open PR → https://github.com/arsenylosev/musicGeneration/pull/4

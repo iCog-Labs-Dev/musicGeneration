@@ -25,18 +25,23 @@ clearml = [
   "clearml",
 ]
 audio = [
-  # M0 placeholder: YAML config loading for future aimusic.audio orchestrator.
-  # Heavy DSP (librosa/torch/demucs) is added in later milestones.
+  # M1 CI-safe deterministic spine (no fluidsynth / torch).
   "PyYAML",
+  "pydantic>=2.5",
+  "pretty_midi>=0.2.10",
+  "soundfile>=0.12.0",
+  "numpy",
 ]
 audio-bridge = [
   "aimusic[audio]",
-  # TODO PR3: pin git tag midi2audio-generative@v0.1.0 once URL confirmed
+  # Pin public main tip with M1–M3 spine; retag v0.1.0 later when local m2a commits push.
+  "midi2audio-generative @ git+https://github.com/arsenylosev/midi2audio_generative.git@46b3dfe",
 ]
 dev = [
   "pytest",
   "flake8",
   "mypy",
+  "hypothesis>=6.90.0",
 ]
 
 [tool.setuptools]

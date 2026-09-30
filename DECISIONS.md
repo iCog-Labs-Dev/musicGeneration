@@ -78,7 +78,22 @@ and [docs/audio-pipeline.md](docs/audio-pipeline.md).
 ### Fork-first contribution path
 
 - **Decision:** Integration PRs land on `arsenylosev/musicGeneration` (`main`)
-  first. Opening a PR to `iCog-Labs-Dev/musicGeneration` is a separate,
-  explicit human step after fork CI is green. Do not add iCog as a git
-  `upstream` remote for this workstream unless asked.
-- **Rationale:** Keeps CI and review ownership on the fork during migration.
+  first; org PR to iCog is a separate human step after fork CI is green.
+- **Rationale:** Keeps reviewable PRs; agents must not open org PRs unasked.
+
+## 2026-09-30 — M1 PR3 CI-safe spine + m2a bridge
+
+### Simple render default in product CI
+
+- **Decision:** Native M1 spine uses `render.backend: simple` (additive numpy
+  synth). Fluidsynth is deferred to a later optional extra; registry falls back
+  to simple when `allow_simple_fallback` is true.
+- **Rationale:** Reviewable PRs must stay green without SoundFont / libfluidsynth.
+
+### Bridge pin
+
+- **Decision:** `[audio-bridge]` pins
+  `git+https://github.com/arsenylosev/midi2audio_generative.git@46b3dfe`
+  (public `main` tip with M1–M3). Retag `v0.1.0` after pushing newer local m2a
+  commits is a later chore, not a blocker.
+- **Rationale:** No tags existed on the public repo; SHA pins are reproducible.

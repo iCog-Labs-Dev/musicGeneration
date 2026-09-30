@@ -3,5 +3,9 @@ mypy
 numpy
 mido
 PyYAML
+pydantic>=2.5
+pretty_midi>=0.2.10
+soundfile>=0.12.0
 gradio
 pytest
+hypothesis>=6.90.0
