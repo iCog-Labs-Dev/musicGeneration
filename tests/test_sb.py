@@ -8,10 +8,10 @@ from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
 from aimusic.planning.graph import GraphDiagnostics, LayerBuildDiagnostics, SparseGraph
 from aimusic.core.rng import RNGKey
 from aimusic.planning.sb import (
+    SBBackendError,
     SBContractError,
     SBSolverError,
     _IndexedEdgeBucket,
-    _NumpySBBackend,
     _require_non_empty_log_support,
     build_sb_problem,
     map_bridge_path,
@@ -20,6 +20,7 @@ from aimusic.planning.sb import (
     solved_bridge_from_solution,
     uniform_bridge_from_graph,
 )
+from aimusic.planning.sb_backend import DenseReferenceBackend, NumpySBBackend
 
 
 def _state(beat: int, groove: int = 0) -> BeatState:
@@ -402,7 +403,7 @@ class TestSBProblemContract(unittest.TestCase):
 class TestSparseBackendHelpers(unittest.TestCase):
     def test_logsumexp_underflow_guard_checks_relative_shift(self):
         with self.assertRaises(SBSolverError):
-            _NumpySBBackend.logsumexp(
+            NumpySBBackend().logsumexp(
                 np.asarray((0.0, -200.0), dtype=float),
                 underflow_floor=-100.0,
                 context="unit_test_relative_shift",
@@ -421,12 +422,21 @@ class TestSparseBackendHelpers(unittest.TestCase):
             (math.log(0.2), math.log(0.8), math.log(0.3)),
             dtype=float,
         )
+        kwargs = dict(
+            log_weights=np.asarray(bucket.log_kernel_weights, dtype=float),
+            gather_from=np.asarray(bucket.target_indices, dtype=np.int64),
+            messages=next_values,
+            scatter_to=np.asarray(bucket.source_indices, dtype=np.int64),
+            out_size=bucket.source_size,
+        )
 
-        reduced = _NumpySBBackend.reduce_by_source(bucket, next_values)
+        reduced = NumpySBBackend().scatter_logsumexp(**kwargs)
+        dense = DenseReferenceBackend().scatter_logsumexp(**kwargs)
 
         expected_0 = math.log(0.5 * 0.2 + 0.25 * 0.8)
         expected_1 = math.log(0.9 * 0.3)
         self.assertTrue(np.allclose(reduced, np.asarray((expected_0, expected_1))))
+        self.assertTrue(np.allclose(reduced, dense))
 
     def test_reduce_by_target_matches_dense_reference(self):
         bucket = _IndexedEdgeBucket(
@@ -446,12 +456,21 @@ class TestSparseBackendHelpers(unittest.TestCase):
             (math.log(0.5), math.log(0.4), math.log(0.9)),
             dtype=float,
         )
+        kwargs = dict(
+            log_weights=np.asarray(bucket.log_kernel_weights, dtype=float),
+            gather_from=np.asarray(bucket.source_indices, dtype=np.int64),
+            messages=prev_values,
+            scatter_to=np.asarray(bucket.target_indices, dtype=np.int64),
+            out_size=bucket.target_size,
+        )
 
-        reduced = _NumpySBBackend.reduce_by_target(bucket, prev_values)
+        reduced = NumpySBBackend().scatter_logsumexp(**kwargs)
+        dense = DenseReferenceBackend().scatter_logsumexp(**kwargs)
 
         expected_0 = math.log(0.6 * 0.5 + 0.2 * 0.4 + 0.1 * 0.9)
         expected_1 = math.log(0.7 * 0.9)
         self.assertTrue(np.allclose(reduced, np.asarray((expected_0, expected_1))))
+        self.assertTrue(np.allclose(reduced, dense))
 
     def test_empty_support_guard_rejects_all_negative_inf(self):
         with self.assertRaises(SBSolverError):
@@ -564,7 +583,7 @@ class TestSBSolver(unittest.TestCase):
             sb_config=SBConfig(horizon_t=2, backend_selection=SBBackend.JAX),
         )
 
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(SBBackendError):
             solve_sb(problem)
 
     def test_solution_exposes_marginals_and_convergence_history(self):
