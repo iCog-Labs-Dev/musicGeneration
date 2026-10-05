@@ -61,6 +61,21 @@ class TestCliGenerateInspectExportWorkflow(unittest.TestCase):
         self.assertIn("structure", manifest_data)
         self.assertIn("sb_stats", manifest_data)
 
+    def test_section_wise_generate_exports_four_section_diagnostics(self) -> None:
+        result = _run_cli(
+            "generate", "--seed", "11", "--beats", "16",
+            "--sections", "intro", "theme", "bridge", "return",
+            "--max-horizon-per-solve", "4", "--out", str(self._tmp),
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        manifest = json.loads(next(self._tmp.glob("*_manifest.json")).read_text(encoding="utf-8"))
+        self.assertEqual([item["name"] for item in manifest["sb_stats"]["sections"]],
+                         ["intro", "theme", "bridge", "return"])
+        self.assertEqual(len(manifest["sb_stats"]["joins"]), 3)
+        self.assertEqual(len(manifest["sb_stats"]["layer_sizes"]), 17)
+        midi = mido.MidiFile(str(next(self._tmp.glob("*.mid"))))
+        self.assertTrue(any(message.type == "note_on" for track in midi.tracks for message in track))
+
     def test_inspect_reads_manifest_structure_key_and_prints_tension_arc(self) -> None:
         _, _, manifest_path = self._generate()
 
