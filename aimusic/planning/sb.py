@@ -9,10 +9,17 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
-from aimusic.core.config import SBBackend, SBConfig
+from aimusic.core.config import SBConfig
 from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
 from aimusic.planning.graph import SparseGraph
 from aimusic.core.rng import RNGKey, random_unit
+from aimusic.planning.sb_backend import (
+    SBBackendError,
+    SBNumericBackend,
+    SBSolverError,
+    invoke_backend,
+    select_sb_backend,
+)
 
 
 @dataclass(frozen=True)
@@ -193,9 +200,9 @@ class SBSolution:
         object.__setattr__(self, "log_forward_potentials", forward)
         object.__setattr__(self, "log_backward_potentials", backward)
 
-    def to_bridge(self) -> SolvedBridge:
+    def to_bridge(self, backend: SBNumericBackend | None = None) -> SolvedBridge:
         """Convert potentials into normalized sparse bridge transitions."""
-        return solved_bridge_from_solution(self)
+        return solved_bridge_from_solution(self, backend=backend)
 
 
 @dataclass(frozen=True)
@@ -254,89 +261,44 @@ class SBContractError(ValueError):
     """Raised when SB graph inputs violate the solver contract."""
 
 
-class SBSolverError(ValueError):
-    """Raised when SB solver iterations encounter invalid numeric conditions."""
+def _scatter_reduce_by_source(
+    backend: SBNumericBackend,
+    bucket: _IndexedEdgeBucket,
+    next_values: np.ndarray,
+    *,
+    underflow_floor: Optional[float] = None,
+) -> np.ndarray:
+    return invoke_backend(
+        backend,
+        "scatter_logsumexp",
+        log_weights=np.asarray(bucket.log_kernel_weights, dtype=float),
+        gather_from=np.asarray(bucket.target_indices, dtype=np.int64),
+        messages=next_values,
+        scatter_to=np.asarray(bucket.source_indices, dtype=np.int64),
+        out_size=bucket.source_size,
+        underflow_floor=underflow_floor,
+        context=f"reduce_by_source[t={bucket.time_index}]",
+    )
 
 
-class _NumpySBBackend:
-    """Small sparse log-space backend used by the SB solver."""
-
-    @staticmethod
-    def logsumexp(
-        values: np.ndarray,
-        *,
-        underflow_floor: Optional[float] = None,
-        context: str = "logsumexp",
-    ) -> float:
-        if values.ndim != 1:
-            raise ValueError("logsumexp expects a 1D array.")
-        if values.size == 0:
-            return float("-inf")
-        finite_mask = np.isfinite(values)
-        if not np.any(finite_mask):
-            return float("-inf")
-        finite_values = values[finite_mask]
-        max_value = float(np.max(finite_values))
-        shifts = finite_values - max_value
-        if underflow_floor is not None:
-            min_shift = float(np.min(shifts))
-            if min_shift < underflow_floor:
-                raise SBSolverError(
-                    f"{context} encountered shift below underflow floor: "
-                    f"min_shift={min_shift:.6g}, floor={underflow_floor:.6g}."
-                )
-        shifted = np.exp(shifts)
-        return float(max_value + np.log(np.sum(shifted)))
-
-    @classmethod
-    def reduce_by_source(
-        cls,
-        bucket: _IndexedEdgeBucket,
-        next_values: np.ndarray,
-        *,
-        underflow_floor: Optional[float] = None,
-    ) -> np.ndarray:
-        result = np.full(bucket.source_size, float("-inf"), dtype=float)
-        edge_values = (
-            np.asarray(bucket.log_kernel_weights, dtype=float)
-            + next_values[np.asarray(bucket.target_indices, dtype=int)]
-        )
-        grouped: list[list[float]] = [[] for _ in range(bucket.source_size)]
-        for src_idx, edge_value in zip(bucket.source_indices, edge_values):
-            grouped[src_idx].append(float(edge_value))
-        for idx, group in enumerate(grouped):
-            if group:
-                result[idx] = cls.logsumexp(
-                    np.asarray(group, dtype=float),
-                    underflow_floor=underflow_floor,
-                    context=f"reduce_by_source[t={bucket.time_index},src={idx}]",
-                )
-        return result
-
-    @classmethod
-    def reduce_by_target(
-        cls,
-        bucket: _IndexedEdgeBucket,
-        prev_values: np.ndarray,
-        *,
-        underflow_floor: Optional[float] = None,
-    ) -> np.ndarray:
-        result = np.full(bucket.target_size, float("-inf"), dtype=float)
-        edge_values = (
-            np.asarray(bucket.log_kernel_weights, dtype=float)
-            + prev_values[np.asarray(bucket.source_indices, dtype=int)]
-        )
-        grouped: list[list[float]] = [[] for _ in range(bucket.target_size)]
-        for dst_idx, edge_value in zip(bucket.target_indices, edge_values):
-            grouped[dst_idx].append(float(edge_value))
-        for idx, group in enumerate(grouped):
-            if group:
-                result[idx] = cls.logsumexp(
-                    np.asarray(group, dtype=float),
-                    underflow_floor=underflow_floor,
-                    context=f"reduce_by_target[t={bucket.time_index},dst={idx}]",
-                )
-        return result
+def _scatter_reduce_by_target(
+    backend: SBNumericBackend,
+    bucket: _IndexedEdgeBucket,
+    prev_values: np.ndarray,
+    *,
+    underflow_floor: Optional[float] = None,
+) -> np.ndarray:
+    return invoke_backend(
+        backend,
+        "scatter_logsumexp",
+        log_weights=np.asarray(bucket.log_kernel_weights, dtype=float),
+        gather_from=np.asarray(bucket.source_indices, dtype=np.int64),
+        messages=prev_values,
+        scatter_to=np.asarray(bucket.target_indices, dtype=np.int64),
+        out_size=bucket.target_size,
+        underflow_floor=underflow_floor,
+        context=f"reduce_by_target[t={bucket.time_index}]",
+    )
 
 
 def _ensure_layer_times_are_contiguous(layers: Sequence[Layer]) -> None:
@@ -524,14 +486,6 @@ def _endpoint_probabilities_to_logs(
     )
 
 
-def _select_backend(sb_config: SBConfig) -> type[_NumpySBBackend]:
-    if sb_config.backend_selection is SBBackend.NUMPY:
-        return _NumpySBBackend
-    if sb_config.backend_selection is SBBackend.JAX:
-        raise NotImplementedError("SBBackend.JAX is not implemented yet.")
-    raise SBSolverError(f"Unsupported SB backend: {sb_config.backend_selection!r}")
-
-
 def _index_problem(problem: SBProblem) -> _IndexedSBProblem:
     layers = problem.graph.layers
     state_to_index = [
@@ -583,7 +537,7 @@ def _require_non_empty_log_support(name: str, values: np.ndarray) -> None:
 
 def _propagate_backward(
     indexed_problem: _IndexedSBProblem,
-    backend: type[_NumpySBBackend],
+    backend: SBNumericBackend,
     log_terminal_backward: np.ndarray,
     *,
     underflow_floor: float,
@@ -594,7 +548,8 @@ def _propagate_backward(
     _validate_log_array("log_terminal_backward", backward[-1])
     _require_non_empty_log_support("log_terminal_backward", backward[-1])
     for bucket in reversed(indexed_problem.indexed_buckets):
-        backward[bucket.time_index] = backend.reduce_by_source(
+        backward[bucket.time_index] = _scatter_reduce_by_source(
+            backend,
             bucket,
             backward[bucket.time_index + 1],
             underflow_floor=underflow_floor,
@@ -612,7 +567,7 @@ def _propagate_backward(
 
 def _propagate_forward(
     indexed_problem: _IndexedSBProblem,
-    backend: type[_NumpySBBackend],
+    backend: SBNumericBackend,
     log_initial_forward: np.ndarray,
     *,
     underflow_floor: float,
@@ -623,7 +578,8 @@ def _propagate_forward(
     _validate_log_array("log_initial_forward", forward[0])
     _require_non_empty_log_support("log_initial_forward", forward[0])
     for bucket in indexed_problem.indexed_buckets:
-        forward[bucket.time_index + 1] = backend.reduce_by_target(
+        forward[bucket.time_index + 1] = _scatter_reduce_by_target(
+            backend,
             bucket,
             forward[bucket.time_index],
             underflow_floor=underflow_floor,
@@ -686,9 +642,16 @@ def _tuplify_layers(values: Sequence[np.ndarray]) -> Tuple[Tuple[float, ...], ..
     return tuple(tuple(float(item) for item in layer) for layer in values)
 
 
-def _normalize_log_probs(log_values: np.ndarray) -> np.ndarray:
-    normalizer = _NumpySBBackend.logsumexp(log_values, context="normalize_log_probs")
-    return log_values - normalizer
+def _normalize_log_probs(
+    log_values: np.ndarray,
+    backend: SBNumericBackend,
+) -> np.ndarray:
+    return invoke_backend(
+        backend,
+        "normalize_log_probs",
+        log_values=log_values,
+        context="normalize_log_probs",
+    )
 
 
 def _validate_conditioned_edge_probabilities(
@@ -729,6 +692,7 @@ def _validate_conditioned_edge_probabilities(
 
 def _compute_bridge_marginals_and_conditionals(
     solution: SBSolution,
+    backend: SBNumericBackend,
 ) -> tuple[tuple[tuple[float, ...], ...], BridgeMarginals]:
     graph = solution.problem.graph
     temperature = solution.problem.sb_config.temperature
@@ -743,7 +707,7 @@ def _compute_bridge_marginals_and_conditionals(
         log_mass = np.asarray(forward[layer_idx], dtype=float) + np.asarray(
             backward[layer_idx], dtype=float
         )
-        normalized = _normalize_log_probs(log_mass)
+        normalized = _normalize_log_probs(log_mass, backend)
         probs = tuple(float(np.exp(value)) for value in normalized)
         _require_probs(f"node_marginals_by_layer[{layer_idx}]", probs)
         node_marginals_by_layer.append(probs)
@@ -792,11 +756,35 @@ def _compute_bridge_marginals_and_conditionals(
     return tuple(edge_conditionals_by_time), marginals
 
 
-def solved_bridge_from_solution(solution: SBSolution) -> SolvedBridge:
+def _resolve_backend(
+    problem: SBProblem,
+    backend: SBNumericBackend | None,
+) -> SBNumericBackend:
+    resolved = (
+        backend
+        if backend is not None
+        else select_sb_backend(problem.sb_config.backend_selection)
+    )
+    if not isinstance(resolved, SBNumericBackend):
+        raise SBBackendError(
+            f"SB backend {type(resolved).__name__!r} does not implement SBNumericBackend."
+        )
+    return resolved
+
+
+def solved_bridge_from_solution(
+    solution: SBSolution,
+    *,
+    backend: SBNumericBackend | None = None,
+) -> SolvedBridge:
     """Build a normalized sparse bridge object from a solved SB solution."""
     if not isinstance(solution, SBSolution):
         raise TypeError("solution must be an SBSolution.")
-    edge_probabilities_by_time, marginals = _compute_bridge_marginals_and_conditionals(solution)
+    resolved = _resolve_backend(solution.problem, backend)
+    edge_probabilities_by_time, marginals = _compute_bridge_marginals_and_conditionals(
+        solution,
+        resolved,
+    )
     return SolvedBridge(
         graph=solution.problem.graph,
         edge_probabilities_by_time=edge_probabilities_by_time,
@@ -947,13 +935,21 @@ def build_sb_problem(
     )
 
 
-def solve_sb(problem: SBProblem) -> SBSolution:
-    """Solve SB forward/backward endpoint scaling updates in log-space."""
+def solve_sb(
+    problem: SBProblem,
+    *,
+    backend: SBNumericBackend | None = None,
+) -> SBSolution:
+    """Solve SB forward/backward endpoint scaling updates in log-space.
+
+    Backend selection is resolved before the scaling loop. Pass ``backend`` to
+    inject a test double or dense oracle without changing orchestration.
+    """
 
     if not isinstance(problem, SBProblem):
         raise TypeError("problem must be an SBProblem.")
 
-    backend = _select_backend(problem.sb_config)
+    resolved_backend = _resolve_backend(problem, backend)
     indexed_problem = _index_problem(problem)
     log_terminal_backward = np.zeros(problem.diagnostics.piT_support_size, dtype=float)
     final_max_delta = float("inf")
@@ -964,7 +960,7 @@ def solve_sb(problem: SBProblem) -> SBSolution:
     for iteration in range(1, problem.sb_config.max_iterations + 1):
         backward = _propagate_backward(
             indexed_problem,
-            backend,
+            resolved_backend,
             log_terminal_backward,
             underflow_floor=problem.sb_config.log_underflow_floor,
         )
@@ -976,7 +972,7 @@ def solve_sb(problem: SBProblem) -> SBSolution:
         )
         forward = _propagate_forward(
             indexed_problem,
-            backend,
+            resolved_backend,
             log_initial_forward,
             underflow_floor=problem.sb_config.log_underflow_floor,
         )
@@ -1010,7 +1006,7 @@ def solve_sb(problem: SBProblem) -> SBSolution:
 
     backward = _propagate_backward(
         indexed_problem,
-        backend,
+        resolved_backend,
         log_terminal_backward,
         underflow_floor=problem.sb_config.log_underflow_floor,
     )
@@ -1022,7 +1018,7 @@ def solve_sb(problem: SBProblem) -> SBSolution:
     )
     forward = _propagate_forward(
         indexed_problem,
-        backend,
+        resolved_backend,
         log_initial_forward,
         underflow_floor=problem.sb_config.log_underflow_floor,
     )
@@ -1039,7 +1035,7 @@ def solve_sb(problem: SBProblem) -> SBSolution:
         log_backward_potentials=_tuplify_layers(backward),
         trace=trace,
     )
-    _, marginals = _compute_bridge_marginals_and_conditionals(solution)
+    _, marginals = _compute_bridge_marginals_and_conditionals(solution, resolved_backend)
     return SBSolution(
         problem=solution.problem,
         log_forward_potentials=solution.log_forward_potentials,
