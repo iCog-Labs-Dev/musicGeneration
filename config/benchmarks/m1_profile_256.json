@@ -1,0 +1,15 @@
+{
+  "schema_version": "mus28-config/1",
+  "name": "m1_profile_256",
+  "config_version": "1.0.0",
+  "description": "Single-seed scaling probe at 256 beats (full and no_prior) to validate the linear-extrapolation estimate before attempting 512/1,024 beats. Not a benchmark result.",
+  "horizons": [256],
+  "seeds": [0],
+  "edos": [12],
+  "path_modes": ["sample"],
+  "conditions": ["full", "no_prior"],
+  "graph_grid": [{"k_max": 64, "d_max": 8, "proposal_budget": 256}],
+  "prior_guided_proposals": false,
+  "sb": {"max_iterations": 200, "tolerance": 1e-6, "temperature": 1.0},
+  "timeout_s": 3600
+}
