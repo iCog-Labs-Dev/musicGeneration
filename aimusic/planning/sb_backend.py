@@ -9,6 +9,7 @@ See ``docs/sb-backend.md`` for padded-array semantics and parity requirements.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
@@ -88,13 +89,108 @@ class SBNumericBackend(Protocol):
         ...
 
 
+# Result validators — keep the public error boundary stable.
+
+def _validate_logsumexp_result(
+    result: Any, *, context: str = "logsumexp", **kwargs: Any
+) -> float:
+    if isinstance(result, (bool, np.bool_)):
+        raise SBBackendError(f"{context}: logsumexp returned a bool.")
+    if not isinstance(result, (int, float, np.floating)):
+        raise SBBackendError(
+            f"{context}: logsumexp returned {type(result).__name__}, expected float."
+        )
+    value = float(result)
+    if math.isnan(value) or value == float("inf"):
+        raise SBSolverError(f"{context}: logsumexp returned invalid value {value!r}.")
+    return value
+
+
+def _validate_scatter_result(
+    result: Any,
+    *,
+    out_size: Optional[int] = None,
+    context: str = "scatter_logsumexp",
+    **kwargs: Any,
+) -> np.ndarray:
+    if not isinstance(result, np.ndarray):
+        raise SBBackendError(
+            f"{context}: scatter_logsumexp returned {type(result).__name__}, "
+            "expected np.ndarray."
+        )
+    if result.ndim != 1:
+        raise SBBackendError(
+            f"{context}: scatter_logsumexp returned ndim {result.ndim}, expected 1."
+        )
+    if out_size is not None and result.shape[0] != out_size:
+        raise SBBackendError(
+            f"{context}: scatter_logsumexp returned shape {result.shape}, "
+            f"expected ({out_size},)."
+        )
+    if result.dtype != _LOG_DTYPE:
+        raise SBBackendError(
+            f"{context}: scatter_logsumexp returned dtype {result.dtype}, "
+            "expected float64."
+        )
+    if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
+        raise SBSolverError(f"{context}: scatter_logsumexp returned NaN or +inf.")
+    return result
+
+
+def _validate_normalize_result(
+    result: Any,
+    *,
+    log_values: Optional[np.ndarray] = None,
+    mask: Optional[np.ndarray] = None,
+    context: str = "normalize_log_probs",
+    **kwargs: Any,
+) -> np.ndarray:
+    if not isinstance(result, np.ndarray):
+        raise SBBackendError(
+            f"{context}: normalize_log_probs returned {type(result).__name__}, "
+            "expected np.ndarray."
+        )
+    if log_values is not None:
+        expected_len = np.asarray(log_values).shape[0]
+        if result.ndim != 1 or result.shape[0] != expected_len:
+            raise SBBackendError(
+                f"{context}: normalize_log_probs returned shape {result.shape}, "
+                f"expected ({expected_len},)."
+            )
+    elif result.ndim != 1:
+        raise SBBackendError(
+            f"{context}: normalize_log_probs returned ndim {result.ndim}, expected 1."
+        )
+    if result.dtype != _LOG_DTYPE:
+        raise SBBackendError(
+            f"{context}: normalize_log_probs returned dtype {result.dtype}, "
+            "expected float64."
+        )
+    if np.any(np.isnan(result)) or np.any(np.isposinf(result)):
+        raise SBSolverError(f"{context}: normalize_log_probs returned NaN or +inf.")
+    if mask is not None:
+        mask_arr = np.asarray(mask, dtype=_MASK_DTYPE)
+        if np.any(np.isfinite(result[~mask_arr])):
+            raise SBBackendError(
+                f"{context}: normalize_log_probs left finite values at masked positions."
+            )
+    return result
+
+
+_RESULT_VALIDATORS = {
+    "logsumexp": _validate_logsumexp_result,
+    "scatter_logsumexp": _validate_scatter_result,
+    "normalize_log_probs": _validate_normalize_result,
+}
+
+
 def invoke_backend(
     backend: SBNumericBackend,
     operation: str,
     /,
     **kwargs: Any,
 ) -> Any:
-    """Call a backend op and translate unexpected failures into ``SBBackendError``."""
+    """Call a backend op and translate failures / malformed results into stable errors."""
 
     try:
         method = getattr(backend, operation)
@@ -103,7 +199,7 @@ def invoke_backend(
             f"SB backend {type(backend).__name__!r} does not implement {operation}."
         ) from exc
     try:
-        return method(**kwargs)
+        result = method(**kwargs)
     except (SBSolverError, SBBackendError):
         raise
     except NotImplementedError as exc:
@@ -114,6 +210,11 @@ def invoke_backend(
         raise SBBackendError(
             f"SB backend operation {operation} failed: {exc}"
         ) from exc
+
+    validator = _RESULT_VALIDATORS.get(operation)
+    if validator is not None:
+        result = validator(result, **kwargs)
+    return result
 
 
 def select_sb_backend(selection: SBBackend) -> SBNumericBackend:
@@ -135,11 +236,15 @@ def _as_log_array(name: str, values: np.ndarray) -> np.ndarray:
     array = np.asarray(values, dtype=_LOG_DTYPE)
     _require_1d(name, array)
     if np.any(np.isnan(array)) or np.any(np.isposinf(array)):
-        raise SBSolverError(f"{name} contains NaN or +inf; only finite values and -inf are allowed.")
+        raise SBSolverError(
+            f"{name} contains NaN or +inf; only finite values and -inf are allowed."
+        )
     return array
 
 
-def _as_index_array(name: str, values: np.ndarray, *, length: int, upper: int) -> np.ndarray:
+def _as_index_array(
+    name: str, values: np.ndarray, *, length: int, upper: int
+) -> np.ndarray:
     array = np.asarray(values, dtype=_INDEX_DTYPE)
     _require_1d(name, array)
     if array.size != length:
@@ -166,7 +271,9 @@ def _as_edge_indices(
     return _as_index_array(name, values, length=edge_count, upper=dim_size)
 
 
-def _as_mask(name: str, mask: Optional[np.ndarray], *, length: int) -> Optional[np.ndarray]:
+def _as_mask(
+    name: str, mask: Optional[np.ndarray], *, length: int
+) -> Optional[np.ndarray]:
     if mask is None:
         return None
     array = np.asarray(mask, dtype=_MASK_DTYPE)
@@ -203,7 +310,41 @@ def logsumexp_1d(
     return float(max_value + np.log(np.sum(np.exp(shifts))))
 
 
-def _apply_mask_as_neg_inf(values: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+def _python_logsumexp(
+    values: np.ndarray,
+    *,
+    underflow_floor: Optional[float] = None,
+    context: str = "logsumexp",
+) -> float:
+    """Independent pure-Python log-sum-exp used by ``DenseReferenceBackend``.
+
+    Deliberately does *not* call ``logsumexp_1d`` so that a bug in the NumPy
+    helper cannot silently pass backend parity.
+    """
+
+    arr = np.asarray(values, dtype=_LOG_DTYPE)
+    finite_mask = np.isfinite(arr)
+    if not np.any(finite_mask):
+        return float("-inf")
+    finite_vals = arr[finite_mask]
+    m = float(np.max(finite_vals))
+    shifts = finite_vals - m
+    if underflow_floor is not None:
+        min_shift = float(np.min(shifts))
+        if min_shift < underflow_floor:
+            raise SBSolverError(
+                f"{context} encountered shift below underflow floor: "
+                f"min_shift={min_shift:.6g}, floor={underflow_floor:.6g}."
+            )
+    acc = 0.0
+    for s in shifts:
+        acc += math.exp(float(s))
+    return float(m + math.log(acc))
+
+
+def _apply_mask_as_neg_inf(
+    values: np.ndarray, mask: Optional[np.ndarray]
+) -> np.ndarray:
     if mask is None:
         return values
     masked = values.copy()
@@ -275,21 +416,28 @@ class NumpySBBackend:
         context: str = "scatter_logsumexp",
     ) -> np.ndarray:
         weights, msgs, gather, scatter, mask = _prepare_scatter_args(
-            log_weights,
-            gather_from,
-            messages,
-            scatter_to,
-            out_size,
-            edge_mask,
+            log_weights, gather_from, messages, scatter_to, out_size, edge_mask
         )
 
-        edge_values = weights + msgs[gather]
-        result = np.full(out_size, float("-inf"), dtype=_LOG_DTYPE)
-        grouped: list[list[float]] = [[] for _ in range(out_size)]
-        for idx, (scatter_idx, edge_value) in enumerate(zip(scatter, edge_values)):
+        # Phase 1: merge duplicate (scatter_to, gather_from) cells with logaddexp.
+        merged: dict[tuple[int, int], float] = {}
+        for idx in range(weights.size):
             if mask is not None and not bool(mask[idx]):
                 continue
-            grouped[int(scatter_idx)].append(float(edge_value))
+            key = (int(scatter[idx]), int(gather[idx]))
+            w = float(weights[idx])
+            if key in merged:
+                merged[key] = float(np.logaddexp(merged[key], w))
+            else:
+                merged[key] = w
+
+        # Phase 2: add gathered messages (constant per cell) and group by scatter_to.
+        grouped: list[list[float]] = [[] for _ in range(out_size)]
+        for (scatter_idx, gather_idx), w in merged.items():
+            grouped[scatter_idx].append(w + float(msgs[gather_idx]))
+
+        # Phase 3: per-group log-sum-exp with the underflow floor on merged cells.
+        result = np.full(out_size, float("-inf"), dtype=_LOG_DTYPE)
         for group_idx, group in enumerate(grouped):
             if group:
                 result[group_idx] = logsumexp_1d(
@@ -329,7 +477,10 @@ class DenseReferenceBackend:
     """Dense log-kernel oracle for tiny graphs.
 
     Each scatter builds a dense ``(out_size, message_size)`` log-matrix, merging
-    duplicate edges with ``logaddexp``, then reduces with row-wise log-sum-exp.
+    duplicate edges with ``logaddexp``, then reduces with an *independent*
+    pure-Python log-sum-exp (``_python_logsumexp``). Normalization is also
+    implemented directly rather than delegating to ``NumpySBBackend``.
+
     Intended only as a correctness reference for small randomized graphs.
     """
 
@@ -341,11 +492,12 @@ class DenseReferenceBackend:
         underflow_floor: Optional[float] = None,
         context: str = "logsumexp",
     ) -> float:
-        return NumpySBBackend().logsumexp(
-            values,
-            mask=mask,
-            underflow_floor=underflow_floor,
-            context=context,
+        arr = _as_log_array("values", values)
+        log_mask = _as_mask("mask", mask, length=arr.size)
+        if log_mask is not None:
+            arr = _apply_mask_as_neg_inf(arr, log_mask)
+        return _python_logsumexp(
+            arr, underflow_floor=underflow_floor, context=context
         )
 
     def scatter_logsumexp(
@@ -361,12 +513,7 @@ class DenseReferenceBackend:
         context: str = "scatter_logsumexp",
     ) -> np.ndarray:
         weights, msgs, gather, scatter, mask = _prepare_scatter_args(
-            log_weights,
-            gather_from,
-            messages,
-            scatter_to,
-            out_size,
-            edge_mask,
+            log_weights, gather_from, messages, scatter_to, out_size, edge_mask
         )
 
         log_kernel = np.full((out_size, msgs.size), float("-inf"), dtype=_LOG_DTYPE)
@@ -380,7 +527,7 @@ class DenseReferenceBackend:
         combined = log_kernel + msgs[np.newaxis, :]
         result = np.full(out_size, float("-inf"), dtype=_LOG_DTYPE)
         for row_idx, row in enumerate(combined):
-            result[row_idx] = logsumexp_1d(
+            result[row_idx] = _python_logsumexp(
                 row,
                 underflow_floor=underflow_floor,
                 context=f"{context}[row={row_idx}]",
@@ -395,12 +542,31 @@ class DenseReferenceBackend:
         underflow_floor: Optional[float] = None,
         context: str = "normalize_log_probs",
     ) -> np.ndarray:
-        return NumpySBBackend().normalize_log_probs(
-            log_values,
-            mask=mask,
-            underflow_floor=underflow_floor,
-            context=context,
-        )
+        values = _as_log_array("log_values", log_values)
+        log_mask = _as_mask("mask", mask, length=values.size)
+        working = _apply_mask_as_neg_inf(values, log_mask)
+        finite_mask = np.isfinite(working)
+        if not np.any(finite_mask):
+            raise SBSolverError(f"{context} has empty finite support.")
+        finite_vals = working[finite_mask]
+        m = float(np.max(finite_vals))
+        shifts = finite_vals - m
+        if underflow_floor is not None:
+            min_shift = float(np.min(shifts))
+            if min_shift < underflow_floor:
+                raise SBSolverError(
+                    f"{context} encountered shift below underflow floor: "
+                    f"min_shift={min_shift:.6g}, floor={underflow_floor:.6g}."
+                )
+        acc = 0.0
+        for s in shifts:
+            acc += math.exp(float(s))
+        normalizer = m + math.log(acc)
+        normalized = working - normalizer
+        if log_mask is not None:
+            normalized = normalized.copy()
+            normalized[~log_mask] = float("-inf")
+        return normalized
 
 
 class JaxSBBackend:
