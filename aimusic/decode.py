@@ -337,13 +337,8 @@ def _nearest_pitch(
     edo: int,
 ) -> int:
     pcs = tuple(pitch_classes)
-    candidates = []
-    for pitch_pc in pcs:
-        base = _fit_pitch_to_register(pitch_pc, register, edo)
-        for octave_shift in (-edo, 0, edo):
-            pitch = base + octave_shift
-            if register[0] <= pitch <= register[1]:
-                candidates.append(pitch)
+    candidates = [pitch for pitch in range(register[0], register[1] + 1)
+                  if pitch % edo in pcs]
     if not candidates:
         return _fit_pitch_to_register(pcs[0], register, edo)
     if prev_pitch is None:
@@ -389,6 +384,7 @@ def _clamp_leap(
     *,
     edo: int,
     register: tuple[int, int],
+    fallback_pitch_classes: Iterable[int] = (),
 ) -> int:
     if prev_pitch is None:
         return next_pitch
@@ -402,8 +398,16 @@ def _clamp_leap(
     )
     if compatible:
         return min(compatible, key=lambda pitch: (abs(pitch - prev_pitch), pitch))
-    # Never invent a different pitch class merely to satisfy the soft leap cap.
-    return next_pitch
+    # If the requested head cannot fit, prefer a nearby chord tone. Repeating
+    # the previous note is the last resort; never jump outside the configured cap.
+    fallback_pcs = tuple(fallback_pitch_classes)
+    alternatives = tuple(
+        pitch for pitch in range(register[0], register[1] + 1)
+        if pitch % edo in fallback_pcs and abs(pitch - prev_pitch) <= max_leap
+    )
+    if alternatives:
+        return min(alternatives, key=lambda pitch: (abs(pitch - prev_pitch), abs(pitch - next_pitch), pitch))
+    return prev_pitch
 
 
 def _append_event(
@@ -656,13 +660,17 @@ def gen_lead(
 
     prev_pitch = decoder_state.prev_pitch
     head_pc = _head_pitch_class(state, vocabularies, edo)
-    pitch = _nearest_pitch(prev_pitch, (head_pc,), decode_config.lead_register, edo)
+    # Start near the register center so descending motion has room as well.
+    anchor = prev_pitch if prev_pitch is not None else sum(decode_config.lead_register) // 2
+    pitch = _nearest_pitch(anchor, (head_pc,), decode_config.lead_register, edo)
+    chord = _chord_token(state, vocabularies)
     pitch = _clamp_leap(
         prev_pitch,
         pitch,
         decode_config.max_lead_leap_steps,
         edo=edo,
         register=decode_config.lead_register,
+        fallback_pitch_classes=chord_pitch_classes(chord.root_pc, chord.quality, edo),
     )
     ton = window.beat_index * ticks_per_beat
     duration = ticks_per_beat if state.boundary_lvl > 0 else ticks_per_beat // 2

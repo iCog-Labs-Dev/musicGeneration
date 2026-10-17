@@ -438,6 +438,8 @@ def _validate_horizon_matches_graph(
     layers: Sequence[Layer],
 ) -> None:
     expected_horizon = len(layers) - 1
+    if sb_config.max_horizon_per_solve is not None and expected_horizon > sb_config.max_horizon_per_solve:
+        raise SBContractError("Graph exceeds max_horizon_per_solve.")
     if sb_config.horizon_t != expected_horizon:
         raise SBContractError(
             "SBConfig horizon_t must match the sparse graph horizon "
