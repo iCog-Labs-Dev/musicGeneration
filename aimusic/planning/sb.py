@@ -81,10 +81,12 @@ class BridgeMarginals:
         edge_layers = tuple(
             tuple(float(value) for value in layer) for layer in self.edge_marginals_by_time
         )
+        # Each layer's node marginal and each time step's total edge marginal is a
+        # probability distribution (sums to 1).
         for layer in node_layers:
-            _require_probs("node_marginals_by_layer", layer)
+            _require_probs("node_marginals_by_layer", layer, require_normalized=True)
         for layer in edge_layers:
-            _require_probs("edge_marginals_by_time", layer)
+            _require_probs("edge_marginals_by_time", layer, require_normalized=True)
         object.__setattr__(self, "node_marginals_by_layer", node_layers)
         object.__setattr__(self, "edge_marginals_by_time", edge_layers)
 
@@ -106,6 +108,22 @@ class SolvedBridge:
     def __post_init__(self) -> None:
         if not isinstance(self.graph, SparseGraph):
             raise TypeError("graph must be a SparseGraph.")
+        # Shape checks first: everything below indexes marginals by layer / time.
+        if self.initial_distribution is not None and self.initial_distribution.layer != self.graph.layers[0]:
+            raise ValueError("initial_distribution.layer must match graph.layers[0].")
+        if self.marginals is not None:
+            if len(self.marginals.node_marginals_by_layer) != len(self.graph.layers):
+                raise ValueError("marginals.node_marginals_by_layer must align with graph.layers.")
+            if len(self.marginals.edge_marginals_by_time) != len(self.graph.edges_by_time):
+                raise ValueError(
+                    "marginals.edge_marginals_by_time must align with graph.edges_by_time."
+                )
+            for layer, probs in zip(self.graph.layers, self.marginals.node_marginals_by_layer):
+                if len(layer.states) != len(probs):
+                    raise ValueError("Node marginals must align with layer support sizes.")
+            for edges, probs in zip(self.graph.edges_by_time, self.marginals.edge_marginals_by_time):
+                if len(edges) != len(probs):
+                    raise ValueError("Edge marginals must align with sparse edge counts.")
         edge_probs = tuple(tuple(float(p) for p in group) for group in self.edge_probabilities_by_time)
         if len(edge_probs) != len(self.graph.edges_by_time):
             raise ValueError("edge_probabilities_by_time must align with graph.edges_by_time.")
@@ -127,22 +145,6 @@ class SolvedBridge:
                 ),
             )
         object.__setattr__(self, "edge_probabilities_by_time", edge_probs)
-
-        if self.initial_distribution is not None and self.initial_distribution.layer != self.graph.layers[0]:
-            raise ValueError("initial_distribution.layer must match graph.layers[0].")
-        if self.marginals is not None:
-            if len(self.marginals.node_marginals_by_layer) != len(self.graph.layers):
-                raise ValueError("marginals.node_marginals_by_layer must align with graph.layers.")
-            if len(self.marginals.edge_marginals_by_time) != len(self.graph.edges_by_time):
-                raise ValueError(
-                    "marginals.edge_marginals_by_time must align with graph.edges_by_time."
-                )
-            for layer, probs in zip(self.graph.layers, self.marginals.node_marginals_by_layer):
-                if len(layer.states) != len(probs):
-                    raise ValueError("Node marginals must align with layer support sizes.")
-            for edges, probs in zip(self.graph.edges_by_time, self.marginals.edge_marginals_by_time):
-                if len(edges) != len(probs):
-                    raise ValueError("Edge marginals must align with sparse edge counts.")
 
 
 @dataclass(frozen=True)
@@ -193,9 +195,19 @@ class SBSolution:
         object.__setattr__(self, "log_forward_potentials", forward)
         object.__setattr__(self, "log_backward_potentials", backward)
 
-    def to_bridge(self) -> SolvedBridge:
+    def require_converged(self) -> "SBSolution":
+        """Raise ``SBSolverError`` unless the solver reached its tolerance."""
+        if not self.trace.converged:
+            raise SBSolverError(
+                "SB solution did not converge "
+                f"(iterations={self.trace.iterations}, "
+                f"final_max_delta={self.trace.final_max_delta:g})."
+            )
+        return self
+
+    def to_bridge(self, *, allow_nonconverged: bool = False) -> SolvedBridge:
         """Convert potentials into normalized sparse bridge transitions."""
-        return solved_bridge_from_solution(self)
+        return solved_bridge_from_solution(self, allow_nonconverged=allow_nonconverged)
 
 
 @dataclass(frozen=True)
@@ -687,6 +699,10 @@ def _tuplify_layers(values: Sequence[np.ndarray]) -> Tuple[Tuple[float, ...], ..
 
 
 def _normalize_log_probs(log_values: np.ndarray) -> np.ndarray:
+    if not np.any(np.isfinite(log_values)):
+        raise SBSolverError(
+            "Cannot normalize log-probabilities: every entry is -inf (empty finite support)."
+        )
     normalizer = _NumpySBBackend.logsumexp(log_values, context="normalize_log_probs")
     return log_values - normalizer
 
@@ -727,6 +743,49 @@ def _validate_conditioned_edge_probabilities(
             )
 
 
+_FLOW_CONSISTENCY_ATOL = 1e-8
+
+
+def _validate_edge_flow_consistency(
+    graph: SparseGraph,
+    time_index: int,
+    edge_marginals: Sequence[float],
+    source_node_marginals: Sequence[float],
+    target_node_marginals: Sequence[float],
+    *,
+    atol: float = _FLOW_CONSISTENCY_ATOL,
+) -> None:
+    """Edge masses must be a consistent flow between the adjacent node marginals.
+
+    For each state the outgoing edge mass equals its node marginal at ``t`` and the
+    incoming edge mass equals its node marginal at ``t + 1``. These identities follow from
+    the forward/backward recursions (they hold even before convergence), so a violation
+    signals a numerical problem and the bridge must not be exposed to path extraction.
+    """
+    outgoing: dict[BeatState, float] = {}
+    incoming: dict[BeatState, float] = {}
+    for edge, mass in zip(graph.edges_by_time[time_index], edge_marginals):
+        outgoing[edge.source] = outgoing.get(edge.source, 0.0) + float(mass)
+        incoming[edge.target] = incoming.get(edge.target, 0.0) + float(mass)
+    for state, node_mass in zip(graph.layers[time_index].states, source_node_marginals):
+        gap = abs(outgoing.get(state, 0.0) - float(node_mass))
+        if gap > atol:
+            raise SBSolverError(
+                f"Edge marginals at t={time_index} are inconsistent with the node marginal of "
+                f"a source state: outgoing edge mass {outgoing.get(state, 0.0):.12g} vs node "
+                f"mass {float(node_mass):.12g} (gap {gap:.3e} > {atol:g})."
+            )
+    for state, node_mass in zip(graph.layers[time_index + 1].states, target_node_marginals):
+        gap = abs(incoming.get(state, 0.0) - float(node_mass))
+        if gap > atol:
+            raise SBSolverError(
+                f"Edge marginals at t={time_index} are inconsistent with the node marginal of "
+                f"a target state at t={time_index + 1}: incoming edge mass "
+                f"{incoming.get(state, 0.0):.12g} vs node mass {float(node_mass):.12g} "
+                f"(gap {gap:.3e} > {atol:g})."
+            )
+
+
 def _compute_bridge_marginals_and_conditionals(
     solution: SBSolution,
 ) -> tuple[tuple[tuple[float, ...], ...], BridgeMarginals]:
@@ -745,7 +804,9 @@ def _compute_bridge_marginals_and_conditionals(
         )
         normalized = _normalize_log_probs(log_mass)
         probs = tuple(float(np.exp(value)) for value in normalized)
-        _require_probs(f"node_marginals_by_layer[{layer_idx}]", probs)
+        _require_probs(
+            f"node_marginals_by_layer[{layer_idx}]", probs, require_normalized=True
+        )
         node_marginals_by_layer.append(probs)
 
     edge_conditionals_by_time: list[tuple[float, ...]] = []
@@ -776,7 +837,16 @@ def _compute_bridge_marginals_and_conditionals(
         conditioned_tuple = tuple(conditioned_probs)
         edge_conditionals_by_time.append(conditioned_tuple)
         edge_marginals_tuple = tuple(edge_marginals)
-        _require_probs(f"edge_marginals_by_time[{time_index}]", edge_marginals_tuple)
+        _require_probs(
+            f"edge_marginals_by_time[{time_index}]", edge_marginals_tuple, require_normalized=True
+        )
+        _validate_edge_flow_consistency(
+            graph,
+            time_index,
+            edge_marginals_tuple,
+            node_marginals_by_layer[time_index],
+            node_marginals_by_layer[time_index + 1],
+        )
         edge_marginals_by_time.append(edge_marginals_tuple)
         _validate_conditioned_edge_probabilities(
             graph,
@@ -792,10 +862,14 @@ def _compute_bridge_marginals_and_conditionals(
     return tuple(edge_conditionals_by_time), marginals
 
 
-def solved_bridge_from_solution(solution: SBSolution) -> SolvedBridge:
+def solved_bridge_from_solution(
+    solution: SBSolution, *, allow_nonconverged: bool = False
+) -> SolvedBridge:
     """Build a normalized sparse bridge object from a solved SB solution."""
     if not isinstance(solution, SBSolution):
         raise TypeError("solution must be an SBSolution.")
+    if not allow_nonconverged:
+        solution.require_converged()
     edge_probabilities_by_time, marginals = _compute_bridge_marginals_and_conditionals(solution)
     return SolvedBridge(
         graph=solution.problem.graph,
@@ -803,6 +877,37 @@ def solved_bridge_from_solution(solution: SBSolution) -> SolvedBridge:
         initial_distribution=solution.problem.pi0,
         marginals=marginals,
     )
+
+
+def _validate_explicit_start_state(
+    bridge: SolvedBridge,
+    start_state: BeatState,
+    transition_tables: Sequence[Mapping[BeatState, tuple]],
+) -> None:
+    """Reject an explicit start the bridge does not support.
+    """
+    graph = bridge.graph
+    if start_state not in set(graph.layers[0].states):
+        raise ValueError("start_state must come from the bridge start layer.")
+    if (
+        bridge.initial_distribution is not None
+        and not bridge.initial_distribution.probability_of(start_state) > 0.0
+    ):
+        raise ValueError(
+            "start_state has zero probability under the bridge's initial distribution; "
+            "path extraction from it is not supported by this bridge."
+        )
+    reachable = {state for state in graph.layers[-1].states}
+    for table in reversed(transition_tables):
+        reachable = {
+            source
+            for source, (edges, probs) in table.items()
+            if any(p > 0.0 and e.target in reachable for e, p in zip(edges, probs))
+        }
+    if start_state not in reachable:
+        raise ValueError(
+            "start_state has no positive-probability continuation to the terminal support."
+        )
 
 
 def map_bridge_path(
@@ -820,8 +925,8 @@ def map_bridge_path(
         {state: idx for idx, state in enumerate(layer.states)} for layer in graph.layers
     ]
 
-    if start_state is not None and start_state not in state_to_index[0]:
-        raise ValueError("start_state must come from the bridge start layer.")
+    if start_state is not None:
+        _validate_explicit_start_state(bridge, start_state, transition_tables)
 
     initial_scores = np.full(len(graph.layers[0]), float("-inf"), dtype=float)
     if start_state is None:
@@ -934,8 +1039,8 @@ def build_sb_problem(
         zero_indegree_count=sum(
             1 for layer in layers[1:] for state in layer.states if in_degree[state] == 0
         ),
-        pi0_support_size=len(pi0.layer),
-        piT_support_size=len(piT.layer),
+        pi0_support_size=sum(p > 0.0 for p in pi0.probabilities),
+        piT_support_size=sum(p > 0.0 for p in piT.probabilities),
     )
 
     return SBProblem(
@@ -955,7 +1060,9 @@ def solve_sb(problem: SBProblem) -> SBSolution:
 
     backend = _select_backend(problem.sb_config)
     indexed_problem = _index_problem(problem)
-    log_terminal_backward = np.zeros(problem.diagnostics.piT_support_size, dtype=float)
+    log_terminal_backward = np.where(
+        np.isfinite(np.asarray(indexed_problem.log_piT, dtype=float)), 0.0, float("-inf")
+    )
     final_max_delta = float("inf")
     converged = False
     iterations = 0
@@ -1051,7 +1158,13 @@ def solve_sb(problem: SBProblem) -> SBSolution:
 
 # --- Pure Path Sampling Implementation ---
 
-def _require_probs(name: str, values: Sequence[float]) -> tuple[float, ...]:
+def _require_probs(
+    name: str,
+    values: Sequence[float],
+    *,
+    require_normalized: bool = False,
+    atol: float = 1e-8,
+) -> tuple[float, ...]:
     probs = tuple(float(value) for value in values)
     if not probs:
         raise ValueError(f"{name} must not be empty.")
@@ -1063,6 +1176,8 @@ def _require_probs(name: str, values: Sequence[float]) -> tuple[float, ...]:
     total = sum(probs)
     if total <= 0.0:
         raise ValueError(f"{name} must have positive total mass.")
+    if require_normalized and abs(total - 1.0) > atol:
+        raise ValueError(f"{name} must sum to 1.0 (got {total!r}, atol={atol}).")
     return probs
 
 
@@ -1072,11 +1187,16 @@ def _sample_categorical(key: RNGKey, probs: Sequence[float]) -> tuple[int, RNGKe
     threshold, next_key = random_unit(key)
     cutoff = threshold * total
     running = 0.0
+    last_positive = -1
     for idx, prob in enumerate(normalized):
         running += prob
-        if cutoff <= running:
-            return idx, next_key
-    return len(normalized) - 1, next_key
+        if prob > 0.0:
+            last_positive = idx
+            if cutoff < running:
+                return idx, next_key
+    # Reached only through floating-point round-off (cutoff == total). Fall back to the
+    # last outcome with positive mass -- never to a zero-mass outcome.
+    return last_positive, next_key
 
 
 def _build_conditioned_transition_table(
@@ -1124,8 +1244,7 @@ def sample_bridge_path(
             idx, rng = _sample_categorical(rng, bridge.initial_distribution.probabilities)
             start_state = bridge.initial_distribution.layer.states[idx]
     else:
-        if start_state not in set(graph.layers[0].states):
-            raise ValueError("start_state must come from the bridge start layer.")
+        _validate_explicit_start_state(bridge, start_state, transition_tables)
 
     path: list[BeatState] = [start_state]
     edges: list[Edge] = []
