@@ -138,3 +138,24 @@ run, with roughly 0.4 GB and 0.8 GB of memory growth. A 1,024-beat matrix of 4 c
   recurrence, voice leading, groove continuity), and `K_max`/`D_max`/budget sweeps (the config supports a
   `graph_grid`, but only one point is run).
 * Horizons 256–1,024 and the listening-test package (Milestones 2 and 3).
+
+## Evaluation dashboard (Gradio)
+
+`python ui.py` serves the generation UI at `/` and the evaluation dashboard at `/evaluation`
+(implemented in `aimusic/evaluation/ui.py`; needs `pip install -e ".[ui]"`).
+
+* **Runs go through the CLI.** *Run*, *Resume*, *List Runs* and *Generate Report* launch
+  `python -m aimusic.evaluation run|report ...` in a subprocess (stdout+stderr are kept in
+  `<out>/ui_run.log` and shown in the page), so UI and command-line results are identical. The page polls
+  while a job runs and never blocks; *Stop* terminates the CLI and its workers, and *Resume* continues.
+  A directory created from a different config is refused before anything starts.
+* **Data sources.** `manifest.json` + `runs/*.json` (falling back to `results.jsonl`) for run level,
+  `aggregate.json` for cell level with its 95% intervals. If `aggregate.json` is missing or out of date
+  (e.g. mid-run) it is recomputed with `stats.aggregate`, the same code the CLI uses. `report.md` is shown as a
+  reference view only.
+* **Views.** Overview cards, runtime/memory bars with CIs, run-status chart, paired ablation deltas vs `full`,
+  tension target-vs-realized, runtime/memory scaling by horizon, 12- vs 19-EDO (EDOs are never pooled), and a
+  per-run inspector (including failure records).
+* **Tension curves.** New runs record `metrics.tension.target_curve` / `realized_curve` (per-beat lists, ignored by
+  the aggregator). Results produced before this change have only summary tension metrics; the dashboard shows those
+  instead and says so. Re-run to get curves.
