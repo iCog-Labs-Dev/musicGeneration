@@ -72,6 +72,11 @@ class TestCliGenerateInspectExportWorkflow(unittest.TestCase):
         self.assertEqual([item["name"] for item in manifest["sb_stats"]["sections"]],
                          ["intro", "theme", "bridge", "return"])
         self.assertEqual(len(manifest["sb_stats"]["joins"]), 3)
+        for join in manifest["sb_stats"]["joins"]:
+            self.assertGreater(join["boundary_support_size"], 1)
+            self.assertEqual(len(join["boundary_states"]), join["boundary_support_size"])
+            self.assertAlmostEqual(sum(join["boundary_probabilities"]), 1.0)
+            self.assertIn(join["shared_state"], join["boundary_states"])
         self.assertEqual(len(manifest["sb_stats"]["layer_sizes"]), 17)
         midi = mido.MidiFile(str(next(self._tmp.glob("*.mid"))))
         self.assertTrue(any(message.type == "note_on" for track in midi.tracks for message in track))

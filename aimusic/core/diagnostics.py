@@ -55,13 +55,17 @@ class SBDiagnostics:
             raise ValueError("At least one solution is required.")
         parts = [cls.from_solution(solution) for solution in solutions]
         layers = parts[0].layer_sizes + [size for part in parts[1:] for size in part.layer_sizes[1:]]
-        # Shared anchors have zero entropy, so removing duplicates changes only the divisor.
+        duplicate_entropy = sum(
+            -sum(p * math.log(p) for p in solution.marginals.node_marginals_by_layer[0] if p > 0)
+            for solution in solutions[1:] if solution.marginals
+        )
         return cls(
             iterations_run=sum(part.iterations_run for part in parts),
             converged=all(part.converged for part in parts),
             final_max_delta=max(part.final_max_delta for part in parts),
             layer_sizes=layers, pruned_nodes=sum(part.pruned_nodes for part in parts),
-            effective_entropy=sum(part.effective_entropy * len(part.layer_sizes) for part in parts) / len(layers),
+            effective_entropy=(sum(part.effective_entropy * len(part.layer_sizes) for part in parts)
+                               - duplicate_entropy) / len(layers),
         )
 
     @classmethod

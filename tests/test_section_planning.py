@@ -1,14 +1,20 @@
 import dataclasses
+import math
 import unittest
 from unittest.mock import patch
 
 from aimusic.core.config import PlanConfig, SBConfig, SectioningStrategy, StitchingConfig, StyleConfig
 from aimusic.core.diagnostics import SBDiagnostics
 from aimusic.core.rng import RNGKey
-from aimusic.core.core_types import BeatState
+from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
 from aimusic.core.vocab import build_tonal_context
 from aimusic.planning import plans
-from aimusic.planning.stitching import concatenate_section_paths, stitch_cost
+from aimusic.planning.stitching import (
+    concatenate_section_paths, map_section_paths, prune_section_graphs, section_path_score,
+    shared_boundary_distribution, stitch_cost,
+)
+from aimusic.planning.graph import GraphDiagnostics, SparseGraph
+from aimusic.planning.sb import SolvedBridge, map_bridge_path
 
 
 def section_config(edo=12, sample=False):
@@ -68,6 +74,10 @@ class TestSectionPlanning(unittest.TestCase):
                              right.sb_solution.problem.pi0.layer.states)
             self.assertEqual(left.sb_solution.problem.piT.probabilities,
                              right.sb_solution.problem.pi0.probabilities)
+            self.assertGreater(sum(p > 0 for p in left.bridge.marginals.node_marginals_by_layer[-1]), 1)
+            for expected, actual in zip(left.sb_solution.problem.piT.probabilities,
+                                        left.bridge.marginals.node_marginals_by_layer[-1]):
+                self.assertAlmostEqual(expected, actual, places=5)
         for join in result.joins:
             self.assertLessEqual(join.incoming.total, join.tolerance)
             self.assertLessEqual(join.outgoing.total, join.tolerance)
@@ -76,6 +86,82 @@ class TestSectionPlanning(unittest.TestCase):
         self.assertEqual(len(stats.joins), 3)
         self.assertEqual(stats.iterations_run, sum(s.trace.iterations for s in result.solutions))
         self.assertEqual(len(stats.layer_sizes), 17)
+        masses = list(result.solutions[0].marginals.node_marginals_by_layer)
+        for solution in result.solutions[1:]:
+            masses.extend(solution.marginals.node_marginals_by_layer[1:])
+        expected_entropy = sum(-sum(p * math.log(p) for p in layer if p > 0)
+                               for layer in masses) / len(masses)
+        self.assertAlmostEqual(stats.effective_entropy, expected_entropy)
+
+    def test_following_start_preferences_and_stitch_weights_change_boundary_mass(self):
+        for edo in (12, 19):
+            vocabs = build_tonal_context(edo, StyleConfig()).vocabularies
+            a = BeatState(0, 0, 2, 0, 0, 3, 1, 0)
+            b = dataclasses.replace(a, head_id=2)
+            layer = Layer(4, (a, b))
+            left = EndpointDistribution(layer, (0.5, 0.5))
+            right_a = EndpointDistribution(layer, (0.9, 0.1))
+            right_b = EndpointDistribution(layer, (0.1, 0.9))
+            config = StitchingConfig(head_weight=3)
+            prefer_a = shared_boundary_distribution(left, right_a, config, vocabs, edo)
+            prefer_b = shared_boundary_distribution(left, right_b, config, vocabs, edo)
+            self.assertGreater(prefer_a.probabilities[0], prefer_b.probabilities[0])
+            no_head_cost = shared_boundary_distribution(
+                left, right_a, dataclasses.replace(config, head_weight=0), vocabs, edo)
+            self.assertEqual(no_head_cost.probabilities, (0.5, 0.5))
+            self.assertTrue(all(p > 0 for p in prefer_a.probabilities))
+
+    def test_joint_map_considers_following_section_without_resolving(self):
+        start = BeatState(0, 0, 0, 0, 0, 0, 1, 0)
+        a = dataclasses.replace(start, beat_in_bar=1)
+        b = dataclasses.replace(a, head_id=2)
+        x = dataclasses.replace(start, beat_in_bar=2)
+        y = dataclasses.replace(x, head_id=2)
+        end = dataclasses.replace(start, beat_in_bar=3)
+
+        def bridge(layers, pairs, probabilities, initial):
+            graph = SparseGraph(tuple(Layer(t, states) for t, states in enumerate(layers)),
+                                tuple(tuple(Edge(t, source, target, 0.0) for source, target in group)
+                                      for t, group in enumerate(pairs)),
+                                GraphDiagnostics(tuple(len(layer) for layer in layers), ()))
+            return SolvedBridge(graph, probabilities, EndpointDistribution(graph.layers[0], initial))
+
+        left = bridge(((start,), (a, b)), (((start, a), (start, b)),), ((0.6, 0.4),), (1.0,))
+        right = bridge(((a, b), (x, y), (end,)),
+                       (((a, x), (a, y), (b, x), (b, y)), ((x, end), (y, end))),
+                       ((0.5, 0.5, 0.99, 0.01), (1.0, 1.0)), (0.6, 0.4))
+        self.assertEqual(map_bridge_path(left)[0][-1], a)
+        paths = map_section_paths((left, right))
+        self.assertEqual(paths, ((start, b), (b, x, end)))
+        self.assertAlmostEqual(sum(section_path_score(part, path, include_initial=i == 0)
+                                   for i, (part, path) in enumerate(zip((left, right), paths))), math.log(0.4 * 0.99))
+        # If the next section cannot continue from b, both copies must lose b
+        # before either solve; retaining it on only one side would break the join.
+        restricted = dataclasses.replace(right.graph, edges_by_time=(right.graph.edges_by_time[0][:2],
+                                                                    right.graph.edges_by_time[1]))
+        pruned_left, pruned_right = prune_section_graphs((left.graph, restricted))
+        self.assertEqual(pruned_left.layers[-1].states, (a,))
+        self.assertEqual(pruned_right.layers[0].states, (a,))
+
+    def test_following_start_preferences_reach_actual_solver_marginals(self):
+        config = dataclasses.replace(section_config(), total_beats=4, sb_config=SBConfig(horizon_t=4),
+                                     plan_config=PlanConfig(sectioning_strategy=SectioningStrategy.SECTION_WISE,
+                                                            section_names=("intro", "theme"), endpoint_top_k=2))
+        build_distribution = plans._build_endpoint_distribution
+        results = []
+        for probabilities in ((0.9, 0.1), (0.1, 0.9)):
+            def prefer_start(**kwargs):
+                distribution = build_distribution(**kwargs)
+                if kwargs["is_start"] and kwargs["time_index"] > 0:
+                    return dataclasses.replace(distribution, probabilities=probabilities)
+                return distribution
+            with patch.object(plans, "_build_endpoint_distribution", side_effect=prefer_start):
+                result, _ = plans.run_method_a(config, key=RNGKey(11))
+            left, right = result.solutions
+            self.assertEqual(left.problem.piT.probabilities, right.problem.pi0.probabilities)
+            self.assertEqual(len(left.problem.piT.layer), 2)
+            results.append(left.problem.piT.probabilities)
+        self.assertNotEqual(results[0], results[1])
 
     def test_budget_rejects_monolithic_but_accepts_sections(self):
         config = section_config()

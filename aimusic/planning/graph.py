@@ -616,6 +616,20 @@ def build_sparse_graph(
         final_step = next_time == end_layer.time_index
         steps_remaining = end_layer.time_index - next_time
 
+        # Many sources propose the same target. Its distance/legality relative
+        # to the fixed endpoint layer is identical for every incoming edge.
+        # Cache only within this layer so multi-state endpoints do not multiply
+        # repeated tonal-distance work or retain an unbounded song-wide cache.
+        remaining_costs: dict[BeatState, float] = {}
+
+        def remaining_cost(state: BeatState) -> float:
+            if state not in remaining_costs:
+                remaining_costs[state] = -_pruning_score(
+                    state, 0.0, steps_remaining, end_layer, resolved_vocabs,
+                    resolved_style, edo=resolved_edo,
+                )
+            return remaining_costs[state]
+
         raw_candidate_count = 0
         raw_edge_count = 0
         outdegree_pruned_count = 0
@@ -697,14 +711,7 @@ def build_sparse_graph(
             ]
             source_edges.sort(
                 key=lambda edge: (
-                    -_edge_priority_score(
-                        edge,
-                        steps_remaining,
-                        end_layer,
-                        resolved_vocabs,
-                        resolved_style,
-                        edo=resolved_edo,
-                    ),
+                    -(edge.log_weight - remaining_cost(edge.target)),
                     _state_sort_key(edge.target),
                 )
             )
@@ -738,15 +745,7 @@ def build_sparse_graph(
                 ranked_candidates = sorted(
                     unique_candidates,
                     key=lambda state: (
-                        -_pruning_score(
-                            state,
-                            best_incoming[state],
-                            steps_remaining,
-                            end_layer,
-                            resolved_vocabs,
-                            resolved_style,
-                            edo=resolved_edo,
-                        ),
+                        -(best_incoming[state] - remaining_cost(state)),
                         _state_sort_key(state),
                     ),
                 )
@@ -758,15 +757,7 @@ def build_sparse_graph(
                             time_index=next_time,
                             state=state,
                             reason="k_max_prune",
-                            heuristic_score=_pruning_score(
-                                state,
-                                best_incoming[state],
-                                steps_remaining,
-                                end_layer,
-                                resolved_vocabs,
-                                resolved_style,
-                                edo=resolved_edo,
-                            ),
+                            heuristic_score=best_incoming[state] - remaining_cost(state),
                         )
                     )
                 kept_edges = [edge for edge in kept_edges if edge.target in kept_state_set]
