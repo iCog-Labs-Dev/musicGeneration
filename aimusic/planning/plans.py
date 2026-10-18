@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -35,7 +35,11 @@ from aimusic.planning.sb import (
     sample_bridge_path,
     solve_sb,
 )
-from aimusic.scoring.priors import NullPrior, Prior
+from aimusic.scoring.priors import NullPrior, Prior, PriorContext
+from aimusic.planning.stitching import (
+    SectionJoinDiagnostics, StitchPolicy, concatenate_section_paths, stitch_cost,
+    map_section_paths, prune_section_graphs, section_path_score, shared_boundary_distribution,
+)
 from aimusic.theory.edo import EDO
 from aimusic.theory.tonal import get_fifth_steps
 
@@ -195,12 +199,62 @@ class MethodAPlanResult:
     diagnostics: MethodAPlanDiagnostics
     path_edge_diagnostics: Tuple[EdgeScoreDiagnostics, ...] = ()
 
+    @property
+    def solutions(self) -> Tuple[SBSolution, ...]:
+        return (self.sb_solution,)
+
+
+@dataclass(frozen=True)
+class SectionRunResult:
+    section: PlanningSection
+    graph: SparseGraph
+    sb_solution: SBSolution
+    bridge: SolvedBridge
+    path: Tuple[BeatState, ...]
+    path_score: Optional[float]
+    sampled_path: Optional[SampledBridgePath]
+    rng_stream_id: str
+
+
+@dataclass(frozen=True)
+class SectionWisePlanResult:
+    """Local solver artifacts plus a global path; no fictitious whole-song solve."""
+
+    run_config: MethodARunConfig
+    tonal_context: TonalContext
+    vocabularies: Vocabularies
+    endpoints: MethodAEndpoints
+    section_results: Tuple[SectionRunResult, ...]
+    boundary_choices: Tuple[EndpointChoice, ...]
+    joins: Tuple[SectionJoinDiagnostics, ...]
+    path: Tuple[BeatState, ...]
+    path_score: Optional[float]
+    diagnostics: MethodAPlanDiagnostics
+    path_edge_diagnostics: Tuple[EdgeScoreDiagnostics, ...]
+
+    @property
+    def solutions(self) -> Tuple[SBSolution, ...]:
+        return tuple(section.sb_solution for section in self.section_results)
+
+
+class SectionPlanningError(ValueError):
+    """Failure annotated with the section and stage, retaining the cause."""
+
+    def __init__(self, index: int, section: PlanningSection, stage: str, cause: Exception):
+        self.section_index = index
+        self.section = section
+        self.stage = stage
+        super().__init__(
+            f"Section {index} '{section.name}' [{section.start_time}, {section.end_time}) "
+            f"failed during {stage}: {cause}"
+        )
+
 
 @dataclass(frozen=True)
 class ExactBridgeDemoResult:
     """Compatibility wrapper for legacy bridge-demo scripts."""
 
-    plan_result: MethodAPlanResult
+    plan_result: MethodAPlanResult | SectionWisePlanResult
     score: Score
     output_path: str
 
@@ -558,8 +612,10 @@ def run_method_a(
     key: RNGKey,
     prior: Optional[Prior] = None,
     vocabularies: Optional[Vocabularies] = None,
-) -> tuple[MethodAPlanResult, RNGKey]:
+) -> tuple[MethodAPlanResult | SectionWisePlanResult, RNGKey]:
     """Run Method A from endpoint planning through SB path extraction."""
+    if run_config.plan_config.sectioning_strategy is SectioningStrategy.SECTION_WISE:
+        return run_section_wise(run_config, key=key, prior=prior, vocabularies=vocabularies)
     _logger.info(f"Method A: {run_config.total_beats} beats, seed={run_config.seed}")
     tonal_context = build_tonal_context(
         run_config.edo,
@@ -655,6 +711,182 @@ def run_method_a(
         diagnostics=diagnostics,
         path_edge_diagnostics=graph.diagnostics_for_path(path),
     ), next_key
+
+
+def run_section_wise(
+    run_config: MethodARunConfig,
+    *,
+    key: RNGKey,
+    prior: Optional[Prior] = None,
+    vocabularies: Optional[Vocabularies] = None,
+) -> tuple[SectionWisePlanResult, RNGKey]:
+    """Solve once per section with shared multi-state boundary marginals."""
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
+    tonal_context = build_tonal_context(run_config.edo, run_config.style_config, vocabularies=vocabularies)
+    vocabs = tonal_context.vocabularies
+    sections = build_section_plan(run_config)
+    sb_config = _resolved_sb_config(run_config)
+    endpoints, _ = generate_method_a_endpoints(
+        run_config, vocabularies=vocabs, key=key.derive("endpoint_choice"),
+        sample_endpoints=run_config.use_sampling,
+    )
+    boundaries = [_singleton_endpoint_distribution(endpoints.start_choice.state, time_index=0)]
+    for index, section in enumerate(sections[:-1]):
+        try:
+            # Use cumulative time for metrical phase, even though solves use local time.
+            boundary_run = replace(
+                run_config, total_beats=section.end_time, sb_config=None,
+                plan_config=replace(run_config.plan_config,
+                                    sectioning_strategy=SectioningStrategy.SINGLE_PASS),
+            )
+            distribution = generate_end_endpoint_distribution(boundary_run, vocabularies=vocabs)
+            # Respect the authored boundary level where the meter permits it.
+            distribution = replace(distribution, layer=replace(
+                distribution.layer, states=tuple(
+                    replace(state, boundary_lvl=section.boundary_level)
+                    if state.beat_in_bar == 0 else state
+                    for state in distribution.layer.states
+                ),
+            ))
+            # Start preferences use the same global metrical phase as the end.
+            following_start = _build_endpoint_distribution(
+                time_index=section.end_time,
+                beat_in_bar_by_meter={meter_id: section.end_time % vocabs.meters.token_for_id(meter_id).beats_per_bar
+                                      for meter_id in _meter_ids(run_config.style_config, vocabs)},
+                is_start=True, run_config=boundary_run, vocabularies=vocabs,
+            )
+            boundaries.append(shared_boundary_distribution(
+                distribution, following_start, run_config.plan_config.stitching, vocabs, run_config.edo,
+            ))
+        except (ValueError, RuntimeError) as exc:
+            raise SectionPlanningError(index, section, "boundary planning", exc) from exc
+    boundaries.append(_singleton_endpoint_distribution(endpoints.end_choice.state,
+                                                       time_index=run_config.total_beats))
+    results: list[SectionRunResult] = []
+    pending = []
+    for index, section in enumerate(sections):
+        stage = "graph construction"
+        try:
+            horizon = section.end_time - section.start_time
+            local_sb = replace(sb_config, horizon_t=horizon)
+            start = replace(boundaries[index], layer=replace(boundaries[index].layer, time_index=0))
+            end = replace(boundaries[index + 1], layer=replace(boundaries[index + 1].layer, time_index=horizon))
+            edge_times = tuple(sorted(set(
+                ([0] if index > 0 else []) + ([horizon - 1] if index < len(sections) - 1 else [])
+            )))
+            context = PriorContext(section_name=section.name, metadata=(
+                ("section_index", str(index)), ("section_start", str(section.start_time)),
+                ("section_end", str(section.end_time)),
+                ("boundary_level", str(section.boundary_level)),
+                ("target_tension_arc", repr(section.target_tension_arc)),
+            ))
+            stream_id = f"section.{index}.{section.name}"
+            graph, _ = build_sparse_graph(
+                start.layer, end.layer, horizon, sb_config=local_sb,
+                style_config=run_config.style_config, vocabularies=vocabs,
+                prior=prior, weights=run_config.prior_weights, edo=run_config.edo,
+                key=key.derive(stream_id).derive("candidate_proposal"), d_max=local_sb.d_max,
+                section_context=context,
+                stitch_policy=StitchPolicy(run_config.plan_config.stitching, vocabs,
+                                          run_config.edo, edge_times),
+            )
+            pending.append((section, graph, local_sb, stream_id))
+        except (ValueError, RuntimeError) as exc:
+            raise SectionPlanningError(index, section, stage, exc) from exc
+    graphs = prune_section_graphs(tuple(item[1] for item in pending))
+    # Drop references to the unpruned graphs once reconciliation is complete.
+    pending = [(section, graph, local_sb, stream_id)
+               for (section, _, local_sb, stream_id), graph in zip(pending, graphs)]
+    for index, (section, graph, _, _) in enumerate(pending):
+        try:
+            retained = _align_endpoint_distribution(boundaries[index + 1], graph.layers[-1])
+            boundaries[index + 1] = replace(retained, layer=replace(retained.layer, time_index=section.end_time))
+        except ValueError as exc:
+            raise SectionPlanningError(index, section, "boundary support reconciliation", exc) from exc
+    for index, (section, _, local_sb, stream_id) in enumerate(pending):
+        stage = "boundary support reconciliation"
+        try:
+            graph = graphs[index]
+            start = _align_endpoint_distribution(boundaries[index], graph.layers[0])
+            end = _align_endpoint_distribution(boundaries[index + 1], graph.layers[-1])
+            stage = "SB solve"
+            solution = solve_sb(build_sb_problem(graph, start, end, sb_config=local_sb))
+            if not solution.trace.converged:
+                raise ValueError("Section SB did not converge to the shared boundary marginals.")
+            bridge = solution.to_bridge()
+            results.append(SectionRunResult(
+                section, graph, solution, bridge, (), None, None, stream_id,
+            ))
+        except (ValueError, RuntimeError) as exc:
+            raise SectionPlanningError(index, section, stage, exc) from exc
+
+    if not run_config.use_sampling:
+        try:
+            paths = map_section_paths(tuple(result.bridge for result in results))
+        except ValueError as exc:
+            raise SectionPlanningError(0, sections[0], "joint path extraction", exc) from exc
+    for index, result in enumerate(results):
+        try:
+            if run_config.use_sampling:
+                sampled_path, _ = sample_bridge_path(
+                    result.bridge, key.derive(result.rng_stream_id).derive("bridge_sampling"),
+                    start_state=None if index == 0 else results[index - 1].path[-1],
+                    include_edges=True, include_debug=True,
+                )
+                results[index] = replace(result, path=sampled_path.path, sampled_path=sampled_path)
+            else:
+                results[index] = replace(result, path=paths[index], path_score=section_path_score(
+                    result.bridge, paths[index], include_initial=index == 0))
+        except (ValueError, RuntimeError) as exc:
+            raise SectionPlanningError(index, result.section, "path extraction", exc) from exc
+    choices = [endpoints.start_choice]
+    for index, result in enumerate(results[:-1]):
+        distribution = boundaries[index + 1]
+        selected = distribution.layer.states.index(result.path[-1])
+        choices.append(EndpointChoice(result.path[-1], distribution, selected,
+                                      distribution.probabilities[selected],
+                                      "sample" if run_config.use_sampling else "joint_map"))
+    choices.append(endpoints.end_choice)
+    combined = concatenate_section_paths(tuple(result.path for result in results))
+    joins = []
+    config = run_config.plan_config.stitching
+    for index, (left, right) in enumerate(zip(results, results[1:])):
+        incoming = stitch_cost(left.path[-2], left.path[-1], config, vocabs, run_config.edo)
+        outgoing = stitch_cost(right.path[0], right.path[1], config, vocabs, run_config.edo)
+        if max(incoming.total, outgoing.total) > config.max_cost:
+            join_error = ValueError("Selected join exceeds stitching tolerance.")
+            raise SectionPlanningError(index + 1, right.section, "join validation", join_error) from join_error
+        joins.append(SectionJoinDiagnostics(
+            left.section.name, right.section.name, right.section.start_time,
+            right.path[0], incoming, outgoing, config.max_cost,
+            len(boundaries[index + 1].layer), boundaries[index + 1].layer.states,
+            boundaries[index + 1].probabilities,
+        ))
+    layer_sizes = results[0].graph.diagnostics.layer_sizes + tuple(
+        size for result in results[1:] for size in result.graph.diagnostics.layer_sizes[1:]
+    )
+    diagnostics = MethodAPlanDiagnostics(
+        section_tags=tuple(section.name for section in sections),
+        target_tension_arcs=tuple(section.target_tension_arc for section in sections),
+        chosen_start_state=combined[0], chosen_end_state=combined[-1],
+        endpoint_selection_mode=endpoints.start_choice.selection_mode,
+        chosen_start_probability=endpoints.start_choice.selected_probability,
+        chosen_end_probability=endpoints.end_choice.selected_probability,
+        path_mode="sample" if run_config.use_sampling else "map", graph_layer_sizes=layer_sizes,
+        bridge_iterations=sum(result.sb_solution.trace.iterations for result in results),
+        bridge_converged=all(result.sb_solution.trace.converged for result in results),
+        rng_stream_ids=("endpoint_choice",) + tuple(result.rng_stream_id for result in results),
+    )
+    edge_diagnostics = tuple(
+        replace(item, time_index=item.time_index + result.section.start_time)
+        for result in results for item in result.graph.diagnostics_for_path(result.path)
+    )
+    return SectionWisePlanResult(
+        run_config, tonal_context, vocabs, endpoints, tuple(results), tuple(choices), tuple(joins),
+        combined, None if run_config.use_sampling else sum(result.path_score or 0.0 for result in results),
+        diagnostics, edge_diagnostics,
+    ), key.next_key()
 
 
 def render_exact_bridge_demo(

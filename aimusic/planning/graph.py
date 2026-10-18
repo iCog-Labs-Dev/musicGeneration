@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Optional, Sequence, Tuple
 
 _logger = logging.getLogger(__name__)
@@ -15,6 +15,7 @@ from aimusic.planning.candidates import (
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Edge, Layer
 from aimusic.core.rng import RNGKey
+from aimusic.planning.stitching import StitchPolicy
 from aimusic.scoring.priors import (
     NullPrior,
     Prior,
@@ -246,6 +247,7 @@ class EdgeScoreDiagnostics:
     final_log_weight: float
     right_contexts: Tuple[BeatState, ...] = ()
     context_strategy: str = "two_pass_successor_mean"
+    stitch_cost: float = 0.0
 
     @property
     def right_context_count(self) -> int:
@@ -267,6 +269,7 @@ class EdgeScoreDiagnostics:
             "right_context_count": self.right_context_count,
             "right_contexts": [state.to_dict(vocabularies) for state in self.right_contexts],
             "context_strategy": self.context_strategy,
+            "stitch_cost": self.stitch_cost,
         }
 
 
@@ -344,12 +347,16 @@ def _build_prior_context(
     source_state: BeatState,
     end_layer: Layer,
     time_index: int,
+    section_context: Optional[PriorContext] = None,
 ) -> PriorContext:
     future_hints = end_layer.states[: min(3, len(end_layer.states))]
     return PriorContext(
         history=(source_state,),
         future_hints=future_hints,
-        metadata=(("graph_time", str(time_index)),),
+        section_name=None if section_context is None else section_context.section_name,
+        metadata=(("graph_time", str(time_index)),) + (
+            () if section_context is None else section_context.metadata
+        ),
     )
 
 
@@ -404,6 +411,8 @@ def _rescore_retained_edges_with_windows(
     weights: Optional[PriorWeights],
     vocabularies: Vocabularies,
     edo: int,
+    section_context: Optional[PriorContext] = None,
+    stitch_policy: Optional[StitchPolicy] = None,
 ) -> tuple[Tuple[Tuple[Edge, ...], ...], Tuple[Tuple[EdgeScoreDiagnostics, ...], ...]]:
     """Second pass: score retained edges against their bounded retained successors.
 
@@ -446,7 +455,7 @@ def _rescore_retained_edges_with_windows(
                 prev_state=edge.source,
                 next_state=edge.target,
                 time_index=edge.time_index,
-                context=_build_prior_context(edge.source, end_layer, edge.time_index),
+                context=_build_prior_context(edge.source, end_layer, edge.time_index, section_context),
             )
             flattened_queries.extend(query for _ in windows)
             flattened_windows.extend(windows)
@@ -471,6 +480,12 @@ def _rescore_retained_edges_with_windows(
                 edge=edge,
                 right_contexts=right_contexts,
             )
+            if stitch_policy is not None:
+                cost = stitch_policy.cost(edge.source, edge.target, edge.time_index)
+                diagnostic = replace(
+                    diagnostic, stitch_cost=cost,
+                    final_log_weight=diagnostic.final_log_weight - cost,
+                )
             rescored_pairs.append(
                 (
                     Edge(
@@ -540,6 +555,8 @@ def build_sparse_graph(
     d_max: int,
     proposal_budget: Optional[int] = None,
     prior_guided_proposals: Optional[bool] = None,
+    section_context: Optional[PriorContext] = None,
+    stitch_policy: Optional[StitchPolicy] = None,
 ) -> tuple[SparseGraph, RNGKey]:
     """Build a bounded sparse graph of BeatState transitions.
 
@@ -560,6 +577,11 @@ def build_sparse_graph(
         raise TypeError("key must be an RNGKey.")
 
     resolved_sb = SBConfig() if sb_config is None else sb_config
+    if resolved_sb.max_horizon_per_solve is not None and total_beats > resolved_sb.max_horizon_per_solve:
+        raise ValueError(
+            f"Graph horizon {total_beats} exceeds max_horizon_per_solve="
+            f"{resolved_sb.max_horizon_per_solve}."
+        )
     resolved_style = StyleConfig() if style_config is None else style_config
     resolved_vocabs = _resolved_vocabs(vocabularies)
     resolved_prior = _resolved_prior(prior)
@@ -594,6 +616,20 @@ def build_sparse_graph(
         final_step = next_time == end_layer.time_index
         steps_remaining = end_layer.time_index - next_time
 
+        # Many sources propose the same target. Its distance/legality relative
+        # to the fixed endpoint layer is identical for every incoming edge.
+        # Cache only within this layer so multi-state endpoints do not multiply
+        # repeated tonal-distance work or retain an unbounded song-wide cache.
+        remaining_costs: dict[BeatState, float] = {}
+
+        def remaining_cost(state: BeatState) -> float:
+            if state not in remaining_costs:
+                remaining_costs[state] = -_pruning_score(
+                    state, 0.0, steps_remaining, end_layer, resolved_vocabs,
+                    resolved_style, edo=resolved_edo,
+                )
+            return remaining_costs[state]
+
         raw_candidate_count = 0
         raw_edge_count = 0
         outdegree_pruned_count = 0
@@ -619,7 +655,7 @@ def build_sparse_graph(
                     style_config=resolved_style,
                     vocabularies=resolved_vocabs,
                     prior=resolved_prior,
-                    context=_build_prior_context(source_state, end_layer, current_time),
+                    context=_build_prior_context(source_state, end_layer, current_time, section_context),
                     edo=resolved_edo,
                     key=current_key,
                     d_max=d_max,
@@ -632,7 +668,7 @@ def build_sparse_graph(
             scored_candidate_count += candidate_result.scored_count
             rejected.extend(candidate_result.rejections)
 
-            source_context = _build_prior_context(source_state, end_layer, current_time)
+            source_context = _build_prior_context(source_state, end_layer, current_time, section_context)
             queries = tuple(
                 PriorQuery(
                     prev_state=source_state,
@@ -657,25 +693,25 @@ def build_sparse_graph(
                 if queries
                 else ()
             )
+            costs = tuple(
+                0.0 if stitch_policy is None else stitch_policy.cost(
+                    source_state, query.next_state, current_time
+                )
+                for query in queries
+            )
             source_edges = [
                 Edge(
                     time_index=current_time,
                     source=source_state,
                     target=query.next_state,
-                    log_weight=log_weight,
+                    log_weight=log_weight - cost,
                 )
-                for query, log_weight in zip(queries, log_weights)
+                for query, log_weight, cost in zip(queries, log_weights, costs)
+                if stitch_policy is None or cost <= stitch_policy.config.max_cost
             ]
             source_edges.sort(
                 key=lambda edge: (
-                    -_edge_priority_score(
-                        edge,
-                        steps_remaining,
-                        end_layer,
-                        resolved_vocabs,
-                        resolved_style,
-                        edo=resolved_edo,
-                    ),
+                    -(edge.log_weight - remaining_cost(edge.target)),
                     _state_sort_key(edge.target),
                 )
             )
@@ -709,15 +745,7 @@ def build_sparse_graph(
                 ranked_candidates = sorted(
                     unique_candidates,
                     key=lambda state: (
-                        -_pruning_score(
-                            state,
-                            best_incoming[state],
-                            steps_remaining,
-                            end_layer,
-                            resolved_vocabs,
-                            resolved_style,
-                            edo=resolved_edo,
-                        ),
+                        -(best_incoming[state] - remaining_cost(state)),
                         _state_sort_key(state),
                     ),
                 )
@@ -729,15 +757,7 @@ def build_sparse_graph(
                             time_index=next_time,
                             state=state,
                             reason="k_max_prune",
-                            heuristic_score=_pruning_score(
-                                state,
-                                best_incoming[state],
-                                steps_remaining,
-                                end_layer,
-                                resolved_vocabs,
-                                resolved_style,
-                                edo=resolved_edo,
-                            ),
+                            heuristic_score=best_incoming[state] - remaining_cost(state),
                         )
                     )
                 kept_edges = [edge for edge in kept_edges if edge.target in kept_state_set]
@@ -772,6 +792,8 @@ def build_sparse_graph(
         weights=weights,
         vocabularies=resolved_vocabs,
         edo=resolved_edo,
+        section_context=section_context,
+        stitch_policy=stitch_policy,
     )
     return SparseGraph(
         layers=tuple(layers),
