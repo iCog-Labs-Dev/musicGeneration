@@ -229,6 +229,10 @@ def tension_metrics(path: Sequence[Any], plan: Any, edo: int) -> Dict[str, Any]:
         "realized_mean": sum(values) / len(values),
         "realized_min": min(values),
         "realized_max": max(values),
+        # Per-beat curves (index = beat) so dashboards can plot target vs realized.  Lists are
+        # not numeric leaves, so ``stats.flatten_metrics`` ignores them and aggregates are unchanged.
+        "target_curve": [round(float(v), 6) for _, v in target],
+        "realized_curve": [round(float(v), 6) for v in values],
     }
 
 
