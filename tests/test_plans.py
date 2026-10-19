@@ -11,6 +11,7 @@ from aimusic.planning.plans import (
     generate_method_b_endpoints,
     generate_start_endpoint_distribution,
     run_method_a,
+    run_method_b,
     SectionSummary,
     LongFormDiagnostics,
     ComparisonRunSpec,
@@ -233,6 +234,13 @@ class TestMethodBEndpointsShape(unittest.TestCase):
         for dist in (endpoints.pi0, endpoints.piMid, endpoints.piT):
             self.assertAlmostEqual(sum(dist.probabilities), 1.0, places=5)
 
+    def test_return_distribution_is_start_distribution_shifted_in_time(self):
+        endpoints = generate_method_b_endpoints(self._make_cfg())
+        self.assertEqual(endpoints.piT.layer.states, endpoints.pi0.layer.states)
+        self.assertEqual(endpoints.piT.probabilities, endpoints.pi0.probabilities)
+        self.assertEqual(endpoints.end_choice.state, endpoints.start_choice.state)
+        self.assertEqual(endpoints.end_choice.selection_mode, "cyclic_return")
+
     def test_sections_span_full_range_various_midpoints(self):
         for total, mid in [(16, 8), (32, 10), (64, 1), (64, 63)]:
             cfg = MethodBRunConfig(
@@ -247,7 +255,80 @@ class TestMethodBEndpointsShape(unittest.TestCase):
             self.assertEqual(s2.end_time, total)
 
 
+class TestMethodBEndToEnd(unittest.TestCase):
+    def _config(self, *, seed=7, sample=False, edo=12):
+        return MethodBRunConfig(
+            total_beats=8,
+            seed=seed,
+            use_sampling=sample,
+            edo=edo,
+            style_config=StyleConfig(
+                allowed_meters=("4/4",),
+                groove_families=("straight",),
+            ),
+            plan_config=PlanConfig(method=PlanMethod.METHOD_B, loop_midpoint=4),
+        )
+
+    def test_two_bridges_form_exact_cycle(self):
+        result = run_method_b(self._config())
+        self.assertEqual(len(result.path), 9)
+        self.assertEqual(result.path[0], result.path[-1])
+        self.assertEqual(result.leg1.path[-1], result.leg2.path[0])
+        self.assertEqual(result.endpoints.end_choice.state, result.endpoints.start_choice.state)
+        self.assertTrue(result.leg1.sb_solution.trace.converged)
+        self.assertTrue(result.leg2.sb_solution.trace.converged)
+
+    def test_seeded_sampling_is_reproducible_and_cyclic(self):
+        first = run_method_b(self._config(seed=19, sample=True))
+        second = run_method_b(self._config(seed=19, sample=True))
+        self.assertEqual(first.path, second.path)
+        self.assertEqual(first.path[0], first.path[-1])
+
+    def test_each_leg_uses_local_solver_time(self):
+        result = run_method_b(self._config())
+        for leg in (result.leg1, result.leg2):
+            self.assertEqual(leg.graph.layers[0].time_index, 0)
+            self.assertEqual(
+                tuple(layer.time_index for layer in leg.graph.layers),
+                tuple(range(len(leg.graph.layers))),
+            )
+        self.assertEqual(result.leg2.diagnostics.start_time, 4)
+        self.assertEqual(result.leg2.diagnostics.end_time, 8)
+
+    def test_rejects_horizon_without_complete_allowed_meter_cycle(self):
+        cfg = MethodBRunConfig(
+            total_beats=6,
+            plan_config=PlanConfig(method=PlanMethod.METHOD_B, loop_midpoint=3),
+        )
+        with self.assertRaisesRegex(ValueError, "whole number of bars"):
+            generate_method_b_endpoints(cfg)
+
+
 class TestSectionWiseGuards(unittest.TestCase):
+    def test_section_wise_plan_executes_with_local_solver_times(self):
+        from aimusic.planning.plans import run_method_a_sectioned
+        cfg = MethodARunConfig(
+            total_beats=8,
+            seed=3,
+            style_config=StyleConfig(
+                allowed_meters=("4/4",), groove_families=("straight",)
+            ),
+            plan_config=PlanConfig(
+                method=PlanMethod.METHOD_A,
+                sectioning_strategy=SectioningStrategy.SECTION_WISE,
+                section_names=("intro", "theme"),
+            ),
+        )
+        result = run_method_a_sectioned(cfg)
+        self.assertEqual(len(result.path), 9)
+        self.assertEqual(len(result.section_results), 2)
+        for section in result.section_results:
+            self.assertEqual(section.graph.layers[0].time_index, 0)
+            self.assertEqual(
+                tuple(layer.time_index for layer in section.graph.layers),
+                tuple(range(len(section.graph.layers))),
+            )
+
     def test_rejects_single_pass_strategy(self):
         from aimusic.planning.plans import run_method_a_sectioned
         cfg = MethodARunConfig(

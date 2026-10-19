@@ -277,8 +277,12 @@ def apply_role_constraints(
         if not strong:
             return False, "cadence_requires_strong_beat"
 
-    if next_role == "hold" and next_candidate.boundary_lvl >= 2:
+    if next_role == "hold" and next_candidate.boundary_lvl == 2:
         return False, "hold_cannot_define_phrase_boundary"
+    # A section-level downbeat may restart a held tonic.  This is required for
+    # cyclic plans (Method B), whose final state is exactly their start state.
+    if next_role == "hold" and next_candidate.boundary_lvl >= 3 and not strong:
+        return False, "section_hold_requires_strong_beat"
 
     if next_role == "change":
         changed_harmony = (

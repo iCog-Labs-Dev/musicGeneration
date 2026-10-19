@@ -146,3 +146,18 @@ cython_debug/
 
 # VS Code
 .vscode/
+
+# Generated music and evaluation artifacts
+outputs/
+
+# Microsoft Office temporary lock files
+~$*.doc*
+~$*.xls*
+~$*.ppt*
+
+# Additional tool caches
+.ruff_cache/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db

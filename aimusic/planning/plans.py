@@ -202,12 +202,13 @@ class ExactBridgeDemoResult:
 def _resolved_vocabs(
     vocabularies: Optional[Vocabularies],
     style_config: StyleConfig,
+    edo: int = 12,
 ) -> Vocabularies:
     if vocabularies is not None:
         return vocabularies
-    if style_config == StyleConfig():
+    if style_config == StyleConfig() and edo == 12:
         return DEFAULT_VOCABULARIES
-    return build_default_vocabularies(style_config)
+    return build_default_vocabularies(style_config, edo=edo)
 
 
 def _resolved_sb_config(run_config: MethodARunConfig) -> SBConfig:
@@ -476,7 +477,7 @@ def generate_start_endpoint_distribution(
     *,
     vocabularies: Optional[Vocabularies] = None,
 ) -> EndpointDistribution:
-    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config, run_config.edo)
     beat_positions = {meter_id: 0 for meter_id in _meter_ids(run_config.style_config, resolved_vocabs)}
     return _build_endpoint_distribution(
         time_index=0,
@@ -492,7 +493,7 @@ def generate_end_endpoint_distribution(
     *,
     vocabularies: Optional[Vocabularies] = None,
 ) -> EndpointDistribution:
-    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config, run_config.edo)
     beat_positions = {}
     for meter_id in _meter_ids(run_config.style_config, resolved_vocabs):
         beats_per_bar = resolved_vocabs.meters.token_for_id(meter_id).beats_per_bar
@@ -513,7 +514,7 @@ def generate_method_a_endpoints(
     selection_key: Optional[RNGKey] = None,
     sample_endpoints: bool = False,
 ) -> MethodAEndpoints:
-    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config, run_config.edo)
     pi0 = generate_start_endpoint_distribution(run_config, vocabularies=resolved_vocabs)
     piT = generate_end_endpoint_distribution(run_config, vocabularies=resolved_vocabs)
     root_key = RNGKey(seed=run_config.seed) if selection_key is None else selection_key
@@ -543,7 +544,7 @@ def run_method_a(
     vocabularies: Optional[Vocabularies] = None,
 ) -> MethodAPlanResult:
     """Run Method A from endpoint planning through SB path extraction."""
-    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config, run_config.edo)
     resolved_sb = _resolved_sb_config(run_config)
     root_key = RNGKey(seed=run_config.seed)
     endpoint_key, graph_key, bridge_key = root_key.split(3)
@@ -683,7 +684,7 @@ class MethodBEndpoints:
 
     pi0: EndpointDistribution      # start  (t=0)
     piMid: EndpointDistribution    # midpoint (t=loop_midpoint), leg-1 terminal
-    piT: EndpointDistribution      # return (t=total_beats)
+    piT: EndpointDistribution      # pi0 shifted to t=total_beats
     start_choice: EndpointChoice
     mid_choice: EndpointChoice     # drawn from piMid; pinned as leg-2 start
     end_choice: EndpointChoice
@@ -781,25 +782,46 @@ def _run_single_leg(
     label: str,
 ) -> MethodBLegResult:
     """Build graph, solve SB, and extract path for one Method B leg."""
-    start_layer = Layer(time_index=start_time, states=(start_state,))
-    end_layer = Layer(time_index=start_time + leg_beats, states=(end_state,))
+    # Every SB problem uses its own local 0..T clock.  ``start_time`` is only
+    # a global composition offset used in diagnostics.  The solver explicitly
+    # requires contiguous layers beginning at zero.
+    start_layer = Layer(time_index=0, states=(start_state,))
+    end_layer = Layer(time_index=leg_beats, states=(end_state,))
 
-    graph = build_sparse_graph(
-        start_layer=start_layer,
-        end_layer=end_layer,
-        total_beats=leg_beats,
-        sb_config=sb_config,
-        style_config=run_config.style_config,
-        vocabularies=resolved_vocabs,
-        prior=prior,
-        weights=run_config.prior_weights,
-        edo=run_config.edo,
-        rng=rng,
-        d_max=sb_config.d_max,
+    # Candidate proposal is stochastic and bounded.  An exact endpoint may be
+    # legal but absent from one sparse proposal pass, so retry with fresh
+    # explicitly-threaded RNG state before declaring the leg unreachable.
+    graph: Optional[SparseGraph] = None
+    max_graph_attempts = 16
+    for _ in range(max_graph_attempts):
+        candidate_graph = build_sparse_graph(
+            start_layer=start_layer,
+            end_layer=end_layer,
+            total_beats=leg_beats,
+            sb_config=sb_config,
+            style_config=run_config.style_config,
+            vocabularies=resolved_vocabs,
+            prior=prior,
+            weights=run_config.prior_weights,
+            edo=run_config.edo,
+            rng=rng,
+            d_max=sb_config.d_max,
+        )
+        if end_state in candidate_graph.layers[-1].states:
+            graph = candidate_graph
+            break
+    if graph is None:
+        raise ValueError(
+            f"Method B {label} endpoint is unreachable after "
+            f"{max_graph_attempts} bounded graph attempts."
+        )
+
+    pi0_leg = _align_endpoint_distribution(
+        _singleton_endpoint_distribution(start_state, time_index=0), graph.layers[0]
     )
-
-    pi0_leg = _singleton_endpoint_distribution(start_state, time_index=start_time)
-    piT_leg = _singleton_endpoint_distribution(end_state, time_index=start_time + leg_beats)
+    piT_leg = _align_endpoint_distribution(
+        _singleton_endpoint_distribution(end_state, time_index=leg_beats), graph.layers[-1]
+    )
     problem = build_sb_problem(graph, pi0_leg, piT_leg, sb_config=sb_config)
     solution = solve_sb(problem)
     bridge = solution.to_bridge()
@@ -907,11 +929,34 @@ def _build_midpoint_distribution(
                                 primary_key_id=key_ids[0],
                             )
 
-    # Average scores for states that appear in both pools; keep union
+    # Evaluate every candidate under both roles.  Treating a missing pool
+    # score as zero made the result depend on an arbitrary score baseline.
     all_states = set(end_scores) | set(start_scores)
     combined: list[tuple[float, BeatState]] = []
     for state in all_states:
-        score = (end_scores.get(state, 0.0) + start_scores.get(state, 0.0)) / 2.0
+        end_score = end_scores.get(
+            state,
+            _candidate_score(
+                state,
+                is_start=False,
+                boundary_level=_endpoint_boundary_level(
+                    is_start=False, beat_in_bar=state.beat_in_bar
+                ),
+                primary_key_id=_key_anchor_ids(run_config, vocabularies)[0],
+            ),
+        )
+        start_score = start_scores.get(
+            state,
+            _candidate_score(
+                state,
+                is_start=True,
+                boundary_level=_endpoint_boundary_level(
+                    is_start=True, beat_in_bar=state.beat_in_bar
+                ),
+                primary_key_id=_key_anchor_ids(run_config, vocabularies)[0],
+            ),
+        )
+        score = (end_score + start_score) / 2.0
         combined.append((score, state))
 
     combined.sort(key=lambda item: (-item[0], _state_sort_key(item[1])))
@@ -935,11 +980,7 @@ def generate_method_b_endpoints(
     sample_endpoints: bool = False,
 ) -> MethodBEndpoints:
     """Build and select endpoint distributions for all three Method B anchors."""
-    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
-
-    # Re-use Method A helpers for the outer endpoints.
-    # We construct a temporary MethodARunConfig purely to delegate to the
-    # existing distribution builders — no SB is run here.
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config, run_config.edo)
     _a_config = MethodARunConfig(
         total_beats=run_config.total_beats,
         seed=run_config.seed,
@@ -959,18 +1000,41 @@ def generate_method_b_endpoints(
         edo=run_config.edo,
     )
 
-    pi0 = generate_start_endpoint_distribution(_a_config, vocabularies=resolved_vocabs)
-    piT = generate_end_endpoint_distribution(_a_config, vocabularies=resolved_vocabs)
+    pi0_unfiltered = generate_start_endpoint_distribution(_a_config, vocabularies=resolved_vocabs)
+    compatible_states = tuple(
+        state
+        for state in pi0_unfiltered.layer.states
+        if run_config.total_beats
+        % resolved_vocabs.meters.token_for_id(state.meter_id).beats_per_bar
+        == 0
+    )
+    if not compatible_states:
+        raise ValueError(
+            "Method B requires total_beats to complete a whole number of bars "
+            "in at least one allowed meter."
+        )
+    compatible_layer = Layer(time_index=0, states=compatible_states)
+    pi0 = _align_endpoint_distribution(pi0_unfiltered, compatible_layer)
     piMid = _build_midpoint_distribution(run_config=run_config, vocabularies=resolved_vocabs)
 
     root_key = RNGKey(seed=run_config.seed) if selection_key is None else selection_key
-    start_key, mid_key, end_key = root_key.split(3)
+    start_key, mid_key = root_key.split(2)
 
     start_choice, _ = _choose_endpoint_state(pi0, key=start_key, sample=sample_endpoints)
     mid_choice, _ = _choose_endpoint_state(piMid, key=mid_key, sample=sample_endpoints)
-    end_choice, _ = _choose_endpoint_state(piT, key=end_key, sample=sample_endpoints)
+   
+    piT = EndpointDistribution(
+        layer=Layer(time_index=run_config.total_beats, states=pi0.layer.states),
+        probabilities=pi0.probabilities,
+    )
+    end_choice = EndpointChoice(
+        state=start_choice.state,
+        source_distribution=piT,
+        selected_index=start_choice.selected_index,
+        selected_probability=start_choice.selected_probability,
+        selection_mode="cyclic_return",
+    )
 
-    # Build a two-section plan: leg1 and leg2.
     sections = (
         PlanningSection(
             name="leg1",
@@ -1006,7 +1070,7 @@ def run_method_b(
     vocabularies: Optional[Vocabularies] = None,
 ) -> MethodBPlanResult:
     """Run Method B: two sequential SB passes joined at the midpoint."""
-    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config, run_config.edo)
     resolved_prior: Prior = NullPrior() if prior is None else prior
 
     root_key = RNGKey(seed=run_config.seed)
@@ -1023,7 +1087,7 @@ def run_method_b(
 
     start_state = endpoints.start_choice.state
     mid_state = endpoints.mid_choice.state
-    end_state = endpoints.end_choice.state
+    end_state = start_state
 
     sb1 = _sb_config_for_leg(run_config, run_config.leg1_beats)
     sb2 = _sb_config_for_leg(run_config, run_config.leg2_beats)
@@ -1060,6 +1124,12 @@ def run_method_b(
     # leg2 gives beats midpoint..total (inclusive).
     # Drop leg2[0] because it duplicates leg1[-1] (both are mid_state).
     path: Tuple[BeatState, ...] = leg1.path + leg2.path[1:]
+    if path[0] != path[-1]:
+        raise RuntimeError("Method B invariant violated: final state must equal start state.")
+    if leg1.path[-1] != leg2.path[0]:
+        raise RuntimeError("Method B invariant violated: bridge legs must share the midpoint.")
+    if len(path) != run_config.total_beats + 1:
+        raise RuntimeError("Method B invariant violated: unexpected joined path length.")
 
     diagnostics = MethodBPlanDiagnostics(
         chosen_start_state=start_state,
@@ -1234,26 +1304,43 @@ def _run_section(
     _base_sb = run_config.sb_config if run_config.sb_config is not None else SBConfig()
     sb_config = dataclasses.replace(_base_sb, horizon_t=section_beats)
 
-    start_layer = Layer(time_index=section.start_time, states=(start_state,))
-    end_layer = Layer(time_index=section.end_time, states=(end_state,))
+    # Each SB problem has a local 0..section_beats clock.  Global section
+    # positions belong in section metadata and diagnostics only.
+    start_layer = Layer(time_index=0, states=(start_state,))
+    end_layer = Layer(time_index=section_beats, states=(end_state,))
 
-    graph = build_sparse_graph(
-        start_layer=start_layer,
-        end_layer=end_layer,
-        total_beats=section_beats,
-        sb_config=sb_config,
-        style_config=run_config.style_config,
-        vocabularies=resolved_vocabs,
-        prior=prior,
-        weights=run_config.prior_weights,
-        edo=run_config.edo,
-        rng=rng,
-        d_max=sb_config.d_max,
-        stitch_anchor=stitch_anchor,
+    graph: Optional[SparseGraph] = None
+    max_graph_attempts = 16
+    for _ in range(max_graph_attempts):
+        candidate_graph = build_sparse_graph(
+            start_layer=start_layer,
+            end_layer=end_layer,
+            total_beats=section_beats,
+            sb_config=sb_config,
+            style_config=run_config.style_config,
+            vocabularies=resolved_vocabs,
+            prior=prior,
+            weights=run_config.prior_weights,
+            edo=run_config.edo,
+            rng=rng,
+            d_max=sb_config.d_max,
+            stitch_anchor=stitch_anchor,
+        )
+        if end_state in candidate_graph.layers[-1].states:
+            graph = candidate_graph
+            break
+    if graph is None:
+        raise ValueError(
+            f"Section {section.name!r} endpoint is unreachable after "
+            f"{max_graph_attempts} bounded graph attempts."
+        )
+
+    pi0_sec = _align_endpoint_distribution(
+        _singleton_endpoint_distribution(start_state, time_index=0), graph.layers[0]
     )
-
-    pi0_sec = _singleton_endpoint_distribution(start_state, time_index=section.start_time)
-    piT_sec = _singleton_endpoint_distribution(end_state, time_index=section.end_time)
+    piT_sec = _align_endpoint_distribution(
+        _singleton_endpoint_distribution(end_state, time_index=section_beats), graph.layers[-1]
+    )
     problem = build_sb_problem(graph, pi0_sec, piT_sec, sb_config=sb_config)
     solution = solve_sb(problem)
     bridge = solution.to_bridge()
@@ -1308,7 +1395,7 @@ def run_method_a_sectioned(
             "Section-wise planning requires at least two section_names."
         )
 
-    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config)
+    resolved_vocabs = _resolved_vocabs(vocabularies, run_config.style_config, run_config.edo)
     resolved_prior: Prior = NullPrior() if prior is None else prior
 
     sections = build_section_plan(run_config)

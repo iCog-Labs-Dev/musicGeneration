@@ -28,6 +28,7 @@ from aimusic.scoring.priors import (
 )
 from aimusic.core.vocab import DEFAULT_VOCABULARIES
 
+
 from aimusic.scoring.priors import (
     NeuralPriorScoringStats,
     NeuralPriorSession,

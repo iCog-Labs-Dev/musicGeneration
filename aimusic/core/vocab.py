@@ -381,11 +381,15 @@ def _build_groove_vocabulary(families: Sequence[str]) -> TokenVocabulary[GrooveT
     return TokenVocabulary(name="grooves", tokens=tuple(tokens))
 
 
-def build_default_vocabularies(style_config: StyleConfig | None = None) -> Vocabularies:
+def build_default_vocabularies(
+    style_config: StyleConfig | None = None,
+    *,
+    edo: int | None = None,
+) -> Vocabularies:
     """Build the shared first-pass structural vocabularies.
 
-    The default path is 12-EDO oriented, but chord/key cardinality is parameterized by the
-    configured vocabulary sizes so 19-EDO-compatible label spaces can be introduced later.
+    Key and chord roots cover every pitch class in ``Z_edo``.  Style vocabulary
+    sizes remain lower bounds, but can never truncate the EDO pitch-class space.
     """
 
     meter_signatures = (
@@ -394,9 +398,14 @@ def build_default_vocabularies(style_config: StyleConfig | None = None) -> Vocab
     groove_families = (
         DEFAULT_GROOVE_FAMILIES if style_config is None else style_config.groove_families
     )
-    key_cardinality = 12 if style_config is None else style_config.key_vocabulary_size
-    chord_vocabulary_size = 48 if style_config is None else style_config.chord_vocabulary_size
-
+    if edo is None:
+        key_cardinality = 12 if style_config is None else style_config.key_vocabulary_size
+        chord_vocabulary_size = 48 if style_config is None else style_config.chord_vocabulary_size
+    else:
+        if not isinstance(edo, int) or isinstance(edo, bool) or edo < 1:
+            raise ValueError("edo must be a positive integer.")
+        key_cardinality = edo
+        chord_vocabulary_size = edo * len(CORE_CHORD_QUALITIES)
     meters = _build_meter_vocabulary(meter_signatures)
     beat_positions = _build_beat_position_vocabulary(
         max(token.beats_per_bar for token in meters)

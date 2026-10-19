@@ -66,6 +66,12 @@ class TestVocabularyIntegrity(unittest.TestCase):
 
 
 class TestStyleDrivenVocabularyBuild(unittest.TestCase):
+    def test_explicit_19_edo_covers_all_pitch_classes(self):
+        vocabs = build_default_vocabularies(StyleConfig(), edo=19)
+        self.assertEqual(tuple(token.root_pc for token in vocabs.keys), tuple(range(19)))
+        self.assertEqual({token.root_pc for token in vocabs.chords}, set(range(19)))
+        self.assertEqual(len(vocabs.chords), 19 * len(CORE_CHORD_QUALITIES))
+
     def test_build_vocabularies_uses_style_config_sizes_and_labels(self):
         style = StyleConfig(
             allowed_meters=("4/4", "9/8"),

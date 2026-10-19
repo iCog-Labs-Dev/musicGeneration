@@ -195,6 +195,11 @@ python3 -m aimusic.app.cli generate \
 
 Useful flags:
 
+- `--method a|b` selects start-to-end Method A or cyclic start-to-middle-to-start Method B.
+- `--loop-midpoint N` sets Method B's middle anchor (defaults to half of `--beats`).
+- `--section-names intro,theme,solo,return` enables section-wise Method A planning.
+- `--prior-mode null|neural` selects algorithmic scoring or an external neural prior.
+- `--neural-model-factory module:function` loads an external neural prior implementation.
 - `--sample-path` switches from MAP extraction to sampled bridge-path extraction.
 - `--drum-density`, `--bass-density`, `--comping-density`, and `--lead-density` control decode density.
 - `--edo`, `--pitch-bend-range`, and `--rendering-method` control MIDI rendering behavior.
@@ -366,7 +371,7 @@ musicGeneration/
 | `aimusic.scoring.rhythm_features` | Rhythm-related scoring helpers and compatibility layer over beat-state scoring. |
 | `aimusic.planning.candidates` | Candidate proposal and hard-gating logic for valid beat-level states. |
 | `aimusic.planning.graph` | Sparse layered-graph construction, layer expansion, edge building, and pruning. |
-| `aimusic.planning.plans` | Endpoint generation, section metadata, and orchestration for Method A and future Method B workflows. |
+| `aimusic.planning.plans` | Endpoint generation, section metadata, and orchestration for Method A and cyclic Method B workflows. |
 | `aimusic.planning.sb` | Schrödinger Bridge solver, bridge extraction, trajectory sampling, and MAP path extraction. |
 | `aimusic.render` | Rendering package for converting symbolic scores into output formats such as MIDI. |
 | `aimusic.render.midi_render` | MIDI generation and deterministic MIDI file export, kept separate from planning logic. |
@@ -384,14 +389,14 @@ The current implementation progress is tracked below.
 - [x] Implement GTTM feature energies and a simple rule-based tonal distance metric.
 - [x] Implement candidate generation and sparse graph building with pruning.
 - [x] Implement the Schrödinger Bridge solver on sparse edges using the NumPy backend.
-- [ ] Implement Method A plan, then Method B.
-- [ ] Implement decoder components for drums, bass, comping, and lead.
-- [ ] Implement MIDI rendering.
+- [x] Implement Method A and cyclic Method B plans.
+- [x] Implement decoder components for drums, bass, comping, and lead.
+- [x] Implement MIDI rendering.
   - [x] 12-EDO direct mapping implemented.
-  - [ ] 19-EDO MPE support pending.
-- [ ] Add the placeholder `NeuralPrior` seam and artifact contract.
-- [ ] Integrate the external neural prior implementation when available.
-- [ ] Add section-wise Schrödinger Bridge generation and richer diagnostics.
+  - [x] 19-EDO MPE support implemented.
+- [x] Add the placeholder `NeuralPrior` seam and artifact contract.
+- [x] Provide CLI integration for external neural priors through a model factory.
+- [x] Add section-wise Schrödinger Bridge generation and richer diagnostics.
 
 ---
 
@@ -445,7 +450,7 @@ The implementation now lives under the `aimusic/` package and is grouped by resp
 | `aimusic.scoring.rhythm_features`    | Compatibility facade over the GTTM beat-state scoring layer. |
 | `aimusic.planning.candidates`        | Hard gating and candidate proposal functions.                |
 | `aimusic.planning.graph`             | Layer expansion, sparse edge building, pruning.              |
-| `aimusic.planning.plans`             | Endpoint generation, section metadata, and Method A orchestration. |
+| `aimusic.planning.plans`             | Endpoint generation, section metadata, and Method A/Method B orchestration. |
 | `aimusic.planning.sb`                | Schrödinger bridge solver, bridge extraction, sampling, and MAP path extraction. |
 | `aimusic.decode`                     | BeatState path to multi-track symbolic Score decoding.       |
 | `aimusic.app.main`                   | Application / demo entrypoints.                              |

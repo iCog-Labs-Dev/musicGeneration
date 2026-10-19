@@ -108,7 +108,7 @@ class TestDiagnostics(unittest.TestCase):
         self.assertEqual(stats.iterations_run, 42)
         self.assertTrue(stats.converged)
         self.assertEqual(stats.final_max_delta, 1e-6)
-        self.assertEqual(stats.layer_sizes, [5, 10, 5])
+        self.assertEqual(stats.layer_sizes, (5, 10, 5))
         self.assertEqual(stats.pruned_nodes, 3) # 2 out + 1 in
 
         # Verify Shannon Entropy Math

@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -11,13 +12,29 @@ from aimusic.core.diagnostics import (
     StructuralDiagnostics,
     TimelineEvent,
 )
-from aimusic.core.config import DecodeConfig, EDOConfig, MicrotonalRendering, StyleConfig
+from aimusic.core.config import (
+    DecodeConfig,
+    EDOConfig,
+    MicrotonalRendering,
+    NeuralPriorConfig,
+    PlanConfig,
+    PlanMethod,
+    SectioningStrategy,
+    StyleConfig,
+)
 from aimusic.core.core_types import Score
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
-from aimusic.planning.plans import MethodARunConfig, run_method_a
+from aimusic.planning.plans import (
+    MethodARunConfig,
+    MethodBRunConfig,
+    run_method_a,
+    run_method_a_sectioned,
+    run_method_b,
+)
 from aimusic.render import render_midi
 from aimusic.render.midi_render import TrackInstrumentConfig
+from aimusic.scoring.priors import NullPrior, Prior, load_neural_prior
 from aimusic.theory.edo import EDO
 
 ROLE_TENSION = {
@@ -78,12 +95,12 @@ def _build_structural_diagnostics(path: tuple[Any, ...], vocabularies: Any) -> S
         for index, state in enumerate(decoded_states)
     ]
     return StructuralDiagnostics(
-        key_timeline=_segment_timeline(key_labels),
-        chord_timeline=_segment_timeline(chord_labels),
-        role_timeline=_segment_timeline(role_labels),
-        groove_timeline=_segment_timeline(groove_labels),
-        boundaries=boundaries,
-        tension_curve=tension_curve,
+        key_timeline=tuple(_segment_timeline(key_labels)),
+        chord_timeline=tuple(_segment_timeline(chord_labels)),
+        role_timeline=tuple(_segment_timeline(role_labels)),
+        groove_timeline=tuple(_segment_timeline(groove_labels)),
+        boundaries=tuple(boundaries),
+        tension_curve=tuple(tension_curve),
     )
 
 
@@ -125,8 +142,24 @@ def _build_track_instruments(args: argparse.Namespace) -> dict[str, TrackInstrum
     return instruments
 
 
+def _build_prior(args: argparse.Namespace) -> Prior:
+    if args.prior_mode == "null":
+        return NullPrior()
+    if args.prior_mode == "neural":
+        config = NeuralPriorConfig(manifest_path=args.prior_manifest)
+        model = None
+        if args.neural_model_factory:
+            module_name, separator, factory_name = args.neural_model_factory.partition(":")
+            if not separator or not module_name or not factory_name:
+                raise ValueError("--neural-model-factory must use module:function syntax.")
+            factory = getattr(importlib.import_module(module_name), factory_name)
+            model = factory()
+        return load_neural_prior(config, model=model)
+    raise ValueError(f"Unsupported prior mode: {args.prior_mode}")
+
+
 def handle_generate(args: argparse.Namespace) -> None:
-    """Run the current Method A pipeline and export score, MIDI, and manifest artifacts."""
+    """Run Method A or cyclic Method B and export score, MIDI, and diagnostics."""
     style_config = StyleConfig(
         allowed_meters=(args.meter,),
         groove_families=(args.groove_family,),
@@ -138,15 +171,65 @@ def handle_generate(args: argparse.Namespace) -> None:
         comping_density=args.comping_density,
         lead_density=args.lead_density,
     )
-    run_config = MethodARunConfig(
-        total_beats=args.beats,
-        seed=args.seed,
-        use_sampling=args.sample_path,
-        style_config=style_config,
-        decode_config=decode_config,
-        edo=args.edo,
-    )
-    plan_result = run_method_a(run_config)
+    prior = _build_prior(args)
+    if args.method == "b":
+        if args.section_names.strip():
+            raise ValueError("--section-names currently applies to Method A section-wise planning.")
+        midpoint = args.loop_midpoint if args.loop_midpoint is not None else args.beats // 2
+        run_config: MethodARunConfig | MethodBRunConfig = MethodBRunConfig(
+            total_beats=args.beats,
+            seed=args.seed,
+            use_sampling=args.sample_path,
+            style_config=style_config,
+            decode_config=decode_config,
+            plan_config=PlanConfig(method=PlanMethod.METHOD_B, loop_midpoint=midpoint),
+            edo=args.edo,
+        )
+        plan_result = run_method_b(run_config, prior=prior)
+        sb_stats = SBDiagnostics.from_solutions(
+            (plan_result.leg1.sb_solution, plan_result.leg2.sb_solution)
+        )
+        sb_legs = {
+            "start_to_middle": SBDiagnostics.from_solution(plan_result.leg1.sb_solution),
+            "middle_to_start": SBDiagnostics.from_solution(plan_result.leg2.sb_solution),
+        }
+    else:
+        if args.loop_midpoint is not None:
+            raise ValueError("--loop-midpoint is only valid with --method b.")
+        section_names = tuple(
+            name.strip() for name in args.section_names.split(",") if name.strip()
+        )
+        sectioning = (
+            SectioningStrategy.SECTION_WISE
+            if section_names
+            else SectioningStrategy.SINGLE_PASS
+        )
+        run_config = MethodARunConfig(
+            total_beats=args.beats,
+            seed=args.seed,
+            use_sampling=args.sample_path,
+            style_config=style_config,
+            decode_config=decode_config,
+            plan_config=PlanConfig(
+                method=PlanMethod.METHOD_A,
+                sectioning_strategy=sectioning,
+                section_names=section_names,
+            ),
+            edo=args.edo,
+        )
+        if sectioning is SectioningStrategy.SECTION_WISE:
+            plan_result = run_method_a_sectioned(run_config, prior=prior)
+            sb_stats = SBDiagnostics.from_solutions(
+                tuple(item.sb_solution for item in plan_result.section_results)
+            )
+            sb_legs = {
+                item.section.name: SBDiagnostics.from_solution(item.sb_solution)
+                for item in plan_result.section_results
+            }
+        else:
+            plan_result = run_method_a(run_config, prior=prior)
+            sb_stats = SBDiagnostics.from_solution(plan_result.sb_solution)
+            sb_legs = {}
     score = decode_path_to_score(
         plan_result.path,
         decode_config=decode_config,
@@ -165,10 +248,12 @@ def handle_generate(args: argparse.Namespace) -> None:
                 "tempo_bpm": args.tempo_bpm,
                 "output_dir": args.out,
                 "track_instruments": _build_track_instruments(args),
+                "prior_mode": args.prior_mode,
             }
         ),
         structural_stats=structural_stats,
-        sb_stats=SBDiagnostics.from_solution(plan_result.sb_solution),
+        sb_stats=sb_stats,
+        sb_legs=sb_legs,
     )
 
     out_dir = Path(args.out)
@@ -254,11 +339,41 @@ def main() -> None:
     gen_parser = subparsers.add_parser("generate", help="Generate a new score")
     gen_parser.add_argument("--seed", type=int, default=42)
     gen_parser.add_argument("--beats", type=int, default=8)
+    gen_parser.add_argument(
+        "--method",
+        choices=("a", "b"),
+        default="a",
+        help="Generation plan: a=start-to-end, b=start-to-middle-to-start.",
+    )
+    gen_parser.add_argument(
+        "--loop-midpoint",
+        type=int,
+        default=None,
+        help="Method B midpoint beat; defaults to half of --beats.",
+    )
     gen_parser.add_argument("--edo", type=int, default=12)
     gen_parser.add_argument("--meter", choices=DEFAULT_METER_SIGNATURES, default="4/4")
     gen_parser.add_argument("--groove-family", choices=DEFAULT_GROOVE_FAMILIES, default="straight")
     gen_parser.add_argument("--tempo-bpm", type=float, default=120.0)
     gen_parser.add_argument("--sample-path", action="store_true")
+    gen_parser.add_argument(
+        "--prior-mode",
+        choices=("null", "neural"),
+        default="null",
+    )
+    gen_parser.add_argument("--prior-manifest", type=str, default=None)
+    gen_parser.add_argument(
+        "--neural-model-factory",
+        type=str,
+        default=None,
+        help="External NeuralPriorModel factory in module:function form.",
+    )
+    gen_parser.add_argument(
+        "--section-names",
+        type=str,
+        default="",
+        help="Comma-separated Method A sections; enables section-wise SB.",
+    )
     gen_parser.add_argument("--subbeats-per-beat", type=int, default=4)
     gen_parser.add_argument("--drum-density", type=float, default=0.75)
     gen_parser.add_argument("--bass-density", type=float, default=0.60)

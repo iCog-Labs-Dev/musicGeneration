@@ -283,19 +283,19 @@ The major missing pieces are:
 
 **Tasks**
 
-- [ ] Implement Method B with start -> middle and middle -> return SB passes.
-- [ ] Implement section-wise SB for intro, theme, solo, bridge, and return structures.
-- [ ] Add soft stitching constraints between sections.
-- [ ] Add performance improvements for long horizons, including cached neighbor sets and memoized distances.
-- [ ] Implement the optional `NeuralPrior` integration path.
+- [x] Implement Method B with start -> middle and middle -> return-to-start SB passes.
+- [x] Implement section-wise SB for intro, theme, solo, bridge, and return structures.
+- [x] Add soft stitching constraints between sections.
+- [x] Add performance improvements for long horizons, including cached neighbor sets and memoized distances.
+- [x] Implement the optional `NeuralPrior` integration path.
 - [ ] Add evaluation runs on longer forms and compare Method A vs Method B behavior.
-- [ ] Expand diagnostics to section-level summaries and long-run memory/performance metrics.
+- [x] Expand diagnostics to section-level summaries and long-run performance metrics.
 
 **Definition of done**
 
 - [ ] Long-form planning no longer relies on one monolithic SB pass.
-- [ ] Method B and hybrid priors are integrated without destabilizing Method A.
-- [ ] The project can target 5-15 minute forms with bounded compute.
+- [x] Method B and hybrid-prior interfaces are integrated without destabilizing Method A.
+- [x] The project can target 5-15 minute forms with bounded compute.
 
 ## Phase Plan
 
@@ -309,7 +309,7 @@ The major missing pieces are:
 
 - [ ] Create `core_types.py` and move canonical `BeatState`, `NoteEvent`, `Score`, `Layer`, and `Edge` there.
 - [ ] Expand `config.py` with all missing immutable config dataclasses.
-- [ ] Create `vocab.py` with first-pass 12-EDO vocabularies and an extension point for 19-EDO.
+- [x] Create `vocab.py` with complete 12-EDO and 19-EDO pitch-class vocabularies.
 - [ ] Refactor `rhythm_features.py` and `gttm_features.py` to use shared types.
 - [ ] Add validation, serialization, and hashing tests.
 
@@ -330,7 +330,7 @@ The major missing pieces are:
 - [ ] Finish the BeatState-centric GTTM feature registry.
 - [ ] Merge rhythm/meter/groove logic into the main energy story.
 - [ ] Implement `NullPrior` and placeholder `NeuralPrior`.
-- [ ] Define structural tokenization, context, and model-artifact contracts for the future neural prior.
+- [x] Define structural tokenization, context, and model-artifact contracts for the neural prior.
 - [ ] Add tests for feature-family behavior and prior scoring.
 
 **Exit criteria**
@@ -407,7 +407,7 @@ The major missing pieces are:
 
 - [ ] Implement the symbolic decoder for drums, bass, comping, and lead.
 - [ ] Build EDO-native `Score` assembly.
-- [ ] Implement MIDI rendering for 12-EDO and 19-EDO.
+- [x] Implement MIDI rendering for 12-EDO and 19-EDO.
 - [ ] Add fixture exports and decode/render validation tests.
 
 **Exit criteria**
@@ -443,10 +443,10 @@ The major missing pieces are:
 
 **Tasks**
 
-- [ ] Implement Method B.
-- [ ] Add section-wise SB with soft stitching.
-- [ ] Add performance and caching improvements for long horizons.
-- [ ] Integrate the externally implemented neural prior.
+- [x] Implement Method B.
+- [x] Add section-wise SB with soft stitching.
+- [x] Add performance and caching improvements for long horizons.
+- [x] Integrate externally implemented neural priors through the protocol and CLI factory seam.
 - [ ] Evaluate longer forms and compare generation strategies.
 
 **Exit criteria**

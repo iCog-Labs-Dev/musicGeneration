@@ -3,7 +3,7 @@ import time
 import uuid
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 @dataclass(frozen=True)
 class TimelineEvent:
@@ -11,14 +11,24 @@ class TimelineEvent:
     end_time: float
     label: str
 
-@dataclass
+@dataclass(frozen=True)
 class StructuralDiagnostics:
-    key_timeline: List[TimelineEvent] = field(default_factory=list)
-    chord_timeline: List[TimelineEvent] = field(default_factory=list)
-    role_timeline: List[TimelineEvent] = field(default_factory=list)
-    groove_timeline: List[TimelineEvent] = field(default_factory=list)
-    boundaries: List[float] = field(default_factory=list)
-    tension_curve: List[Tuple[float, float]] = field(default_factory=list)
+    key_timeline: Tuple[TimelineEvent, ...] = ()
+    chord_timeline: Tuple[TimelineEvent, ...] = ()
+    role_timeline: Tuple[TimelineEvent, ...] = ()
+    groove_timeline: Tuple[TimelineEvent, ...] = ()
+    boundaries: Tuple[float, ...] = ()
+    tension_curve: Tuple[Tuple[float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("key_timeline", "chord_timeline", "role_timeline", "groove_timeline"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        object.__setattr__(self, "boundaries", tuple(float(x) for x in self.boundaries))
+        object.__setattr__(
+            self,
+            "tension_curve",
+            tuple((float(t), float(v)) for t, v in self.tension_curve),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -26,17 +36,17 @@ class StructuralDiagnostics:
             "chord_timeline": [dataclasses.asdict(e) for e in self.chord_timeline],
             "role_timeline": [dataclasses.asdict(e) for e in self.role_timeline],
             "groove_timeline": [dataclasses.asdict(e) for e in self.groove_timeline],
-            "boundaries": self.boundaries,
-            "tension_curve": self.tension_curve
+            "boundaries": list(self.boundaries),
+            "tension_curve": [list(item) for item in self.tension_curve]
         }
 
-@dataclass
+@dataclass(frozen=True)
 class SBDiagnostics:
     """Logs the mathematical health and convergence of the Schrödinger Bridge solver."""
     iterations_run: int = 0
     converged: bool = False
     final_max_delta: float = 0.0
-    layer_sizes: List[int] = field(default_factory=list)
+    layer_sizes: Tuple[int, ...] = ()
     pruned_nodes: int = 0
     effective_entropy: float = 0.0
 
@@ -65,13 +75,37 @@ class SBDiagnostics:
             iterations_run=trace.iterations,
             converged=trace.converged,
             final_max_delta=trace.final_max_delta,
-            layer_sizes=list(problem_diags.layer_sizes),
+            layer_sizes=tuple(problem_diags.layer_sizes),
             pruned_nodes=pruned,
             effective_entropy=entropy
         )
 
+    @classmethod
+    def from_solutions(cls, solutions: Sequence[Any]) -> "SBDiagnostics":
+        """Aggregate diagnostics from the two (or more) bridges in one plan."""
+        items = [cls.from_solution(solution) for solution in solutions]
+        if not items:
+            return cls()
+        total_weight = sum(max(1, len(item.layer_sizes)) for item in items)
+        return cls(
+            iterations_run=sum(item.iterations_run for item in items),
+            converged=all(item.converged for item in items),
+            final_max_delta=max(item.final_max_delta for item in items),
+            layer_sizes=tuple(
+                size
+                for index, item in enumerate(items)
+                for size in (item.layer_sizes if index == 0 else item.layer_sizes[1:])
+            ),
+            pruned_nodes=sum(item.pruned_nodes for item in items),
+            effective_entropy=sum(
+                item.effective_entropy * max(1, len(item.layer_sizes)) for item in items
+            ) / total_weight,
+        )
+
     def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
+        data = dataclasses.asdict(self)
+        data["layer_sizes"] = list(self.layer_sizes)
+        return data
 
 @dataclass(frozen=True)
 class RunManifest:
@@ -80,6 +114,7 @@ class RunManifest:
     config_dump: Dict[str, Any]
     structural_stats: StructuralDiagnostics = field(default_factory=StructuralDiagnostics)
     sb_stats: SBDiagnostics = field(default_factory=SBDiagnostics)
+    sb_legs: Dict[str, SBDiagnostics] = field(default_factory=dict)
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: float = field(default_factory=time.time)
     version: str = "0.1.0"
@@ -93,7 +128,8 @@ class RunManifest:
             "seed": self.seed,
             "config": self.config_dump,
             "structure": self.structural_stats.to_dict(),
-            "sb_stats": self.sb_stats.to_dict()
+            "sb_stats": self.sb_stats.to_dict(),
+            "sb_legs": {name: stats.to_dict() for name, stats in self.sb_legs.items()},
         }
 
 def compute_tension_curve(role_timeline: List[TimelineEvent]) -> List[Tuple[float, float]]:
