@@ -32,13 +32,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypeGuard
 
-from aimusic.evaluation.config import expand_matrix, load_config, select_specs
+from aimusic.evaluation.config import CONDITIONS, BenchmarkConfig, expand_matrix, load_config, select_specs
 from aimusic.evaluation.report import CONDITION_ORDER
 from aimusic.evaluation.schema import (
     STATUS_CRASHED,
     STATUS_FAILED,
     STATUS_OK,
     STATUS_TIMEOUT,
+    RunSpec,
 )
 from aimusic.evaluation.stats import aggregate
 
@@ -1138,6 +1139,352 @@ def run_tension_figure(result: Optional[Mapping[str, Any]]) -> Any:
 
 
 # --------------------------------------------------------------------------------------
+# Config metadata, filter choices and validation (pure: no Gradio, no benchmark execution)
+# --------------------------------------------------------------------------------------
+TYPE_SMOKE = "SMOKE"
+TYPE_PROFILE = "PROFILE"
+TYPE_BENCHMARK = "BENCHMARK"
+BENCHMARK_TYPE_TITLES = {
+    TYPE_SMOKE: "Smoke test",
+    TYPE_PROFILE: "Scaling/profile test",
+    TYPE_BENCHMARK: "Main benchmark",
+}
+BENCHMARK_TYPE_COLORS = {TYPE_SMOKE: "#c98500", TYPE_PROFILE: "#6250d6", TYPE_BENCHMARK: "#2a78d6"}
+
+# One central place for condition explanations.  A config may override or extend these with an
+# optional ``"condition_descriptions": {name: text}`` object (config.raw is the source of truth);
+# conditions with neither fall back to a description derived from ``config.CONDITIONS``.
+CONDITION_DESCRIPTIONS: Dict[str, str] = {
+    "full": "Normal configuration using GTTM, the configured prior, and SB.",
+    "no_gttm": "Disables GTTM scoring while preserving legality constraints.",
+    "no_prior": "Uses NullPrior to measure the contribution of the prior.",
+    "no_sb": "Uses the uniform reachable-walk baseline instead of SB reweighting.",
+    "trained_prior": (
+        "Uses a trained neural prior; reports an explicit prior_unavailable result "
+        "if no trained bundle can be loaded."
+    ),
+}
+
+TERM_HELP: Dict[str, str] = {
+    "Horizon": (
+        "Number of beats generated. Larger horizons test longer music but require more time and memory."
+    ),
+    "EDO": (
+        "Equal Divisions of the Octave. 12-EDO is standard semitone tuning; 19-EDO divides the octave "
+        "into 19 pitch steps. It is the pitch-space resolution used throughout graph construction, "
+        "scoring, decoding, and rendering."
+    ),
+    "Seed": "Random starting value used to reproduce a run or compare repeated runs.",
+    "Condition": "A system variant used to measure the contribution of a component.",
+    "Workers": (
+        "Number of benchmark subprocesses running in parallel. More workers may reduce wall time "
+        "but use more CPU and memory."
+    ),
+    "Proposal budget": "Number of candidate transitions considered before final graph retention.",
+    "K_max": "Maximum graph/layer state limit.",
+    "D_max": "Maximum number of outgoing edges retained per state.",
+    "SB": "Schrödinger Bridge path-reweighting/inference stage.",
+}
+
+
+def benchmark_type(config: BenchmarkConfig) -> str:
+    """``SMOKE`` | ``PROFILE`` | ``BENCHMARK`` for a config.
+
+    An explicit ``"benchmark_type"`` key in the config wins.  Otherwise the type is inferred from
+    the config name, then the description.  (The shipped configs deliberately carry no such key:
+    adding one would change their ``config_hash`` and orphan existing output directories.)
+    """
+    explicit = str(config.raw.get("benchmark_type", "")).strip().upper()
+    if explicit in BENCHMARK_TYPE_TITLES:
+        return explicit
+    name = config.name.lower()
+    if "smoke" in name:
+        return TYPE_SMOKE
+    if "profile" in name:
+        return TYPE_PROFILE
+    desc = config.description.lower()
+    if "smoke" in desc:
+        return TYPE_SMOKE
+    if "scaling probe" in desc or "profile" in desc:
+        return TYPE_PROFILE
+    return TYPE_BENCHMARK
+
+
+def condition_description(condition: str, overrides: Optional[Mapping[str, str]] = None) -> str:
+    """Human explanation of a condition (config override > central mapping > derived from CONDITIONS)."""
+    if overrides and condition in overrides:
+        return str(overrides[condition])
+    if condition in CONDITION_DESCRIPTIONS:
+        return CONDITION_DESCRIPTIONS[condition]
+    cdef = CONDITIONS.get(condition)
+    if cdef is not None:
+        return f"Variant of the full system that changes: {cdef.factor}."
+    return "No description is defined for this condition."
+
+
+@dataclass(frozen=True)
+class FilterChoices:
+    """The values a config actually contains, per filterable axis."""
+
+    conditions: Tuple[str, ...] = ()
+    horizons: Tuple[int, ...] = ()
+    edos: Tuple[int, ...] = ()
+    seeds: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class FilterSelection:
+    """What the user ticked.  An empty axis means "use all values available in this config"."""
+
+    conditions: Tuple[str, ...] = ()
+    horizons: Tuple[int, ...] = ()
+    edos: Tuple[int, ...] = ()
+    seeds: Tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConfigMetadata:
+    file_name: str
+    name: str
+    version: str
+    description: str
+    benchmark_type: str
+    horizons: Tuple[int, ...]
+    edos: Tuple[int, ...]
+    seeds: Tuple[int, ...]
+    conditions: Tuple[str, ...]
+    path_modes: Tuple[str, ...]
+    k_max: Tuple[int, ...]
+    d_max: Tuple[int, ...]
+    proposal_budget: Tuple[int, ...]
+    sb_max_iterations: int
+    sb_tolerance: float
+    sb_temperature: float
+    timeout_s: float
+    expected_runs: int
+    condition_descriptions: Dict[str, str]
+
+
+def _unique(values: Sequence[Any]) -> Tuple[Any, ...]:
+    return tuple(dict.fromkeys(values))
+
+
+def available_filter_choices(config: BenchmarkConfig) -> FilterChoices:
+    return FilterChoices(
+        conditions=tuple(config.conditions), horizons=tuple(config.horizons),
+        edos=tuple(config.edos), seeds=tuple(config.seeds),
+    )
+
+
+def config_metadata(config: BenchmarkConfig, file_name: str = "") -> ConfigMetadata:
+    """Describe a parsed config.  Every value comes from the config; ``expected_runs`` from ``expand_matrix``."""
+    raw_desc = config.raw.get("condition_descriptions")
+    overrides = {str(k): str(v) for k, v in raw_desc.items()} if isinstance(raw_desc, Mapping) else {}
+    return ConfigMetadata(
+        file_name=file_name or f"{config.name}.json",
+        name=config.name,
+        version=config.config_version,
+        description=config.description,
+        benchmark_type=benchmark_type(config),
+        horizons=tuple(config.horizons),
+        edos=tuple(config.edos),
+        seeds=tuple(config.seeds),
+        conditions=tuple(config.conditions),
+        path_modes=tuple(config.path_modes),
+        k_max=_unique([p.k_max for p in config.graph_grid]),
+        d_max=_unique([p.d_max for p in config.graph_grid]),
+        proposal_budget=_unique([p.proposal_budget for p in config.graph_grid]),
+        sb_max_iterations=config.max_iterations,
+        sb_tolerance=config.tolerance,
+        sb_temperature=config.temperature,
+        timeout_s=config.timeout_s,
+        expected_runs=len(expand_matrix(config)),
+        condition_descriptions={c: condition_description(c, overrides) for c in config.conditions},
+    )
+
+
+def _load_named_config(config_name: str) -> BenchmarkConfig:
+    if not (config_name or "").strip():
+        raise PreflightError("Choose a benchmark config.")
+    path = config_path_for(config_name)
+    try:
+        return load_config(path)
+    except (OSError, ValueError) as exc:
+        raise PreflightError(f"Cannot load benchmark config {path.name}: {exc}") from exc
+
+
+def load_config_metadata(config_name: str) -> ConfigMetadata:
+    """Metadata for a config file name (inside ``config/benchmarks``) or path.  Raises :class:`PreflightError`."""
+    return config_metadata(_load_named_config(config_name), Path(config_name).name)
+
+
+def config_dropdown_choices(config_dir: Path = CONFIG_DIR) -> List[Tuple[str, str]]:
+    """``(label, value)`` pairs for the config dropdown, e.g. ``("[SMOKE] m1_smoke.json", "m1_smoke.json")``."""
+    out: List[Tuple[str, str]] = []
+    for name in discover_benchmark_configs(config_dir):
+        try:
+            label = f"[{benchmark_type(load_config(config_dir / name))}] {name}"
+        except (OSError, ValueError):
+            label = f"[?] {name}"  # still selectable; the panel then shows why it cannot load
+        out.append((label, name))
+    return out
+
+
+def keep_valid_selection(choices: FilterChoices, selection: FilterSelection) -> FilterSelection:
+    """Drop selected values that the config does not contain (used when the config changes)."""
+    return FilterSelection(
+        conditions=tuple(v for v in selection.conditions if v in choices.conditions),
+        horizons=tuple(v for v in selection.horizons if v in choices.horizons),
+        edos=tuple(v for v in selection.edos if v in choices.edos),
+        seeds=tuple(v for v in selection.seeds if v in choices.seeds),
+    )
+
+
+@dataclass(frozen=True)
+class ConfigSwitch:
+    metadata: ConfigMetadata
+    choices: FilterChoices
+    selection: FilterSelection  # the previous selection, minus values the new config lacks
+
+
+def switch_config(config_name: str, current: FilterSelection = FilterSelection()) -> ConfigSwitch:
+    """Everything the page must update when the config dropdown changes."""
+    config = _load_named_config(config_name)
+    choices = available_filter_choices(config)
+    return ConfigSwitch(
+        config_metadata(config, Path(config_name).name), choices, keep_valid_selection(choices, current)
+    )
+
+
+def _selected_specs(
+    config: BenchmarkConfig, conditions: Sequence[str], horizons: Sequence[int],
+    edos: Sequence[int], seeds: Sequence[int],
+) -> List[RunSpec]:
+    # The one place the UI turns filters into runs: the same expand_matrix/select_specs the CLI uses.
+    return select_specs(
+        expand_matrix(config), conditions=conditions or None, horizons=horizons or None,
+        edos=edos or None, seeds=seeds or None,
+    )
+
+
+def selected_run_count(
+    config: BenchmarkConfig, conditions: Sequence[str], horizons: Sequence[int],
+    edos: Sequence[int], seeds: Sequence[int],
+) -> int:
+    """Exact number of runs the CLI would select for these filters (empty filter = all values)."""
+    return len(_selected_specs(config, conditions, horizons, edos, seeds))
+
+
+NO_RUNS_MESSAGE = "No runs selected."
+
+
+def validate_filter_selection(
+    config: BenchmarkConfig, conditions: Sequence[str], horizons: Sequence[int],
+    edos: Sequence[int], seeds: Sequence[int],
+) -> List[str]:
+    """Problems with a filter selection (empty list = valid).  Never raises."""
+    choices = available_filter_choices(config)
+    problems: List[str] = []
+    for label, picked, valid in (
+        ("Conditions", conditions, choices.conditions), ("Horizons", horizons, choices.horizons),
+        ("EDO values", edos, choices.edos), ("Seeds", seeds, choices.seeds),
+    ):
+        bad = [v for v in picked if v not in valid]
+        if bad:
+            problems.append(f"{label} not available in this config: {', '.join(map(str, bad))}.")
+    if not problems and selected_run_count(config, conditions, horizons, edos, seeds) == 0:
+        problems.append(NO_RUNS_MESSAGE)
+    return problems
+
+
+def describe_valid_values(config: BenchmarkConfig, config_label: str) -> str:
+    c = available_filter_choices(config)
+    join = lambda values: ", ".join(map(str, values))  # noqa: E731
+    return (
+        f"{config_label} supports:\n"
+        f"- Horizons: {join(c.horizons)}\n"
+        f"- Seeds: {join(c.seeds)}\n"
+        f"- EDO: {join(c.edos)}\n"
+        f"- Conditions: {join(c.conditions)}"
+    )
+
+
+def format_validation_error(config: BenchmarkConfig, config_label: str, problems: Sequence[str]) -> str:
+    """The message shown to the user: what is wrong, which config, and what is valid."""
+    if list(problems) == [NO_RUNS_MESSAGE]:
+        head = NO_RUNS_MESSAGE
+    else:
+        head = f"Invalid selection for {config_label}:\n" + "\n".join(f"- {p}" for p in problems)
+    return (
+        f"{head}\n\n{describe_valid_values(config, config_label)}\n\n"
+        "Choose valid values or clear the filters to use all values."
+    )
+
+
+
+def _term(label: str, key: str) -> str:
+    """Label with a hover tooltip carrying the TERM_HELP text."""
+    return f'<abbr title="{html.escape(TERM_HELP[key], quote=True)}" style="cursor:help">{html.escape(label)}</abbr>'
+
+
+def render_config_panel(meta: Optional[ConfigMetadata], error: str = "") -> str:
+    """HTML for the "Benchmark Configuration" panel.  Theme-agnostic, like the overview cards."""
+    css = (
+        "<style>.bcp{border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:12px 14px}"
+        ".bcp .h{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:1.05rem}"
+        ".bcp .badge{font-size:.72rem;font-weight:700;letter-spacing:.04em;color:#fff;border-radius:6px;padding:2px 8px}"
+        ".bcp .d{margin:6px 0 10px;opacity:.85}"
+        ".bcp dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:0}"
+        ".bcp dt{opacity:.7}.bcp dd{margin:0}"
+        ".bcp ul{margin:2px 0 0;padding-left:18px}"
+        ".bcp abbr{text-decoration:underline dotted}</style>"
+    )
+    title = '<div style="font-weight:650;margin-bottom:6px">Benchmark Configuration</div>'
+    if meta is None:
+        return css + f'<div class="bcp">{title}<div class="d">{html.escape(error or "No benchmark config selected.")}</div></div>'
+
+    def vals(values: Sequence[Any], unit: str = "") -> str:
+        return html.escape(", ".join(map(str, values)) + (f" {unit}" if unit else ""))
+
+    badge = (
+        f'<span class="badge" style="background:{BENCHMARK_TYPE_COLORS[meta.benchmark_type]}">{meta.benchmark_type}</span>'
+    )
+    conds = "".join(
+        f"<li><code>{html.escape(c)}</code>: {html.escape(meta.condition_descriptions[c])}</li>" for c in meta.conditions
+    )
+    rows = [
+        ("Type", f"{html.escape(BENCHMARK_TYPE_TITLES[meta.benchmark_type])}"),
+        ("Config version", html.escape(meta.version)),
+        (_term("Horizons", "Horizon"), vals(meta.horizons, "beats")),
+        (_term("EDO", "EDO"), vals(meta.edos)),
+        (_term("Seeds", "Seed"), vals(meta.seeds)),
+        (_term("Conditions", "Condition"), f"<ul>{conds}</ul>"),
+        ("Path modes", vals(meta.path_modes)),
+        (_term("K_max", "K_max"), vals(meta.k_max)),
+        (_term("D_max", "D_max"), vals(meta.d_max)),
+        (_term("Proposal budget", "Proposal budget"), vals(meta.proposal_budget)),
+        (
+            _term("SB settings", "SB"),
+            html.escape(
+                f"max iterations {meta.sb_max_iterations}, tolerance {meta.sb_tolerance:g}, "
+                f"temperature {meta.sb_temperature:g}"
+            ),
+        ),
+        ("Timeout", html.escape(f"{meta.timeout_s:g} s per run")),
+        ("Expected total runs", f"<b>{meta.expected_runs}</b>"),
+    ]
+    body = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+    return (
+        css + f'<div class="bcp">{title}<div class="h">{badge}<b>{html.escape(meta.file_name)}</b></div>'
+        f'<div class="d"><b>Purpose:</b> {html.escape(meta.description or "(no description)")}</div><dl>{body}</dl></div>'
+    )
+
+
+def render_terminology_markdown() -> str:
+    return "\n".join(f"- **{term}**: {text}" for term, text in TERM_HELP.items())
+
+
+# --------------------------------------------------------------------------------------
 # Running benchmarks through the existing CLI
 # --------------------------------------------------------------------------------------
 class PreflightError(ValueError):
@@ -1204,13 +1551,9 @@ def preflight(action: str, request: BenchmarkRequest) -> None:
         config = load_config(cfg_path)
     except (OSError, ValueError) as exc:
         raise PreflightError(f"Cannot load benchmark config {cfg_path.name}: {exc}") from exc
-    specs = expand_matrix(config)
-    selected = select_specs(
-        specs, conditions=request.conditions or None, horizons=request.horizons or None,
-        edos=request.edos or None, seeds=request.seeds or None,
-    )
-    if not selected:
-        raise PreflightError("The condition/horizon/EDO/seed filters select no runs for this config.")
+    problems = validate_filter_selection(config, request.conditions, request.horizons, request.edos, request.seeds)
+    if problems:
+        raise PreflightError(format_validation_error(config, cfg_path.name, problems))
     manifest = _read_json(out / "manifest.json")
     if manifest is not None and manifest.get("config_hash") != config.config_hash and action != "list":
         raise PreflightError(
@@ -1219,6 +1562,202 @@ def preflight(action: str, request: BenchmarkRequest) -> None:
         )
     if action == "resume" and manifest is None:
         raise PreflightError(f"Nothing to resume: {out} has no manifest.json. Use Run Benchmark instead.")
+
+
+# --------------------------------------------------------------------------------------
+# Run plan: what Run / Resume would do with the current selection (pure; never raises)
+# --------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class OutputDirState:
+    has_manifest: bool
+    foreign_config: Optional[str]  # config name stored in the directory when it differs from this one
+    finished: int  # selected runs that already have a result and would be skipped
+    finished_not_ok: int  # ...of which did not finish with status "ok"
+    pending: int  # selected runs that would be executed
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    config_label: str
+    metadata: Optional[ConfigMetadata]
+    errors: Tuple[str, ...]
+    selected_runs: int
+    matrix_text: str
+    out_dir: str
+    output_state: Optional[OutputDirState]
+    action_text: str
+    estimated_runtime_s: Optional[float]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _count(n: int, singular: str, plural: Optional[str] = None) -> str:
+    return f"{n} {singular if n == 1 else (plural or singular + 's')}"
+
+
+def matrix_text(config: BenchmarkConfig, selection: FilterSelection, selected_runs: int) -> str:
+    """``2 conditions × 1 horizon × 2 seeds × 1 EDO = 4 runs`` from the effective (empty = all) selection."""
+    choices = available_filter_choices(config)
+    n_cond = len(selection.conditions or choices.conditions)
+    n_hor = len(selection.horizons or choices.horizons)
+    n_seed = len(selection.seeds or choices.seeds)
+    n_edo = len(selection.edos or choices.edos)
+    factors = [
+        _count(n_cond, "condition"), _count(n_hor, "horizon"), _count(n_seed, "seed"), _count(n_edo, "EDO", "EDO"),
+    ]
+    product = n_cond * n_hor * n_seed * n_edo
+    if len(config.path_modes) > 1:
+        factors.append(_count(len(config.path_modes), "path mode"))
+        product *= len(config.path_modes)
+    if len(config.graph_grid) > 1:
+        factors.append(_count(len(config.graph_grid), "graph setting"))
+        product *= len(config.graph_grid)
+    text = f"{' × '.join(factors)} = {_count(selected_runs, 'run')}"
+    if product != selected_runs:
+        text += " (combinations the config does not define are skipped)"
+    return text
+
+
+def _finished_wall_times(out: Path) -> Dict[Tuple[int, int], List[float]]:
+    """Wall times of finished-ok runs already in ``out``, keyed by (horizon, edo)."""
+    walls: Dict[Tuple[int, int], List[float]] = {}
+    runs = out / "runs"
+    if not runs.is_dir():
+        return walls
+    for path in runs.glob("*.json"):
+        if path.name.startswith("."):
+            continue
+        res = _read_json(path)
+        if not res or res.get("status") != STATUS_OK:
+            continue
+        spec, wall = res.get("spec") or {}, (res.get("runtime") or {}).get("wall_s")
+        if _finite(wall) and isinstance(spec.get("horizon"), int) and isinstance(spec.get("edo"), int):
+            walls.setdefault((spec["horizon"], spec["edo"]), []).append(float(wall))
+    return walls
+
+
+def estimate_runtime_s(pending: Sequence[RunSpec], out: Path, workers: int) -> Optional[float]:
+    """Rough wall time for ``pending`` from finished runs with the same horizon and EDO in ``out``.
+
+    ``None`` unless every pending run has such a reference: no guess is made from other horizons.
+    """
+    if not pending:
+        return 0.0
+    walls = _finished_wall_times(out)
+    total = 0.0
+    for spec in pending:
+        ref = walls.get((spec.horizon, spec.edo))
+        if not ref:
+            return None
+        total += sum(ref) / len(ref)
+    return total / max(1, workers)
+
+
+def inspect_output_dir(
+    config: BenchmarkConfig, specs: Sequence[RunSpec], out: Path, retry_failed: bool
+) -> Tuple[OutputDirState, List[RunSpec]]:
+    """State of ``out`` for these specs, plus the specs a Run/Resume would actually execute."""
+    manifest = _read_json(out / "manifest.json")
+    foreign = None
+    if manifest is not None and manifest.get("config_hash") != config.config_hash:
+        foreign = str(manifest.get("config_name"))
+    pending: List[RunSpec] = []
+    finished = finished_bad = 0
+    for spec in specs:
+        prior = _read_json(out / "runs" / f"{spec.run_id}.json")
+        # Same skip rule as matrix.run_matrix: a result is final unless it failed and --retry-failed is set.
+        if prior is not None and (prior.get("status") == STATUS_OK or not retry_failed):
+            finished += 1
+            finished_bad += prior.get("status") != STATUS_OK
+        else:
+            pending.append(spec)
+    return OutputDirState(manifest is not None, foreign, finished, finished_bad, len(pending)), pending
+
+
+def _action_text(state: OutputDirState, total: int, retry_failed: bool) -> str:
+    if state.foreign_config is not None:
+        return "Blocked: the output directory holds results for a different config."
+    if state.finished == 0:
+        return f"Start new runs: {_count(total, 'run')} will be executed."
+    if state.pending == 0:
+        text = f"Nothing to run: all {_count(total, 'selected run')} already finished and will be skipped."
+    else:
+        text = (
+            f"Resume: {state.finished} already finished will be skipped, "
+            f"{_count(state.pending, 'run')} will be executed."
+        )
+    if state.finished_not_ok and not retry_failed:
+        text += f" {state.finished_not_ok} of the finished runs did not succeed; tick “Retry failed runs” to re-run them."
+    return text
+
+
+def plan_run(request: BenchmarkRequest) -> RunPlan:
+    """Preview of a Run / Resume for the current form values.  Problems are reported, never raised."""
+    label = Path(request.config).name if request.config else "(no config)"
+    errors: List[str] = []
+    try:
+        out: Optional[Path] = resolve_out_dir(request.out_dir)
+    except PreflightError as exc:
+        out = None
+        errors.append(str(exc))
+    out_text = str(out) if out is not None else "-"
+    try:
+        config = _load_named_config(request.config)
+    except PreflightError as exc:
+        return RunPlan(label, None, tuple(errors + [str(exc)]), 0, "", out_text, None, "", None)
+    metadata = config_metadata(config, label)
+    selection = FilterSelection(request.conditions, request.horizons, request.edos, request.seeds)
+    problems = validate_filter_selection(config, request.conditions, request.horizons, request.edos, request.seeds)
+    if problems:
+        errors.append(format_validation_error(config, label, problems))
+        return RunPlan(label, metadata, tuple(errors), 0, "", out_text, None, "", None)
+    specs = _selected_specs(config, request.conditions, request.horizons, request.edos, request.seeds)
+    text = matrix_text(config, selection, len(specs))
+    if out is None:
+        return RunPlan(label, metadata, tuple(errors), len(specs), text, out_text, None, "", None)
+    state, pending = inspect_output_dir(config, specs, out, request.retry_failed)
+    estimate: Optional[float] = None
+    if state.foreign_config is None:
+        estimate = estimate_runtime_s(pending, out, request.workers)
+    else:
+        errors.append(
+            f"{out} already holds results for a different config ({state.foreign_config!r}). "
+            "Pick another output directory; existing results are never overwritten."
+        )
+    return RunPlan(
+        label, metadata, tuple(errors), len(specs), text, out_text, state,
+        _action_text(state, len(specs), request.retry_failed), estimate,
+    )
+
+
+def render_run_preview(plan: RunPlan) -> str:
+    """Markdown shown under the filters: the exact matrix, the directory state and what Run would do."""
+    blocks: List[str] = []
+    for err in plan.errors:
+        blocks.append("\n".join(f"> {line}" if line else ">" for line in ("**⚠ Cannot start**", "", *err.splitlines())))
+    if plan.selected_runs and plan.matrix_text:
+        blocks.append(f"**Selected runs:** {plan.matrix_text}")
+    state = plan.output_state
+    if state is not None:
+        if state.pending == 0 and state.foreign_config is None:
+            est = "none (nothing to execute)"
+        elif plan.estimated_runtime_s is None:
+            est = "not available yet (needs finished runs with the same horizon and EDO in this directory)"
+        else:
+            est = f"about {_fmt_duration(plan.estimated_runtime_s)} (rough, from finished runs in this directory)"
+        existing = (
+            f"{state.finished} of {plan.selected_runs} selected runs already finished"
+            if state.has_manifest or state.finished else "new or empty"
+        )
+        blocks.append(
+            f"- **Output directory:** `{plan.out_dir}`\n"
+            f"- **Directory state:** {existing}\n"
+            f"- **This will:** {plan.action_text}\n"
+            f"- **Estimated runtime:** {est}"
+        )
+    return "\n\n".join(blocks) if blocks else "_Choose a benchmark config._"
 
 
 class BenchmarkJob:
@@ -1419,6 +1958,17 @@ def build_evaluation_page(demo: Any = None) -> None:
 
     configs = discover_benchmark_configs()
     default_config = "m1_smoke.json" if "m1_smoke.json" in configs else (configs[0] if configs else None)
+    try:
+        first = switch_config(default_config) if default_config else None
+    except PreflightError:
+        first = None
+    first_choices = first.choices if first else FilterChoices()
+
+    def _hz(values: Sequence[int]) -> List[Tuple[str, int]]:
+        return [(f"{v} beats", v) for v in values]
+
+    def _edo(values: Sequence[int]) -> List[Tuple[str, int]]:
+        return [(f"{v}-EDO", v) for v in values]
 
     gr.Markdown(
         "## Evaluation dashboard\n"
@@ -1427,19 +1977,35 @@ def build_evaluation_page(demo: Any = None) -> None:
     )
     with gr.Group():
         with gr.Row():
-            config_dd = gr.Dropdown(label="Benchmark config", choices=configs, value=default_config, scale=2)
+            config_dd = gr.Dropdown(
+                label="Benchmark config", choices=config_dropdown_choices(), value=default_config, scale=2,
+                info="SMOKE = quick development check, PROFILE = scaling probe, BENCHMARK = main result matrix.",
+            )
             out_dir_tb = gr.Textbox(
                 label="Output directory",
                 value=str((DEFAULT_OUT_ROOT / (Path(default_config).stem if default_config else "run")).relative_to(REPO_ROOT)),
                 info="Relative paths are resolved from the repository root.", scale=3,
             )
-            workers_num = gr.Number(label="Workers", value=1, precision=0, minimum=1, scale=1)
+            workers_num = gr.Number(label="Workers", value=1, precision=0, minimum=1, scale=1, info=TERM_HELP["Workers"])
+        config_panel = gr.HTML(render_config_panel(first.metadata if first else None))
         with gr.Row():
-            conditions_cb = gr.CheckboxGroup(label="Conditions (none = all)", choices=list(CONDITION_ORDER), value=[])
-            horizons_tb = gr.Textbox(label="Horizons (none = all)", placeholder="e.g. 8 12")
-            edos_tb = gr.Textbox(label="EDOs (none = all)", placeholder="e.g. 12 19")
-            seeds_tb = gr.Textbox(label="Seeds (none = all)", placeholder="e.g. 0 1 2")
-            retry_cb = gr.Checkbox(label="Retry failed runs", value=False)
+            conditions_cb = gr.CheckboxGroup(
+                label="Conditions (none = all in this config)", choices=list(first_choices.conditions), value=[],
+                info=TERM_HELP["Condition"],
+            )
+            horizons_cb = gr.CheckboxGroup(
+                label="Horizons (none = all)", choices=_hz(first_choices.horizons), value=[], info=TERM_HELP["Horizon"]
+            )
+            edos_cb = gr.CheckboxGroup(
+                label="EDO (none = all)", choices=_edo(first_choices.edos), value=[], info=TERM_HELP["EDO"]
+            )
+            seeds_cb = gr.CheckboxGroup(
+                label="Seeds (none = all)", choices=list(first_choices.seeds), value=[], info=TERM_HELP["Seed"]
+            )
+        retry_cb = gr.Checkbox(label="Retry failed runs", value=False)
+        preview_md = gr.Markdown(
+            render_run_preview(plan_run(BenchmarkRequest(default_config or "", out_dir_tb.value)))  # type: ignore[arg-type]
+        )
         with gr.Row():
             list_btn = gr.Button("List Runs")
             run_btn = gr.Button("Run Benchmark", variant="primary")
@@ -1447,6 +2013,8 @@ def build_evaluation_page(demo: Any = None) -> None:
             stop_btn = gr.Button("Stop", variant="stop")
             report_btn = gr.Button("Generate Report")
             load_btn = gr.Button("Load Existing Results")
+    with gr.Accordion("Terminology: what the benchmark settings mean", open=False):
+        gr.Markdown(render_terminology_markdown())
     status_md = gr.Markdown("Idle.")
     cards = gr.HTML(render_overview_cards(None))
     notes_md = gr.Markdown(visible=False)
@@ -1487,8 +2055,8 @@ def build_evaluation_page(demo: Any = None) -> None:
     def _request(config, out_dir, workers, conditions, horizons, edos, seeds, retry) -> BenchmarkRequest:
         return BenchmarkRequest(
             config=config or "", out_dir=out_dir, workers=int(workers or 1), conditions=tuple(conditions or ()),
-            horizons=_parse_int_list(horizons, "Horizons"), edos=_parse_int_list(edos, "EDOs"),
-            seeds=_parse_int_list(seeds, "Seeds"), retry_failed=bool(retry),
+            horizons=tuple(int(v) for v in horizons or ()), edos=tuple(int(v) for v in edos or ()),
+            seeds=tuple(int(v) for v in seeds or ()), retry_failed=bool(retry),
         )
 
     dash_outputs = [
@@ -1563,7 +2131,7 @@ def build_evaluation_page(demo: Any = None) -> None:
                 return (f"**Error:** {type(exc).__name__}: {exc}",) + (gr.skip(),) * 3
         return wrapper
 
-    req_inputs = [config_dd, out_dir_tb, workers_num, conditions_cb, horizons_tb, edos_tb, seeds_tb, retry_cb]
+    req_inputs = [config_dd, out_dir_tb, workers_num, conditions_cb, horizons_cb, edos_cb, seeds_cb, retry_cb]
 
     def do_start(action: str):
         def fn(*args):
@@ -1652,10 +2220,38 @@ def build_evaluation_page(demo: Any = None) -> None:
     run_dd.change(on_run, [out_dir_tb, run_dd], [run_plot, run_md])
 
     # Keep the output directory in step with the chosen config unless the user typed their own.
-    def on_config(config: Optional[str], current: str):
-        if not config:
-            return current
+    def on_config(config: Optional[str], current: str, conditions, horizons, edos, seeds):
         default_names = {str((DEFAULT_OUT_ROOT / Path(c).stem).relative_to(REPO_ROOT)) for c in configs}
-        return str((DEFAULT_OUT_ROOT / Path(config).stem).relative_to(REPO_ROOT)) if current in default_names else current
+        out_dir = (
+            str((DEFAULT_OUT_ROOT / Path(config).stem).relative_to(REPO_ROOT)) if config and current in default_names else current
+        )
+        try:
+            sw = switch_config(
+                config or "",
+                FilterSelection(
+                    tuple(conditions or ()), tuple(int(v) for v in horizons or ()),
+                    tuple(int(v) for v in edos or ()), tuple(int(v) for v in seeds or ()),
+                ),
+            )
+        except PreflightError as exc:
+            empty = gr.update(choices=[], value=[])
+            return out_dir, render_config_panel(None, str(exc)), empty, empty, empty, empty
+        return (
+            out_dir, render_config_panel(sw.metadata),
+            gr.update(choices=list(sw.choices.conditions), value=list(sw.selection.conditions)),
+            gr.update(choices=_hz(sw.choices.horizons), value=list(sw.selection.horizons)),
+            gr.update(choices=_edo(sw.choices.edos), value=list(sw.selection.edos)),
+            gr.update(choices=list(sw.choices.seeds), value=list(sw.selection.seeds)),
+        )
 
-    config_dd.change(on_config, [config_dd, out_dir_tb], [out_dir_tb])
+    def on_preview(*args):
+        return render_run_preview(plan_run(_request(*args)))
+
+    config_dd.change(
+        on_config, [config_dd, out_dir_tb, conditions_cb, horizons_cb, edos_cb, seeds_cb],
+        [out_dir_tb, config_panel, conditions_cb, horizons_cb, edos_cb, seeds_cb],
+    ).then(on_preview, req_inputs, [preview_md])
+    gr.on(
+        triggers=[c.change for c in (out_dir_tb, workers_num, conditions_cb, horizons_cb, edos_cb, seeds_cb, retry_cb)],
+        fn=on_preview, inputs=req_inputs, outputs=[preview_md],
+    )
