@@ -283,6 +283,34 @@ class TestBackendContract(unittest.TestCase):
             invoke_backend(_BrokenBackend(), "scatter_logsumexp",
                            log_weights=np.zeros(1))
 
+    def test_empty_and_padded_contract_parity(self):
+        for B in _BACKENDS:
+            with self.subTest(backend=B.__name__):
+                backend = B()
+                empty = np.array([], dtype=np.float64)
+                indices = np.array([], dtype=np.int64)
+                self.assertEqual(backend.logsumexp(empty), -np.inf)
+                with self.assertRaises(SBSolverError):
+                    backend.normalize_log_probs(empty)
+                np.testing.assert_array_equal(
+                    backend.scatter_logsumexp(empty, indices, empty, indices, 3),
+                    np.full(3, -np.inf))
+                result = backend.scatter_logsumexp(
+                    np.array([0.0, -1000.0]), np.array([0, 1]),
+                    np.array([0.0, 0.0]), np.array([0, 0]), 2,
+                    edge_mask=np.array([True, False]), underflow_floor=-50.0)
+                np.testing.assert_array_equal(result, np.array([0.0, -np.inf]))
+                np.testing.assert_array_equal(backend.normalize_log_probs(
+                    np.array([0.0, -1000.0]), mask=np.array([True, False]),
+                    underflow_floor=-50.0), np.array([0.0, -np.inf]))
+                with self.assertRaises(SBSolverError):
+                    backend.scatter_logsumexp(
+                        np.array([-np.inf]), np.array([2]), np.array([0.0]),
+                        np.array([0]), 1, edge_mask=np.array([False]))
+                with self.assertRaises(SBSolverError):
+                    backend.logsumexp(np.array([0.0, np.nan]),
+                                      mask=np.array([True, False]))
+
     def test_underflow_floor_policy_is_merge_first(self):
         # Same-cell duplicates get logaddexp'd before the floor check.
         merged = dict(log_weights=np.array([0.0, -200.0]),
@@ -365,6 +393,78 @@ class TestNumpyDenseParity(unittest.TestCase):
 
 
 class TestFeasibleConvergenceAndFlow(unittest.TestCase):
+    def test_feasible_randomized_full_backend_parity(self):
+        rng = np.random.default_rng(73)
+        for sample in range(15):
+            problem = _random_problem(rng, feasible=True)
+            solutions = [solve_sb(problem, backend=B()) for B in _BACKENDS]
+            bridges = [s.to_bridge(backend=B()) for s, B in zip(solutions, _BACKENDS)]
+            for solution in solutions:
+                self.assertTrue(solution.trace.converged, msg=f'sample {sample}')
+            n, d = solutions
+            for name, left, right in (
+                ('forward', n.log_forward_potentials, d.log_forward_potentials),
+                ('backward', n.log_backward_potentials, d.log_backward_potentials),
+                ('nodes', n.marginals.node_marginals_by_layer,
+                 d.marginals.node_marginals_by_layer),
+                ('edges', n.marginals.edge_marginals_by_time,
+                 d.marginals.edge_marginals_by_time),
+                ('conditionals', bridges[0].edge_probabilities_by_time,
+                 bridges[1].edge_probabilities_by_time),
+            ):
+                self.assertEqual(len(left), len(right))
+                for a, b in zip(left, right):
+                    np.testing.assert_allclose(a, b, atol=1e-7, rtol=1e-7,
+                                               err_msg=f'{name}, sample {sample}')
+
+    def test_zero_endpoint_support_and_known_conditionals(self):
+        # A uniform complete kernel has bridge joint mass pi0 outer piT.
+        edges = tuple(Edge(time_index=0, source=_state(0, s),
+                           target=_state(1, d), log_weight=0.0)
+                      for s in range(2) for d in range(2))
+        graph = _graph((2, 2), (edges,))
+        for initial, terminal in (((0.5, 0.5), (0.4, 0.6)),
+                                  ((0.5, 0.5), (1.0, 0.0)),
+                                  ((0.0, 1.0), (0.4, 0.6)),
+                                  ((0.0, 1.0), (1.0, 0.0))):
+            for B in _BACKENDS:
+                with self.subTest(initial=initial, terminal=terminal, backend=B.__name__):
+                    problem = build_sb_problem(
+                        graph, EndpointDistribution(graph.layers[0], initial),
+                        EndpointDistribution(graph.layers[-1], terminal))
+                    solution = solve_sb(problem, backend=B())
+                    self.assertTrue(solution.trace.converged)
+                    self.assertTrue(np.all(np.isfinite(solution.trace.residual_history)))
+                    np.testing.assert_allclose(solution.marginals.node_marginals_by_layer,
+                                               (initial, terminal), atol=1e-9)
+                    np.testing.assert_allclose(
+                        solution.marginals.edge_marginals_by_time[0],
+                        np.outer(initial, terminal).ravel(), atol=1e-9)
+                    bridge = solution.to_bridge(backend=B())
+                    for s, mass in enumerate(initial):
+                        if mass > 0:
+                            np.testing.assert_allclose(
+                                bridge.edge_probabilities_by_time[0][2*s:2*s+2],
+                                terminal, atol=1e-9)
+
+    def test_infeasible_endpoint_masses(self):
+        graph = _graph((2, 2), (tuple(
+            Edge(time_index=0, source=_state(0, s), target=_state(1, s), log_weight=0.0)
+            for s in range(2)),))
+        for B in _BACKENDS:
+            for raise_on_failure in (False, True):
+                with self.subTest(backend=B.__name__, raises=raise_on_failure):
+                    problem = build_sb_problem(
+                        graph, EndpointDistribution(graph.layers[0], (0.5, 0.5)),
+                        EndpointDistribution(graph.layers[-1], (0.75, 0.25)),
+                        sb_config=SBConfig(horizon_t=1, max_iterations=25,
+                                           raise_on_non_convergence=raise_on_failure))
+                    if raise_on_failure:
+                        with self.assertRaises(SBSolverError):
+                            solve_sb(problem, backend=B())
+                    else:
+                        self.assertFalse(solve_sb(problem, backend=B()).trace.converged)
+
     def test_feasible_problems_converge_and_conserve_flow(self):
         rng = np.random.default_rng(42)
         checked = 0

@@ -45,7 +45,19 @@ log-sum-exp. A shift below `SBConfig.log_underflow_floor` is `SBSolverError`.
 `NumpySBBackend` and `DenseReferenceBackend` both follow this merge-first
 policy. A future JAX backend must match it — a two-pass implementation that
 checks the floor before folding duplicates will disagree with the current
-backends on inputs like:
+backends on inputs like two duplicate weights of `-11` and a distinct weight
+of `0`, with messages `0` and floor `-10.5`. The merged duplicate cell has
+weight `-11 + log(2)` (about `-10.307`) and passes; checking each duplicate
+before merging would incorrectly reject it.
+
+The current boundary uses host NumPy arrays, including for injected backends.
+Inputs are coerced to the documented dtypes; outputs must have the exact
+documented dtype and shape. NaN and `+inf` are invalid even in masked slots.
+Masked edge indices must still be in range: use a valid dummy index for padding.
+Empty reductions return `-inf`; an empty normalization raises `SBSolverError`.
+Zero endpoint probability is supported and remains zero in solved marginals.
+An eventual device-native or fully JIT-compiled solver requires a separate
+array/loop contract; implementing these three operations alone does not provide it.
 
 
 **Normalization:** `normalize_log_probs` raises `SBSolverError` if unmasked finite support is empty. Masked positions remain `-inf` in the output.
@@ -67,3 +79,16 @@ Unexpected backend exceptions (`NotImplementedError`, `RuntimeError`, missing me
 7. **Tests.** Re-run NumPy vs dense vs JAX on the same tiny randomized graphs; add a skip if JAX is not installed. Do not claim parity until those tests pass.
 
 The current `JaxSBBackend` exists only so selection has a named, documented failure mode.
+
+## REQ-12 verification
+
+Run `python -m pytest tests/test_sb.py tests/test_sb_backend.py -q`.
+The suite covers primitive reductions, duplicate merging, masks, empty groups,
+normalization, malformed results, exception translation, and backend injection.
+Seeded feasible tiny graphs compare forward/backward potentials, node/edge
+marginals, and bridge conditionals between NumPy and the dense oracle.
+Endpoint and flow checks establish feasibility independently of parity.
+A complete uniform kernel provides an analytic oracle: joint mass is
+`pi0[:, None] * piT[None, :]`, including zero endpoint probabilities.
+Incompatible endpoint masses on disconnected components exercise both explicit
+non-convergence and the configured solver-error policy.

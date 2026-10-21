@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, NoReturn, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -177,7 +177,7 @@ def _validate_normalize_result(
     return result
 
 
-_RESULT_VALIDATORS = {
+_RESULT_VALIDATORS: Mapping[str, Callable[..., Any]] = {
     "logsumexp": _validate_logsumexp_result,
     "scatter_logsumexp": _validate_scatter_result,
     "normalize_log_probs": _validate_normalize_result,
@@ -572,7 +572,7 @@ class DenseReferenceBackend:
 class JaxSBBackend:
     """Optional JAX backend placeholder. Not implemented in this ticket."""
 
-    def __init__(self) -> None:
+    def __init__(self) -> NoReturn:
         raise SBBackendError(
             "SBBackend.JAX is not implemented. Implement padded scatter "
             "log-sum-exp per docs/sb-backend.md before enabling JAX parity."

@@ -951,7 +951,10 @@ def solve_sb(
 
     resolved_backend = _resolve_backend(problem, backend)
     indexed_problem = _index_problem(problem)
-    log_terminal_backward = np.zeros(problem.diagnostics.piT_support_size, dtype=float)
+    # Fix terminal support before iterating: zero target mass must stay log-zero.
+    # Otherwise the first update changes finite values to -inf, producing an
+    # infinite residual even for a feasible bridge that subsequently converges.
+    log_terminal_backward = np.where(np.isfinite(indexed_problem.log_piT), 0.0, -np.inf)
     final_max_delta = float("inf")
     converged = False
     iterations = 0
