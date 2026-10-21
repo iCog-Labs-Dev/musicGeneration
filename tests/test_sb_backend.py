@@ -277,8 +277,9 @@ class TestBackendContract(unittest.TestCase):
         self.assertAlmostEqual(padded[0], math.log(0.5 * 0.2 + 0.25 * 0.8), places=12)
 
     def test_select_jax_and_broken_invoke(self):
-        with self.assertRaises(SBBackendError):
-            select_sb_backend(SBBackend.JAX)
+        with patch("aimusic.planning._jax_sb_ops.load_jax_ops", side_effect=ImportError):
+            with self.assertRaises(SBBackendError):
+                select_sb_backend(SBBackend.JAX)
         with self.assertRaises(SBBackendError):
             invoke_backend(_BrokenBackend(), "scatter_logsumexp",
                            log_weights=np.zeros(1))

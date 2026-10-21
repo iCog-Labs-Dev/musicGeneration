@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -574,7 +575,7 @@ class TestSBSolver(unittest.TestCase):
                 sb_config=SBConfig(horizon_t=2, log_underflow_floor=1.0),
             )
 
-    def test_solve_sb_rejects_unsupported_backend(self):
+    def test_solve_sb_reports_unavailable_jax(self):
         graph, pi0, piT = _valid_graph()
         problem = build_sb_problem(
             graph,
@@ -583,8 +584,9 @@ class TestSBSolver(unittest.TestCase):
             sb_config=SBConfig(horizon_t=2, backend_selection=SBBackend.JAX),
         )
 
-        with self.assertRaises(SBBackendError):
-            solve_sb(problem)
+        with patch("aimusic.planning._jax_sb_ops.load_jax_ops", side_effect=ImportError):
+            with self.assertRaises(SBBackendError):
+                solve_sb(problem)
 
     def test_solution_exposes_marginals_and_convergence_history(self):
         graph, pi0, piT = _branching_graph()

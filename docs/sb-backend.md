@@ -2,7 +2,11 @@
 
 The sparse SB solver in [`aimusic/planning/sb.py`](../aimusic/planning/sb.py) is written only against [`SBNumericBackend`](../aimusic/planning/sb_backend.py). Backend **selection** (`SBConfig.backend_selection` → `select_sb_backend`) happens before the scaling loop. Inject a backend into `solve_sb(..., backend=...)` to swap NumPy, a dense oracle, or a test double without changing solver orchestration.
 
-JAX is **optional** and **not implemented** in this ticket. `SBBackend.JAX` raises the stable `SBBackendError`. Do not import JAX from planning modules.
+JAX is **optional**. Install CPU support with `pip install -e ".[jax]"`, then
+select `SBConfig(backend_selection=SBBackend.JAX)` or inject `JaxSBBackend()`.
+Planning imports and NumPy selection never import JAX. An unavailable/broken JAX
+installation raises `SBBackendError` with the original exception as its cause.
+For accelerator installation, follow the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html).
 
 ## Required operations
 
@@ -42,8 +46,8 @@ Empty groups are `-inf`. Duplicate edges to the same `(scatter_to, gather_from)`
 **after** duplicate `(scatter_to, gather_from)` cells have been merged with
 log-sum-exp. A shift below `SBConfig.log_underflow_floor` is `SBSolverError`.
 
-`NumpySBBackend` and `DenseReferenceBackend` both follow this merge-first
-policy. A future JAX backend must match it — a two-pass implementation that
+`NumpySBBackend`, `DenseReferenceBackend`, and `JaxSBBackend` follow this merge-first
+policy. A backend implementation that
 checks the floor before folding duplicates will disagree with the current
 backends on inputs like two duplicate weights of `-11` and a distinct weight
 of `0`, with messages `0` and floor `-10.5`. The merged duplicate cell has
@@ -68,17 +72,37 @@ Unexpected backend exceptions (`NotImplementedError`, `RuntimeError`, missing me
 
 `DenseReferenceBackend` rebuilds a dense `(out_size, message_size)` log-kernel for each scatter. Use it only on tiny graphs. Sparse NumPy and this oracle must match on randomized reachable graphs within a tight tolerance (see `tests/test_sb_backend.py`).
 
-## Required before implementing JAX parity
+## JAX numerical backend and next-stage requirements
 
-1. **Keep JAX optional.** Guard the import; planning must still import when JAX is absent. Do not add a static `import jax` to `sb.py`.
-2. **Implement the three ops** with the table above, including `edge_mask` / node masks. Match NumPy on the existing parity tests (`float64` or documented `float32` tolerances).
-3. **JIT-friendly scatter.** Replace Python grouping loops with a padded segmented log-sum-exp (sort-by-group, or `jax.ops.segment_max` + masked exp). Gather must live in the backend, not in hidden NumPy indexing inside the IPF loop if the loop itself is to be JITed.
-4. **Static shapes.** Pad edges to `d_max * k_max` (or a documented `E_max`) and nodes to `k_max`. `out_size` and message length must be those padded sizes; masks drop padding.
-5. **No new solver math.** `solve_sb` already accepts an injected backend. Add `JaxSBBackend` behind `select_sb_backend(SBBackend.JAX)` only after ops pass the dense-oracle parity tests.
-6. **Errors.** Raise `SBSolverError` for numeric contract failures; let `invoke_backend` wrap implementation gaps as `SBBackendError`.
-7. **Tests.** Re-run NumPy vs dense vs JAX on the same tiny randomized graphs; add a skip if JAX is not installed. Do not claim parity until those tests pass.
+The numerical backend uses lazily compiled reductions with scoped x64 enabled.
+The caller's global JAX precision setting is preserved. Host validation and
+`np.unique` construct sparse cell IDs; JAX merges duplicates, gathers messages,
+and performs segmented max/sum reductions. Memory is proportional to edges and
+states, with no dense graph matrix. Empty/masked groups stay `-inf`.
 
-The current `JaxSBBackend` exists only so selection has a named, documented failure mode.
+The existing solver still runs its Python IPF loop and exchanges NumPy arrays.
+Every operation synchronizes its results back to host, also ensuring device
+errors are translated before returning. Compilation specializes to array shapes;
+changing graph sizes may compile additional kernels. This implementation makes
+no acceleration claim, and does not make the solver differentiable or fully JIT-compatible.
+
+Before a device-native solver is implemented:
+
+1. Define a device-array boundary and retain messages on device throughout IPF.
+2. Precompute graph topology and pad edges/nodes to documented static sizes,
+   carrying masks and valid dummy indices through every operation.
+3. Move convergence control and error reporting into a compiled-loop design
+   without changing the mathematics or weakening float64/support semantics.
+4. Re-run the same parity and failure suite and benchmark against NumPy,
+   separating compilation, transfer, and steady-state execution costs.
+
+Run `python -m pytest tests/test_sb.py tests/test_sb_backend.py tests/test_sb_jax.py -q`.
+JAX tests skip only when the package is absent; a broken installed runtime fails
+the tests. Tests cover shared contract cases, randomized dense/JAX solver parity,
+analytic endpoint/marginal checks, conditionals, optional imports, error translation,
+and precision-setting preservation. CPU parity does not establish GPU/TPU parity.
+The implementation has been validated with JAX/jaxlib 0.4.38 on Windows CPU;
+to reproduce that runtime, install `jax==0.4.38` alongside the project extra.
 
 ## REQ-12 verification
 

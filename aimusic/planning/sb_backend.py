@@ -3,15 +3,15 @@
 Solver mathematics in ``aimusic.planning.sb`` consumes only this interface.
 Backend selection lives in ``select_sb_backend`` and is not part of the IPF loop.
 
-JAX is an optional future implementation. Do not import JAX from this module.
+JAX is optional and loaded only when its backend is constructed.
 See ``docs/sb-backend.md`` for padded-array semantics and parity requirements.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Callable, Mapping, NoReturn, Optional, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -569,14 +569,80 @@ class DenseReferenceBackend:
         return normalized
 
 
+@dataclass(frozen=True)
 class JaxSBBackend:
-    """Optional JAX backend placeholder. Not implemented in this ticket."""
+    """Optional JAX numerical kernels behind the host float64 array contract.
 
-    def __init__(self) -> NoReturn:
-        raise SBBackendError(
-            "SBBackend.JAX is not implemented. Implement padded scatter "
-            "log-sum-exp per docs/sb-backend.md before enabling JAX parity."
-        )
+    Import and device failures become stable backend errors. Scoped x64 mode
+    preserves the caller's global precision setting. The IPF loop stays on host.
+    """
+
+    _ops: Any = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        from aimusic.planning._jax_sb_ops import load_jax_ops
+
+        try:
+            object.__setattr__(self, "_ops", load_jax_ops())
+        except Exception as exc:
+            raise SBBackendError(
+                'JAX backend unavailable. Install aimusic[jax] and a working '
+                'jaxlib for your platform.'
+            ) from exc
+
+    def _execute(self, operation: str, *args: Any) -> Any:
+        try:
+            with self._ops.x64():
+                result = getattr(self._ops, operation)(*args)
+                # Synchronize here so asynchronous device failures stay inside
+                # the error boundary, and return host values to orchestration.
+                return tuple(np.asarray(value) for value in result)
+        except Exception as exc:
+            raise SBBackendError(f"JAX {operation} failed: {exc}") from exc
+
+    @staticmethod
+    def _check_floor(minimum: Any, floor: Optional[float], context: str) -> None:
+        if floor is not None and float(minimum) < floor:
+            raise SBSolverError(f"{context} encountered shift below underflow floor.")
+
+    def logsumexp(self, values: np.ndarray, *, mask: Optional[np.ndarray] = None,
+                  underflow_floor: Optional[float] = None,
+                  context: str = "logsumexp") -> float:
+        values = _as_log_array("values", values)
+        values = _apply_mask_as_neg_inf(values, _as_mask("mask", mask, length=values.size))
+        result, minimum = self._execute("reduce", values)
+        self._check_floor(minimum, underflow_floor, context)
+        return float(result)
+
+    def scatter_logsumexp(
+        self, log_weights: np.ndarray, gather_from: np.ndarray, messages: np.ndarray,
+        scatter_to: np.ndarray, out_size: int, *, edge_mask: Optional[np.ndarray] = None,
+        underflow_floor: Optional[float] = None, context: str = "scatter_logsumexp",
+    ) -> np.ndarray:
+        weights, msgs, gather, scatter, mask = _prepare_scatter_args(
+            log_weights, gather_from, messages, scatter_to, out_size, edge_mask)
+        weights = _apply_mask_as_neg_inf(weights, mask)
+        # Structural indexing only: every numeric reduction and message gather
+        # happens in JAX. Unique pairs keep memory O(E), not O(nodes squared).
+        pairs, cell_ids = np.unique(np.column_stack((scatter, gather)), axis=0,
+                                    return_inverse=True)
+        result, minimum = self._execute(
+            "scatter", weights, msgs, cell_ids.astype(_INDEX_DTYPE),
+            pairs[:, 1], pairs[:, 0], out_size)
+        self._check_floor(minimum, underflow_floor, context)
+        return result
+
+    def normalize_log_probs(
+        self, log_values: np.ndarray, *, mask: Optional[np.ndarray] = None,
+        underflow_floor: Optional[float] = None, context: str = "normalize_log_probs",
+    ) -> np.ndarray:
+        values = _as_log_array("log_values", log_values)
+        values = _apply_mask_as_neg_inf(values, _as_mask("mask", mask, length=values.size))
+        if not np.any(np.isfinite(values)):
+            raise SBSolverError(f"{context} has empty finite support.")
+        result, _, minimum = self._execute("normalize", values)
+        self._check_floor(minimum, underflow_floor, context)
+        return result
 
 
 def backend_array_contract() -> Mapping[str, str]:
