@@ -149,6 +149,19 @@ run, with roughly 0.4 GB and 0.8 GB of memory growth. A 1,024-beat matrix of 4 c
   `<out>/ui_run.log` and shown in the page), so UI and command-line results are identical. The page polls
   while a job runs and never blocks; *Stop* terminates the CLI and its workers, and *Resume* continues.
   A directory created from a different config is refused before anything starts.
+* **Config-aware controls (MUS-28 UI).** Selecting a config shows a *Benchmark Configuration* panel read straight
+  from the JSON (purpose, version, type, horizons, EDOs, seeds, conditions with explanations, path modes,
+  `K_max`/`D_max`/proposal budget, SB settings, timeout, expected run count) and a `SMOKE` / `PROFILE` /
+  `BENCHMARK` label. The type is inferred from the config name/description, or set with an optional
+  `"benchmark_type"` key (do not add it to shipped configs: it would change their `config_hash`). Condition
+  descriptions live in `ui.CONDITION_DESCRIPTIONS` and can be overridden per config with an optional
+  `"condition_descriptions": {name: text}` object. Condition/horizon/EDO/seed filters are checkbox groups that
+  only offer values from the selected config; switching config clears ticks that no longer exist, and an empty
+  group means "all values". Under the filters the page previews the exact matrix (`2 conditions × 1 horizon × 2
+  seeds × 1 EDO = 4 runs`, computed with `expand_matrix`/`select_specs`), the output directory, whether Run
+  would start, resume or skip, and a rough runtime when the directory has finished runs at the same horizon
+  and EDO. Invalid or zero-run selections are refused before any subprocess starts, with a message naming the
+  config and its valid values. Help text for each term is in `ui.TERM_HELP`.
 * **Data sources.** `manifest.json` + `runs/*.json` (falling back to `results.jsonl`) for run level,
   `aggregate.json` for cell level with its 95% intervals. If `aggregate.json` is missing or out of date
   (e.g. mid-run) it is recomputed with `stats.aggregate`, the same code the CLI uses. `report.md` is shown as a
