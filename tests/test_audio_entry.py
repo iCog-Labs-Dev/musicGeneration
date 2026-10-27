@@ -91,7 +91,7 @@ class TestAudioEntry(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("not found", result.stderr.lower())
 
-    def test_full_render_not_implemented(self) -> None:
+    def test_full_render_writes_stems(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             package_root = _generate_package(Path(tmp))
             result = _run_cli(
@@ -99,8 +99,9 @@ class TestAudioEntry(unittest.TestCase):
                 str(package_root),
                 "--no-validate-only",
             )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("not implemented yet", result.stderr.lower())
+            self.assertEqual(result.returncode, 0, msg=result.stderr + result.stdout)
+            self.assertIn("Audio render OK", result.stdout)
+            self.assertIn("rough_mix", result.stdout.lower())
 
     def test_core_import_still_light(self) -> None:
         code = (

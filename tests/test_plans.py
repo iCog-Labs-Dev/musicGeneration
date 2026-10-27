@@ -13,6 +13,8 @@ from aimusic.core.config import (
 from aimusic.decode import decode_path_to_score
 from aimusic.core.rng import RNGKey
 from aimusic.planning.plans import (
+    EndpointFallbackPolicy,
+    EndpointMode,
     MethodARunConfig,
     build_section_plan,
     generate_end_endpoint_distribution,
@@ -23,6 +25,10 @@ from aimusic.planning.plans import (
 from aimusic.planning.sb import sample_bridge_path
 from aimusic.render import render_midi
 from aimusic.theory.edo import EDO
+
+
+def _style() -> StyleConfig:
+    return StyleConfig(allowed_meters=("4/4",), groove_families=("straight",))
 
 
 class TestMethodAEndpointPlanning(unittest.TestCase):
@@ -120,22 +126,118 @@ class TestMethodAOrchestration(unittest.TestCase):
                         0,
                     )
 
-    def test_generate_method_a_endpoints_returns_sections(self):
+    def test_generate_method_a_endpoints_returns_distributions_and_sections_only(self):
         run_config = MethodARunConfig(total_beats=4)
 
-        endpoints, _ = generate_method_a_endpoints(run_config, key=RNGKey(seed=0))
+        # Endpoint generation makes no choice and needs no RNG key.
+        endpoints = generate_method_a_endpoints(run_config)
 
         self.assertEqual(endpoints.pi0.layer.time_index, 0)
         self.assertEqual(endpoints.piT.layer.time_index, 4)
         self.assertEqual(len(endpoints.sections), 1)
-        self.assertIn(endpoints.start_choice.state, endpoints.pi0.layer.states)
-        self.assertIn(endpoints.end_choice.state, endpoints.piT.layer.states)
+        self.assertFalse(hasattr(endpoints, "start_choice"))
+        self.assertFalse(hasattr(endpoints, "end_choice"))
+        self.assertAlmostEqual(sum(endpoints.pi0.probabilities), 1.0)
+        self.assertAlmostEqual(sum(endpoints.piT.probabilities), 1.0)
 
-    def test_run_method_a_map_smoke(self):
+    def test_run_config_defaults(self):
+        run_config = MethodARunConfig(total_beats=4)
+        self.assertIs(run_config.endpoint_mode, EndpointMode.DISTRIBUTION)
+        self.assertIs(
+            run_config.unreachable_policy, EndpointFallbackPolicy.DROP_UNREACHABLE_ONLY
+        )
+
+    # ---- default mode: distribution-to-distribution ------------------------------- #
+    def test_run_method_a_map_smoke_distribution_mode(self):
+        run_config = MethodARunConfig(total_beats=4, seed=11, style_config=_style())
+
+        input_key = RNGKey(seed=11)
+        result, next_key = run_method_a(run_config, key=input_key)
+
+        self.assertEqual(len(result.path), run_config.total_beats + 1)
+        # no endpoint was chosen: the path starts/ends inside the effective supports
+        start_support = {
+            s for s, p in zip(result.endpoints.pi0.layer.states, result.endpoints.pi0.probabilities) if p > 0
+        }
+        end_support = {
+            s for s, p in zip(result.endpoints.piT.layer.states, result.endpoints.piT.probabilities) if p > 0
+        }
+        self.assertIn(result.path[0], start_support)
+        self.assertIn(result.path[-1], end_support)
+        self.assertIsNone(result.diagnostics.chosen_start_state)
+        self.assertIsNone(result.diagnostics.chosen_end_state)
+        self.assertIsNone(result.diagnostics.chosen_start_probability)
+        self.assertIsNone(result.diagnostics.chosen_end_probability)
+        self.assertEqual(result.diagnostics.endpoint_mode, "distribution")
+        self.assertEqual(result.diagnostics.endpoint_selection_mode, "distribution")
+        # the boundary layers keep every feasible positive-mass state (not a delta)
+        self.assertEqual(result.graph.layers[0].states, result.endpoints.pi0.layer.states)
+        self.assertEqual(result.graph.layers[-1].states, result.endpoints.piT.layer.states)
+        self.assertGreaterEqual(len(result.graph.layers[0].states), 1)
+        self.assertTrue(all(p > 0.0 for p in result.endpoints.pi0.probabilities))
+        self.assertTrue(all(p > 0.0 for p in result.endpoints.piT.probabilities))
+        self.assertEqual(result.endpoints.pi0.layer.time_index, 0)
+        self.assertEqual(result.diagnostics.path_mode, "map")
+        self.assertIsNotNone(result.path_score)
+        self.assertTrue(result.sb_solution.trace.converged)
+        # the realized bridge marginals reproduce the effective endpoint targets
+        for report in (result.start_mass, result.end_mass):
+            self.assertLessEqual(
+                report.max_abs_realized_error, run_config.endpoint_marginal_tolerance
+            )
+        self.assertTrue(result.endpoint_resolution.final_flow_check.feasible)
+        # modifications are always classified, never silent
+        resolution = result.endpoint_resolution
+        self.assertEqual(
+            result.diagnostics.endpoint_request_modified, resolution.request_modified
+        )
+        self.assertEqual(result.diagnostics.endpoint_modifications, resolution.modifications)
+        self.assertAlmostEqual(
+            result.diagnostics.endpoint_start_feasible_mass, result.start_mass.feasible_mass
+        )
+        self.assertAlmostEqual(
+            result.diagnostics.endpoint_end_feasible_mass, result.end_mass.feasible_mass
+        )
+        self.assertEqual(resolution.exact, resolution.termination_reason == "feasible_as_requested")
+        for report in (result.start_mass, result.end_mass):
+            self.assertAlmostEqual(
+                report.removed_state_mass + report.feasible_mass + report.trimmed_requested_mass,
+                report.requested_mass,
+            )
+        self.assertEqual(next_key, input_key.next_key())
+        self.assertEqual(
+            result.diagnostics.rng_stream_ids,
+            (
+                "endpoint_choice", "candidate_proposal", "bridge_sampling",
+                "decoder.comping", "decoder.bass", "decoder.lead", "decoder.drums",
+            ),
+        )
+
+    def test_run_method_a_sampling_distribution_mode_is_seed_reproducible(self):
+        run_config = MethodARunConfig(
+            total_beats=4, seed=23, use_sampling=True, style_config=_style()
+        )
+
+        first, _ = run_method_a(run_config, key=RNGKey(seed=23))
+        second, _ = run_method_a(run_config, key=RNGKey(seed=23))
+
+        self.assertEqual(first.path, second.path)
+        self.assertEqual(first.sampled_path, second.sampled_path)
+        self.assertEqual(first.diagnostics.path_mode, "sample")
+        # path sampling is separate from endpoint construction: no endpoint is sampled
+        self.assertEqual(first.diagnostics.endpoint_selection_mode, "distribution")
+        self.assertIsNone(first.diagnostics.chosen_start_state)
+        # the sampled start has positive probability under the effective pi0
+        self.assertGreater(first.endpoints.pi0.probability_of(first.path[0]), 0.0)
+        self.assertGreater(first.endpoints.piT.probability_of(first.path[-1]), 0.0)
+
+    # ---- singleton mode stays available as an explicit special case ---------------- #
+    def test_run_method_a_map_smoke_singleton_mode(self):
         run_config = MethodARunConfig(
             total_beats=4,
             seed=11,
-            style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight",)),
+            style_config=_style(),
+            endpoint_mode=EndpointMode.SINGLETON,
         )
 
         input_key = RNGKey(seed=11)
@@ -146,29 +248,21 @@ class TestMethodAOrchestration(unittest.TestCase):
         self.assertEqual(result.path[-1], result.diagnostics.chosen_end_state)
         self.assertEqual(len(result.graph.layers[0].states), 1)
         self.assertEqual(len(result.graph.layers[-1].states), 1)
-        self.assertEqual(result.endpoints.pi0.layer.time_index, 0)
-        self.assertEqual(result.endpoints.start_choice.selection_mode, "argmax")
+        self.assertEqual(result.diagnostics.endpoint_mode, "singleton")
         self.assertEqual(result.diagnostics.endpoint_selection_mode, "argmax")
         self.assertGreater(result.diagnostics.chosen_start_probability, 0.0)
         self.assertGreater(result.diagnostics.chosen_end_probability, 0.0)
         self.assertEqual(result.diagnostics.path_mode, "map")
-        self.assertIsNotNone(result.path_score)
         self.assertTrue(result.sb_solution.trace.converged)
         self.assertEqual(next_key, input_key.next_key())
-        self.assertEqual(
-            result.diagnostics.rng_stream_ids,
-            (
-                "endpoint_choice", "candidate_proposal", "bridge_sampling",
-                "decoder.comping", "decoder.bass", "decoder.lead", "decoder.drums",
-            ),
-        )
 
-    def test_run_method_a_sampling_is_seed_reproducible(self):
+    def test_run_method_a_sampling_singleton_mode_is_seed_reproducible(self):
         run_config = MethodARunConfig(
             total_beats=4,
             seed=23,
             use_sampling=True,
-            style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight",)),
+            style_config=_style(),
+            endpoint_mode=EndpointMode.SINGLETON,
         )
 
         first, _ = run_method_a(run_config, key=RNGKey(seed=23))
@@ -178,14 +272,15 @@ class TestMethodAOrchestration(unittest.TestCase):
         self.assertEqual(first.sampled_path, second.sampled_path)
         self.assertEqual(first.diagnostics.path_mode, "sample")
         self.assertEqual(first.diagnostics.endpoint_selection_mode, "sample")
-        self.assertEqual(first.endpoints.start_choice, second.endpoints.start_choice)
-        self.assertEqual(first.endpoints.end_choice, second.endpoints.end_choice)
+        self.assertEqual(
+            first.diagnostics.chosen_start_state, second.diagnostics.chosen_start_state
+        )
+        self.assertEqual(
+            first.diagnostics.chosen_end_state, second.diagnostics.chosen_end_state
+        )
 
     def test_bridge_key_cannot_change_candidate_support(self):
-        run_config = MethodARunConfig(
-            total_beats=4,
-            style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight",)),
-        )
+        run_config = MethodARunConfig(total_beats=4, style_config=_style())
         result, _ = run_method_a(run_config, key=RNGKey(seed=45))
         support = result.graph.layers
         sample_bridge_path(result.bridge, RNGKey(seed=1))
@@ -196,7 +291,7 @@ class TestMethodAOrchestration(unittest.TestCase):
         run_config = MethodARunConfig(
             total_beats=4,
             seed=5,
-            style_config=StyleConfig(allowed_meters=("4/4",), groove_families=("straight",)),
+            style_config=_style(),
             plan_config=PlanConfig(
                 sectioning_strategy=SectioningStrategy.SECTION_WISE,
                 section_names=("intro", "outro"),

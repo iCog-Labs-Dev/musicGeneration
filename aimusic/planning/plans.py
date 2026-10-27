@@ -24,16 +24,34 @@ from aimusic.core.rng import RNGKey, allocate_named_keys, random_unit
 from aimusic.core.vocab import TonalContext, Vocabularies, build_tonal_context
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.graph import EdgeScoreDiagnostics, SparseGraph, build_sparse_graph
+from aimusic.planning.endpoint_feasibility import (  # noqa: F401  (re-exported)
+    EndpointFallbackPolicy,
+    EndpointFeasibilityError,
+    EndpointMarginalError,
+    EndpointMassInfeasibleError,
+    EndpointMassReport,
+    EndpointMode,
+    EndpointReachabilityError,
+    EndpointResolution,
+    EndpointSolveResult,
+    EndpointSolverNonConvergenceError,
+    EndpointTolerances,
+    EndpointValidationError,
+    UnreachablePolicy,
+    positive_mass_distribution as _positive_mass_distribution,
+    resolve_endpoint_distributions,
+    resolve_endpoint_support,
+    solve_endpoint_bridge,
+    validate_solution_marginals,
+)
 from aimusic.render import render_midi
 from aimusic.planning.sb import (
     SBProblem,
     SBSolution,
     SampledBridgePath,
     SolvedBridge,
-    build_sb_problem,
     map_bridge_path,
     sample_bridge_path,
-    solve_sb,
 )
 from aimusic.scoring.priors import NullPrior, Prior, PriorContext
 from aimusic.planning.stitching import (
@@ -111,8 +129,29 @@ class MethodARunConfig:
     plan_config: PlanConfig = field(default_factory=PlanConfig)
     neural_prior_config: NeuralPriorConfig = field(default_factory=NeuralPriorConfig)
     edo: int = 12
+    endpoint_mode: EndpointMode = EndpointMode.DISTRIBUTION
+    unreachable_policy: EndpointFallbackPolicy = EndpointFallbackPolicy.DROP_UNREACHABLE_ONLY
+    endpoint_flow_tolerance: float = 1e-9
+    endpoint_capacity_epsilon: float = 1e-14
+    max_fallback_iterations: int = 100
+    endpoint_interior_margin: float = 1e-2
+    endpoint_marginal_tolerance: float = 1e-6
 
     def __post_init__(self) -> None:
+        # Validates positivity and the tolerance relations in one place.
+        EndpointTolerances(
+            flow_tolerance=self.endpoint_flow_tolerance,
+            marginal_tolerance=self.endpoint_marginal_tolerance,
+            capacity_epsilon=self.endpoint_capacity_epsilon,
+        )
+        _require_real("endpoint_interior_margin", self.endpoint_interior_margin)
+        if not 0.0 <= self.endpoint_interior_margin < 1.0:
+            raise ValueError("endpoint_interior_margin must be in [0, 1).")
+        _require_int("max_fallback_iterations", self.max_fallback_iterations, minimum=0)
+        if not isinstance(self.endpoint_mode, EndpointMode):
+            raise TypeError("endpoint_mode must be an EndpointMode value.")
+        if not isinstance(self.unreachable_policy, EndpointFallbackPolicy):
+            raise TypeError("unreachable_policy must be an EndpointFallbackPolicy value.")
         _require_int("total_beats", self.total_beats, minimum=1)
         _require_int("seed", self.seed, minimum=0)
         if not isinstance(self.use_sampling, bool):
@@ -158,8 +197,6 @@ class MethodAEndpoints:
 
     pi0: EndpointDistribution
     piT: EndpointDistribution
-    start_choice: EndpointChoice
-    end_choice: EndpointChoice
     sections: Tuple[PlanningSection, ...]
 
 
@@ -169,16 +206,23 @@ class MethodAPlanDiagnostics:
 
     section_tags: Tuple[str, ...]
     target_tension_arcs: Tuple[Tuple[float, ...], ...]
-    chosen_start_state: BeatState
-    chosen_end_state: BeatState
+    # Populated only in SINGLETON mode; None in DISTRIBUTION mode, where no
+    # endpoint choice is made.
+    chosen_start_state: Optional[BeatState]
+    chosen_end_state: Optional[BeatState]
     endpoint_selection_mode: str
-    chosen_start_probability: float
-    chosen_end_probability: float
+    chosen_start_probability: Optional[float]
+    chosen_end_probability: Optional[float]
     path_mode: str
     graph_layer_sizes: Tuple[int, ...]
     bridge_iterations: int
     bridge_converged: bool
     rng_stream_ids: Tuple[str, ...]
+    endpoint_mode: str = "distribution"
+    endpoint_request_modified: bool = False
+    endpoint_modifications: Tuple[str, ...] = ()
+    endpoint_start_feasible_mass: Optional[float] = None
+    endpoint_end_feasible_mass: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +242,9 @@ class MethodAPlanResult:
     sampled_path: Optional[SampledBridgePath]
     diagnostics: MethodAPlanDiagnostics
     path_edge_diagnostics: Tuple[EdgeScoreDiagnostics, ...] = ()
+    start_mass: Optional[EndpointMassReport] = None
+    end_mass: Optional[EndpointMassReport] = None
+    endpoint_resolution: Optional[EndpointResolution] = None
 
     @property
     def solutions(self) -> Tuple[SBSolution, ...]:
@@ -315,11 +362,15 @@ def _sample_index_from_distribution(
 ) -> tuple[int, RNGKey]:
     threshold, next_key = random_unit(key)
     running = 0.0
+    last_positive = -1
     for idx, probability in enumerate(endpoint.probabilities):
         running += probability
-        if threshold <= running:
-            return idx, next_key
-    return len(endpoint.probabilities) - 1, next_key
+        if probability > 0.0:
+            last_positive = idx
+            if threshold < running:
+                return idx, next_key
+    # Round-off fallback: the last outcome with positive mass, never a zero-mass one.
+    return last_positive, next_key
 
 
 def _choose_endpoint_state(
@@ -577,33 +628,32 @@ def generate_method_a_endpoints(
     run_config: MethodARunConfig,
     *,
     vocabularies: Optional[Vocabularies] = None,
-    key: RNGKey,
-    sample_endpoints: bool = False,
-) -> tuple[MethodAEndpoints, RNGKey]:
-    if not isinstance(key, RNGKey):
-        raise TypeError("key must be an RNGKey.")
+) -> MethodAEndpoints:
+    """Generate endpoint distributions and section metadata only (no selection, no RNG)."""
     resolved_vocabs = _resolved_vocabs(
         vocabularies, run_config.style_config, run_config.edo
     )
     pi0 = generate_start_endpoint_distribution(run_config, vocabularies=resolved_vocabs)
     piT = generate_end_endpoint_distribution(run_config, vocabularies=resolved_vocabs)
-    start_choice, next_key = _choose_endpoint_state(
-        pi0,
-        key=key,
-        sample=sample_endpoints,
-    )
-    end_choice, next_key = _choose_endpoint_state(
-        piT,
-        key=next_key,
-        sample=sample_endpoints,
-    )
     return MethodAEndpoints(
         pi0=pi0,
         piT=piT,
-        start_choice=start_choice,
-        end_choice=end_choice,
         sections=build_section_plan(run_config),
-    ), next_key
+    )
+
+
+def select_singleton_endpoints(
+    endpoints: MethodAEndpoints,
+    *,
+    key: RNGKey,
+    sample: bool = False,
+) -> tuple[EndpointChoice, EndpointChoice, RNGKey]:
+    """SINGLETON-mode only: choose one start and one terminal state (argmax or sample)."""
+    if not isinstance(key, RNGKey):
+        raise TypeError("key must be an RNGKey.")
+    start_choice, next_key = _choose_endpoint_state(endpoints.pi0, key=key, sample=sample)
+    end_choice, next_key = _choose_endpoint_state(endpoints.piT, key=next_key, sample=sample)
+    return start_choice, end_choice, next_key
 
 
 def run_method_a(
@@ -631,20 +681,28 @@ def run_method_a(
         "decoder.comping", "decoder.bass", "decoder.lead", "decoder.drums",
     )
     streams, next_key = allocate_named_keys(key, stream_ids)
-    endpoints, _ = generate_method_a_endpoints(
-        run_config,
-        vocabularies=resolved_vocabs,
-        key=streams["endpoint_choice"],
-        sample_endpoints=run_config.use_sampling,
-    )
-    _logger.info(f"Endpoints: start={endpoints.start_choice.state} end={endpoints.end_choice.state}")
-    start_endpoint = _singleton_endpoint_distribution(
-        endpoints.start_choice.state,
-        time_index=0,
-    )
-    end_endpoint = _singleton_endpoint_distribution(
-        endpoints.end_choice.state,
-        time_index=run_config.total_beats,
+    endpoints = generate_method_a_endpoints(run_config, vocabularies=resolved_vocabs)
+    start_choice: Optional[EndpointChoice] = None
+    end_choice: Optional[EndpointChoice] = None
+    if run_config.endpoint_mode is EndpointMode.SINGLETON:
+        # Selection lives only in this branch: pick one state per side, then
+        # collapse to delta distributions.
+        start_choice, end_choice, _ = select_singleton_endpoints(
+            endpoints,
+            key=streams["endpoint_choice"],
+            sample=run_config.use_sampling,
+        )
+        start_endpoint = _singleton_endpoint_distribution(start_choice.state, time_index=0)
+        end_endpoint = _singleton_endpoint_distribution(
+            end_choice.state, time_index=run_config.total_beats
+        )
+    else:
+        # DISTRIBUTION: no choice. Keep every positive-mass start/terminal state.
+        start_endpoint = _positive_mass_distribution(endpoints.pi0)
+        end_endpoint = _positive_mass_distribution(endpoints.piT)
+    _logger.info(
+        f"Endpoints ({run_config.endpoint_mode.value}): "
+        f"{len(start_endpoint.layer)} start states, {len(end_endpoint.layer)} terminal states"
     )
     graph, _ = build_sparse_graph(
         start_layer=start_endpoint.layer,
@@ -660,16 +718,39 @@ def run_method_a(
         d_max=resolved_sb.d_max,
     )
     _logger.info(f"Graph built: {len(graph.layers)} layers, {sum(len(l.states) for l in graph.layers)} states")
+    # feasibility (L1 + L2 max-flow) -> fallback by policy -> build_sb_problem ->
+    # solve_sb -> convergence + marginal validation. Raises on any failure, so path
+    # extraction below only ever sees a validated bridge.
+    solved = solve_endpoint_bridge(
+        graph,
+        start_endpoint,
+        end_endpoint,
+        sb_config=resolved_sb,
+        policy=run_config.unreachable_policy,
+        flow_tolerance=run_config.endpoint_flow_tolerance,
+        max_fallback_iterations=run_config.max_fallback_iterations,
+        marginal_tolerance=run_config.endpoint_marginal_tolerance,
+        capacity_epsilon=run_config.endpoint_capacity_epsilon,
+        interior_margin=run_config.endpoint_interior_margin,
+    )
+    graph = solved.graph  # restricted: zero-mass boundary states and dead paths pruned
+    resolution = solved.resolution
+    problem, solution, bridge = solved.problem, solved.solution, solved.bridge
+    start_mass, end_mass = solved.start_mass, solved.end_mass
+    if resolution.request_modified:
+        _logger.warning(
+            f"Endpoint distributions modified {list(resolution.modifications)} "
+            f"({resolution.termination_reason}): "
+            f"start removed={start_mass.removed_state_mass:.6f} "
+            f"trimmed={start_mass.trimmed_mass:.6f}, "
+            f"terminal removed={end_mass.removed_state_mass:.6f} "
+            f"trimmed={end_mass.trimmed_mass:.6f}"
+        )
     aligned_endpoints = MethodAEndpoints(
-        pi0=_align_endpoint_distribution(endpoints.pi0, graph.layers[0]),
-        piT=_align_endpoint_distribution(endpoints.piT, graph.layers[-1]),
-        start_choice=endpoints.start_choice,
-        end_choice=endpoints.end_choice,
+        pi0=start_mass.effective,
+        piT=end_mass.effective,
         sections=endpoints.sections,
     )
-    problem = build_sb_problem(graph, start_endpoint, end_endpoint, sb_config=resolved_sb)
-    solution = solve_sb(problem)
-    bridge = solution.to_bridge()
     _logger.info(f"SB solved: converged={solution.trace.converged}, iterations={solution.trace.iterations}")
 
     if run_config.use_sampling:
@@ -685,16 +766,27 @@ def run_method_a(
     diagnostics = MethodAPlanDiagnostics(
         section_tags=tuple(section.name for section in endpoints.sections),
         target_tension_arcs=tuple(section.target_tension_arc for section in endpoints.sections),
-        chosen_start_state=endpoints.start_choice.state,
-        chosen_end_state=endpoints.end_choice.state,
-        endpoint_selection_mode=endpoints.start_choice.selection_mode,
-        chosen_start_probability=endpoints.start_choice.selected_probability,
-        chosen_end_probability=endpoints.end_choice.selected_probability,
+        chosen_start_state=None if start_choice is None else start_choice.state,
+        chosen_end_state=None if end_choice is None else end_choice.state,
+        endpoint_selection_mode=(
+            "distribution" if start_choice is None else start_choice.selection_mode
+        ),
+        chosen_start_probability=(
+            None if start_choice is None else start_choice.selected_probability
+        ),
+        chosen_end_probability=(
+            None if end_choice is None else end_choice.selected_probability
+        ),
         path_mode="sample" if run_config.use_sampling else "map",
         graph_layer_sizes=graph.diagnostics.layer_sizes,
         bridge_iterations=solution.trace.iterations,
         bridge_converged=solution.trace.converged,
         rng_stream_ids=stream_ids,
+        endpoint_mode=run_config.endpoint_mode.value,
+        endpoint_request_modified=resolution.request_modified,
+        endpoint_modifications=resolution.modifications,
+        endpoint_start_feasible_mass=start_mass.feasible_mass,
+        endpoint_end_feasible_mass=end_mass.feasible_mass,
     )
     return MethodAPlanResult(
         run_config=run_config,
@@ -710,6 +802,9 @@ def run_method_a(
         sampled_path=sampled_path,
         diagnostics=diagnostics,
         path_edge_diagnostics=graph.diagnostics_for_path(path),
+        start_mass=start_mass,
+        end_mass=end_mass,
+        endpoint_resolution=resolution,
     ), next_key
 
 

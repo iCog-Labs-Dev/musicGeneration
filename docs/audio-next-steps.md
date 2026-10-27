@@ -15,7 +15,8 @@ Ordered backlog. Prefer one P0/P1 item per session. Full roadmap:
 - [x] Optional `[audio-bridge]` extra declared (runtime bridge deferred to PR3)
 - [x] CLI `render-audio` with lazy import; validate-only default in PR2
 - [x] Native `from_score` loader; prefer planner `structure.json`
-- [ ] Port M1 remainder: groove apply, simple/fluidsynth render, orchestrator
+- [x] Port M1 CI-safe remainder: groove apply, simple render, orchestrator + m2a bridge
+- [ ] Port fluidsynth render backend (optional `[audio-render]`)
 - [ ] CI reconcile on fixtures
 
 ## P2 — Safe generative loop

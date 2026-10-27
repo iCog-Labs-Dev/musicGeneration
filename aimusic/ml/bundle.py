@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,9 +58,8 @@ def save_count_state(checkpoint_dir: Path, count_state: Mapping[str, Any]) -> No
         shutil.rmtree(checkpoint_dir)
 
     serializable = {name: jnp.asarray(array) for name, array in count_state.items()}
-    checkpointer = ocp.StandardCheckpointer()
+    checkpointer = ocp.PyTreeCheckpointer(use_ocdbt=os.name != "nt")
     checkpointer.save(checkpoint_dir, serializable, force=True)
-    checkpointer.wait_until_finished()
 
 
 def load_count_state(checkpoint_dir: Path) -> dict[str, Any]:
@@ -68,7 +68,7 @@ def load_count_state(checkpoint_dir: Path) -> dict[str, Any]:
     except ImportError as exc:
         raise ImportError("Loading count checkpoints requires the optional [ml] extra.") from exc
 
-    checkpointer = ocp.StandardCheckpointer()
+    checkpointer = ocp.PyTreeCheckpointer(use_ocdbt=os.name != "nt")
     restored = checkpointer.restore(checkpoint_dir)
     if not isinstance(restored, dict):
         raise ValueError("Count checkpoint must restore to a dict of arrays.")
