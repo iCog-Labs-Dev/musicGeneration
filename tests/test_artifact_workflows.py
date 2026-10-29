@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import io
 import json
 import math
@@ -15,6 +16,7 @@ import mido
 import ui
 from aimusic.app.cli import handle_export, handle_generate, handle_inspect
 from aimusic.core.config import EDOConfig, MicrotonalRendering
+from aimusic.planning import plans
 from aimusic.render import SymbolicNote, render_midi, summarize_midi
 from aimusic.theory.edo import EDO
 
@@ -192,6 +194,7 @@ class TestUiArtifactWorkflow(unittest.TestCase):
             comping_program=5,
             lead_program=88,
             drum_track=["drums"],
+            section_wise=False,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -221,6 +224,28 @@ class TestUiArtifactWorkflow(unittest.TestCase):
                 manifest_data["config"]["rendering_method"],
                 params.rendering_method,
             )
+
+    def test_ui_defaults_to_four_section_solves(self) -> None:
+        params = ui._normalize_inputs(
+            11, 16, 12, "4/4", "straight", 120, False,
+            0.75, 0.60, 0.55, 0.45, 2, "MPE", 34, 5, 88, ["drums"],
+        )
+        self.assertTrue(params.section_wise)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(ui, "OUTPUT_DIR", Path(temp_dir)):
+                with patch.object(plans, "solve_endpoint_bridge", wraps=plans.solve_endpoint_bridge) as solve:
+                    artifacts = ui._generate_artifacts(params)
+                self.assertEqual(solve.call_count, 4)
+                manifest = json.loads(artifacts.manifest_path.read_text())
+                config = manifest["config"]["run_config"]["plan_config"]
+                self.assertEqual(config["sectioning_strategy"], "section_wise")
+                self.assertEqual(config["section_names"], list(ui.DEFAULT_SECTION_NAMES))
+                self.assertTrue(artifacts.midi_path.is_file())
+                with self.assertRaisesRegex(ValueError, "at least 4 beats"):
+                    ui._generate_artifacts(replace(params, beats=3))
+                with patch.object(plans, "solve_endpoint_bridge", wraps=plans.solve_endpoint_bridge) as solve:
+                    ui._generate_artifacts(replace(params, beats=4, section_wise=False))
+                self.assertEqual(solve.call_count, 1)
 
 
 if __name__ == "__main__":
