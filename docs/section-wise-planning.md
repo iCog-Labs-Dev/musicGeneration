@@ -30,11 +30,14 @@ per boundary. The hard tolerance applies to actual transitions, not this
 comparison between same-time endpoint preferences. Section-aware priors still
 score actual transitions in each section graph.
 
-After building every section graph once, forward/backward reachability passes
-remove states that cannot participate in a complete song. Boundary probability
-is renormalized over the common surviving support **before** either neighboring
-SB solve. Both solves receive this same multi-state distribution. Empty support
-or non-convergence fails with section context; there is no retry loop.
+After building every section graph once, each section calls
+`solve_endpoint_bridge()` to validate reachability, joint mass feasibility,
+convergence, and realized endpoint marginal errors. Adjacent sections receive
+identical shared supports and probabilities, with only local time indices
+changed. Independent removal, trimming, renormalization or interior blending
+of a shared boundary is rejected with section-local context, even when the
+configured fallback permits changes at the outer song endpoints. There is no
+cross-section retry loop.
 
 Only after solving do we choose actual connections. Sampling carries the
 preceding sampled endpoint into the next solved bridge. MAP uses one Viterbi
@@ -43,7 +46,10 @@ influence the selected connection. Neither procedure reruns SB. The MAP pass
 is linear in retained edges and does not construct a monolithic graph.
 `boundary_choices` records the retained distribution and final selected state;
 join diagnostics expose support sizes, states and probabilities. Song-level
-start/end choices retain their previous behavior; this changes interior joins.
+endpoints honor `endpoint_mode`: distribution mode uses the generated positive
+probability distributions, while explicit singleton mode alone calls
+`select_singleton_endpoints()`. Interior joins remain shared distributions in
+both modes.
 
 On downbeats, the section's authored boundary level is applied. Off downbeats,
 the endpoint generator's meter-legal local boundary level is retained; section
@@ -81,6 +87,10 @@ rebuild graphs or adjust infeasible marginal constraints automatically.
 combined `path`, and global `path_edge_diagnostics`. Shared endpoints appear
 only once in the combined path. Both result types expose `solutions` for
 diagnostic consumers; `SBDiagnostics.from_plan` builds manifest summaries.
+Each section retains `start_mass`, `end_mass`, and `endpoint_resolution`,
+including requested/effective probabilities, removed or trimmed mass,
+feasibility checks, realized probabilities and maximum marginal errors.
+These validated reports are also included in the per-section manifest.
 The section-wise MAP score is the log probability of the best connected path
 under the composed solved kernels. Shared boundary probability is counted once,
 not multiplied in again at every join. This is not a joint optimization of the

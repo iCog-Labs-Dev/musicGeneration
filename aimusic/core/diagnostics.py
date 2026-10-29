@@ -75,6 +75,11 @@ class SBDiagnostics:
             item = cls.from_solution(section.sb_solution).to_dict()
             item.update(dataclasses.asdict(section.section))
             item["rng_stream_id"] = section.rng_stream_id
+            resolution = getattr(section, "endpoint_resolution", None)
+            if resolution is not None:
+                item["endpoint_resolution"] = resolution.to_dict(
+                    getattr(plan, "vocabularies", None)
+                )
             result.sections.append(item)
         result.joins = [dataclasses.asdict(join) for join in getattr(plan, "joins", ())]
         return result

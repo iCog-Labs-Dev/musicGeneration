@@ -43,8 +43,10 @@ class TestSectionPlanning(unittest.TestCase):
         prior = RecordingPrior()
         config = section_config()
         config = dataclasses.replace(config, plan_config=dataclasses.replace(
-            config.plan_config, stitching=StitchingConfig(max_cost=2.0)))
-        with patch.object(plans, "solve_sb", wraps=plans.solve_sb) as solve:
+            config.plan_config, stitching=StitchingConfig(max_cost=3.0)))
+        with patch.object(
+            plans, "solve_endpoint_bridge", wraps=plans.solve_endpoint_bridge
+        ) as solve:
             with patch.object(plans, "build_sparse_graph", wraps=plans.build_sparse_graph) as build:
                 result, next_key = plans.run_method_a(config, key=RNGKey(11), prior=prior)
         self.assertIsInstance(result, plans.SectionWisePlanResult)
@@ -63,7 +65,7 @@ class TestSectionPlanning(unittest.TestCase):
             self.assertEqual(section.sb_solution.problem.sb_config.horizon_t, 4)
             self.assertEqual(section.graph.layers[0].time_index, 0)
             self.assertEqual(section.graph.layers[-1].time_index, 4)
-            self.assertTrue(all(item.stitch_cost <= 2.0
+            self.assertTrue(all(item.stitch_cost <= 3.0
                                 for layer in section.graph.edge_diagnostics_by_time for item in layer))
             for item in section.graph.diagnostics_for_path(section.path):
                 self.assertAlmostEqual(item.final_log_weight,

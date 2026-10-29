@@ -56,7 +56,7 @@ from aimusic.planning.sb import (
 from aimusic.scoring.priors import NullPrior, Prior, PriorContext
 from aimusic.planning.stitching import (
     SectionJoinDiagnostics, StitchPolicy, concatenate_section_paths, stitch_cost,
-    map_section_paths, prune_section_graphs, section_path_score, shared_boundary_distribution,
+    map_section_paths, section_path_score, shared_boundary_distribution,
 )
 from aimusic.theory.edo import EDO
 from aimusic.theory.tonal import get_fifth_steps
@@ -257,6 +257,9 @@ class SectionRunResult:
     graph: SparseGraph
     sb_solution: SBSolution
     bridge: SolvedBridge
+    start_mass: EndpointMassReport
+    end_mass: EndpointMassReport
+    endpoint_resolution: EndpointResolution
     path: Tuple[BeatState, ...]
     path_score: Optional[float]
     sampled_path: Optional[SampledBridgePath]
@@ -353,6 +356,20 @@ def _singleton_endpoint_distribution(state: BeatState, *, time_index: int) -> En
     return EndpointDistribution(
         layer=Layer(time_index=time_index, states=(state,)),
         probabilities=(1.0,),
+    )
+
+
+def _sorted_endpoint_distribution(
+    endpoint: EndpointDistribution,
+) -> EndpointDistribution:
+    """Canonicalize support order without changing support or state masses."""
+    pairs = sorted(
+        zip(endpoint.layer.states, endpoint.probabilities),
+        key=lambda item: _state_sort_key(item[0]),
+    )
+    return EndpointDistribution(
+        layer=replace(endpoint.layer, states=tuple(state for state, _ in pairs)),
+        probabilities=tuple(probability for _, probability in pairs),
     )
 
 
@@ -822,11 +839,23 @@ def run_section_wise(
     vocabs = tonal_context.vocabularies
     sections = build_section_plan(run_config)
     sb_config = _resolved_sb_config(run_config)
-    endpoints, _ = generate_method_a_endpoints(
-        run_config, vocabularies=vocabs, key=key.derive("endpoint_choice"),
-        sample_endpoints=run_config.use_sampling,
-    )
-    boundaries = [_singleton_endpoint_distribution(endpoints.start_choice.state, time_index=0)]
+    endpoints = generate_method_a_endpoints(run_config, vocabularies=vocabs)
+    start_choice: Optional[EndpointChoice] = None
+    end_choice: Optional[EndpointChoice] = None
+    if run_config.endpoint_mode is EndpointMode.SINGLETON:
+        start_choice, end_choice, _ = select_singleton_endpoints(
+            endpoints,
+            key=key.derive("endpoint_choice"),
+            sample=run_config.use_sampling,
+        )
+        start_endpoint = _singleton_endpoint_distribution(start_choice.state, time_index=0)
+        end_endpoint = _singleton_endpoint_distribution(
+            end_choice.state, time_index=run_config.total_beats
+        )
+    else:
+        start_endpoint = _positive_mass_distribution(endpoints.pi0)
+        end_endpoint = _positive_mass_distribution(endpoints.piT)
+    boundaries = [_sorted_endpoint_distribution(start_endpoint)]
     for index, section in enumerate(sections[:-1]):
         try:
             # Use cumulative time for metrical phase, even though solves use local time.
@@ -851,13 +880,18 @@ def run_section_wise(
                                       for meter_id in _meter_ids(run_config.style_config, vocabs)},
                 is_start=True, run_config=boundary_run, vocabularies=vocabs,
             )
-            boundaries.append(shared_boundary_distribution(
-                distribution, following_start, run_config.plan_config.stitching, vocabs, run_config.edo,
+            boundaries.append(_sorted_endpoint_distribution(
+                shared_boundary_distribution(
+                    distribution,
+                    following_start,
+                    run_config.plan_config.stitching,
+                    vocabs,
+                    run_config.edo,
+                )
             ))
         except (ValueError, RuntimeError) as exc:
             raise SectionPlanningError(index, section, "boundary planning", exc) from exc
-    boundaries.append(_singleton_endpoint_distribution(endpoints.end_choice.state,
-                                                       time_index=run_config.total_beats))
+    boundaries.append(_sorted_endpoint_distribution(end_endpoint))
     results: list[SectionRunResult] = []
     pending = []
     for index, section in enumerate(sections):
@@ -889,32 +923,73 @@ def run_section_wise(
             pending.append((section, graph, local_sb, stream_id))
         except (ValueError, RuntimeError) as exc:
             raise SectionPlanningError(index, section, stage, exc) from exc
-    graphs = prune_section_graphs(tuple(item[1] for item in pending))
-    # Drop references to the unpruned graphs once reconciliation is complete.
-    pending = [(section, graph, local_sb, stream_id)
-               for (section, _, local_sb, stream_id), graph in zip(pending, graphs)]
-    for index, (section, graph, _, _) in enumerate(pending):
+    for index, (section, graph, local_sb, stream_id) in enumerate(pending):
+        stage = "endpoint bridge solve"
         try:
-            retained = _align_endpoint_distribution(boundaries[index + 1], graph.layers[-1])
-            boundaries[index + 1] = replace(retained, layer=replace(retained.layer, time_index=section.end_time))
-        except ValueError as exc:
-            raise SectionPlanningError(index, section, "boundary support reconciliation", exc) from exc
-    for index, (section, _, local_sb, stream_id) in enumerate(pending):
-        stage = "boundary support reconciliation"
-        try:
-            graph = graphs[index]
-            start = _align_endpoint_distribution(boundaries[index], graph.layers[0])
-            end = _align_endpoint_distribution(boundaries[index + 1], graph.layers[-1])
-            stage = "SB solve"
-            solution = solve_sb(build_sb_problem(graph, start, end, sb_config=local_sb))
-            if not solution.trace.converged:
-                raise ValueError("Section SB did not converge to the shared boundary marginals.")
-            bridge = solution.to_bridge()
+            start = replace(
+                boundaries[index],
+                layer=replace(boundaries[index].layer, time_index=0),
+            )
+            end = replace(
+                boundaries[index + 1],
+                layer=replace(boundaries[index + 1].layer, time_index=local_sb.horizon_t),
+            )
+            solved = solve_endpoint_bridge(
+                graph,
+                start,
+                end,
+                sb_config=local_sb,
+                policy=run_config.unreachable_policy,
+                flow_tolerance=run_config.endpoint_flow_tolerance,
+                max_fallback_iterations=run_config.max_fallback_iterations,
+                marginal_tolerance=run_config.endpoint_marginal_tolerance,
+                capacity_epsilon=run_config.endpoint_capacity_epsilon,
+                interior_margin=run_config.endpoint_interior_margin,
+            )
+            # An internal boundary is one authored distribution shared by both
+            # neighbors.  A section may not independently trim, drop, blend or
+            # renormalize that request: if it is infeasible, report the section
+            # whose constraints rejected it.
+            if index > 0 and solved.start_mass.modified:
+                raise EndpointValidationError(
+                    "Shared start-boundary distribution would be modified by "
+                    f"section {section.name!r}; use compatible section constraints."
+                )
+            if index < len(sections) - 1 and solved.end_mass.modified:
+                raise EndpointValidationError(
+                    "Shared terminal-boundary distribution would be modified by "
+                    f"section {section.name!r}; use compatible section constraints."
+                )
             results.append(SectionRunResult(
-                section, graph, solution, bridge, (), None, None, stream_id,
+                section=section,
+                graph=solved.graph,
+                sb_solution=solved.solution,
+                bridge=solved.bridge,
+                start_mass=solved.start_mass,
+                end_mass=solved.end_mass,
+                endpoint_resolution=replace(
+                    solved.resolution, start=solved.start_mass, end=solved.end_mass,
+                ),
+                path=(),
+                path_score=None,
+                sampled_path=None,
+                rng_stream_id=stream_id,
             ))
-        except (ValueError, RuntimeError) as exc:
+        except (EndpointFeasibilityError, ValueError, RuntimeError) as exc:
             raise SectionPlanningError(index, section, stage, exc) from exc
+
+    for index in range(1, len(results)):
+        left_boundary = results[index - 1].end_mass.effective
+        right_boundary = results[index].start_mass.effective
+        if (left_boundary.layer.states != right_boundary.layer.states
+                or left_boundary.probabilities != right_boundary.probabilities):
+            cause = EndpointValidationError(
+                "Adjacent section solves did not preserve the identical shared "
+                "boundary support and probabilities."
+            )
+            raise SectionPlanningError(
+                index, results[index].section, "shared boundary validation", cause
+            ) from cause
 
     if not run_config.use_sampling:
         try:
@@ -935,14 +1010,33 @@ def run_section_wise(
                     result.bridge, paths[index], include_initial=index == 0))
         except (ValueError, RuntimeError) as exc:
             raise SectionPlanningError(index, result.section, "path extraction", exc) from exc
-    choices = [endpoints.start_choice]
+    choices = []
+    if start_choice is not None:
+        choices.append(start_choice)
+    else:
+        distribution = results[0].start_mass.effective
+        selected = distribution.layer.states.index(results[0].path[0])
+        choices.append(EndpointChoice(
+            results[0].path[0], distribution, selected,
+            distribution.probabilities[selected],
+            "sample" if run_config.use_sampling else "joint_map",
+        ))
     for index, result in enumerate(results[:-1]):
         distribution = boundaries[index + 1]
         selected = distribution.layer.states.index(result.path[-1])
         choices.append(EndpointChoice(result.path[-1], distribution, selected,
                                       distribution.probabilities[selected],
                                       "sample" if run_config.use_sampling else "joint_map"))
-    choices.append(endpoints.end_choice)
+    if end_choice is not None:
+        choices.append(end_choice)
+    else:
+        distribution = results[-1].end_mass.effective
+        selected = distribution.layer.states.index(results[-1].path[-1])
+        choices.append(EndpointChoice(
+            results[-1].path[-1], distribution, selected,
+            distribution.probabilities[selected],
+            "sample" if run_config.use_sampling else "joint_map",
+        ))
     combined = concatenate_section_paths(tuple(result.path for result in results))
     joins = []
     config = run_config.plan_config.stitching
@@ -964,21 +1058,47 @@ def run_section_wise(
     diagnostics = MethodAPlanDiagnostics(
         section_tags=tuple(section.name for section in sections),
         target_tension_arcs=tuple(section.target_tension_arc for section in sections),
-        chosen_start_state=combined[0], chosen_end_state=combined[-1],
-        endpoint_selection_mode=endpoints.start_choice.selection_mode,
-        chosen_start_probability=endpoints.start_choice.selected_probability,
-        chosen_end_probability=endpoints.end_choice.selected_probability,
+        chosen_start_state=None if start_choice is None else start_choice.state,
+        chosen_end_state=None if end_choice is None else end_choice.state,
+        endpoint_selection_mode=(
+            "distribution" if start_choice is None else start_choice.selection_mode
+        ),
+        chosen_start_probability=(
+            None if start_choice is None else start_choice.selected_probability
+        ),
+        chosen_end_probability=(
+            None if end_choice is None else end_choice.selected_probability
+        ),
         path_mode="sample" if run_config.use_sampling else "map", graph_layer_sizes=layer_sizes,
         bridge_iterations=sum(result.sb_solution.trace.iterations for result in results),
         bridge_converged=all(result.sb_solution.trace.converged for result in results),
         rng_stream_ids=("endpoint_choice",) + tuple(result.rng_stream_id for result in results),
+        endpoint_mode=run_config.endpoint_mode.value,
+        endpoint_request_modified=any(
+            result.endpoint_resolution.request_modified for result in results
+        ),
+        endpoint_modifications=tuple(
+            f"section.{index}.{modification}"
+            for index, result in enumerate(results)
+            for modification in result.endpoint_resolution.modifications
+        ),
+        endpoint_start_feasible_mass=results[0].start_mass.feasible_mass,
+        endpoint_end_feasible_mass=results[-1].end_mass.feasible_mass,
     )
     edge_diagnostics = tuple(
         replace(item, time_index=item.time_index + result.section.start_time)
         for result in results for item in result.graph.diagnostics_for_path(result.path)
     )
+    effective_endpoints = MethodAEndpoints(
+        pi0=results[0].start_mass.effective,
+        piT=replace(
+            results[-1].end_mass.effective,
+            layer=replace(results[-1].end_mass.effective.layer, time_index=run_config.total_beats),
+        ),
+        sections=endpoints.sections,
+    )
     return SectionWisePlanResult(
-        run_config, tonal_context, vocabs, endpoints, tuple(results), tuple(choices), tuple(joins),
+        run_config, tonal_context, vocabs, effective_endpoints, tuple(results), tuple(choices), tuple(joins),
         combined, None if run_config.use_sampling else sum(result.path_score or 0.0 for result in results),
         diagnostics, edge_diagnostics,
     ), key.next_key()
