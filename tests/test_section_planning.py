@@ -9,6 +9,11 @@ from aimusic.core.rng import RNGKey
 from aimusic.core.core_types import BeatState, Edge, EndpointDistribution, Layer
 from aimusic.core.vocab import build_tonal_context
 from aimusic.planning import plans
+from aimusic.planning.endpoint_feasibility import (
+    EndpointFallbackPolicy,
+    EndpointMassInfeasibleError,
+    EndpointMode,
+)
 from aimusic.planning.stitching import (
     concatenate_section_paths, map_section_paths, prune_section_graphs, section_path_score,
     shared_boundary_distribution, stitch_cost,
@@ -67,6 +72,15 @@ class TestSectionPlanning(unittest.TestCase):
             self.assertEqual(section.graph.layers[-1].time_index, 4)
             self.assertTrue(all(item.stitch_cost <= 3.0
                                 for layer in section.graph.edge_diagnostics_by_time for item in layer))
+            self.assertTrue(section.endpoint_resolution.final_flow_check.feasible)
+            self.assertLessEqual(
+                section.start_mass.max_abs_realized_error,
+                config.endpoint_marginal_tolerance,
+            )
+            self.assertLessEqual(
+                section.end_mass.max_abs_realized_error,
+                config.endpoint_marginal_tolerance,
+            )
             for item in section.graph.diagnostics_for_path(section.path):
                 self.assertAlmostEqual(item.final_log_weight,
                                        item.data_contribution + item.gttm_contribution - item.stitch_cost)
@@ -86,6 +100,14 @@ class TestSectionPlanning(unittest.TestCase):
         stats = SBDiagnostics.from_plan(result)
         self.assertEqual([item["name"] for item in stats.sections], ["intro", "theme", "bridge", "return"])
         self.assertEqual(len(stats.joins), 3)
+        self.assertTrue(all("endpoint_resolution" in item for item in stats.sections))
+        for item, section in zip(stats.sections, result.section_results):
+            for side, mass in (("start", section.start_mass), ("end", section.end_mass)):
+                report = item["endpoint_resolution"][side]
+                self.assertIsNotNone(report["max_abs_realized_error"])
+                self.assertEqual(report["max_abs_realized_error"], mass.max_abs_realized_error)
+                self.assertEqual(report["realized_probabilities"], list(mass.realized_probabilities))
+                self.assertEqual(report["removed_state_mass"], mass.removed_state_mass)
         self.assertEqual(stats.iterations_run, sum(s.trace.iterations for s in result.solutions))
         self.assertEqual(len(stats.layer_sizes), 17)
         masses = list(result.solutions[0].marginals.node_marginals_by_layer)
@@ -184,6 +206,83 @@ class TestSectionPlanning(unittest.TestCase):
                 self.assertEqual(first.diagnostics, second.diagnostics)
                 self.assertEqual(first_key, second_key)
                 self.assertEqual(first.boundary_choices, second.boundary_choices)
+
+    def test_distribution_and_singleton_endpoint_modes_are_respected(self):
+        for mode in (EndpointMode.DISTRIBUTION, EndpointMode.SINGLETON):
+            with self.subTest(mode=mode.value):
+                config = dataclasses.replace(section_config(), endpoint_mode=mode)
+                with patch.object(
+                    plans,
+                    "select_singleton_endpoints",
+                    wraps=plans.select_singleton_endpoints,
+                ) as select:
+                    result, _ = plans.run_method_a(config, key=RNGKey(11))
+                self.assertEqual(select.call_count, int(mode is EndpointMode.SINGLETON))
+                self.assertEqual(result.diagnostics.endpoint_mode, mode.value)
+                self.assertEqual(result.endpoints.pi0.layer.time_index, 0)
+                self.assertEqual(result.endpoints.piT.layer.time_index, config.total_beats)
+                if mode is EndpointMode.DISTRIBUTION:
+                    self.assertIsNone(result.diagnostics.chosen_start_state)
+                    self.assertIsNone(result.diagnostics.chosen_end_state)
+                    self.assertGreater(len(result.endpoints.pi0.layer), 1)
+                    self.assertGreater(len(result.endpoints.piT.layer), 1)
+                else:
+                    self.assertIsNotNone(result.diagnostics.chosen_start_state)
+                    self.assertIsNotNone(result.diagnostics.chosen_end_state)
+                    self.assertEqual(len(result.endpoints.pi0.layer), 1)
+                    self.assertEqual(len(result.endpoints.piT.layer), 1)
+
+    def test_strict_endpoint_failure_has_section_context(self):
+        config = dataclasses.replace(
+            section_config(), unreachable_policy=EndpointFallbackPolicy.STRICT
+        )
+        original = plans.solve_endpoint_bridge
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise EndpointMassInfeasibleError("incompatible shared boundary")
+            return original(*args, **kwargs)
+
+        with patch.object(plans, "solve_endpoint_bridge", side_effect=fail_second):
+            with self.assertRaises(plans.SectionPlanningError) as caught:
+                plans.run_method_a(config, key=RNGKey(11))
+        self.assertEqual(caught.exception.section.name, "theme")
+        self.assertEqual(caught.exception.stage, "endpoint bridge solve")
+        self.assertIsInstance(caught.exception.__cause__, EndpointMassInfeasibleError)
+
+    def test_shared_boundary_removal_is_rejected_by_real_solver(self):
+        config = dataclasses.replace(
+            section_config(), total_beats=4, sb_config=SBConfig(horizon_t=4),
+            plan_config=PlanConfig(sectioning_strategy=SectioningStrategy.SECTION_WISE,
+                                   section_names=("intro", "theme"), endpoint_top_k=2),
+        )
+        original = plans.build_sparse_graph
+
+        def unreachable_terminal(*args, **kwargs):
+            graph, key = original(*args, **kwargs)
+            if kwargs["section_context"].section_name == "intro":
+                missing = graph.layers[-1].states[-1]
+                graph = dataclasses.replace(
+                    graph, edges_by_time=graph.edges_by_time[:-1] + (
+                        tuple(edge for edge in graph.edges_by_time[-1] if edge.target != missing),
+                    ), edge_diagnostics_by_time=(),
+                )
+            return graph, key
+
+        for policy, error in (
+            (EndpointFallbackPolicy.STRICT, plans.EndpointReachabilityError),
+            (EndpointFallbackPolicy.DROP_UNREACHABLE_ONLY, plans.EndpointValidationError),
+        ):
+            with self.subTest(policy=policy.value):
+                with patch.object(plans, "build_sparse_graph", side_effect=unreachable_terminal):
+                    with self.assertRaises(plans.SectionPlanningError) as caught:
+                        plans.run_method_a(dataclasses.replace(config, unreachable_policy=policy), key=RNGKey(11))
+                self.assertEqual(caught.exception.section.name, "intro")
+                self.assertEqual(caught.exception.stage, "endpoint bridge solve")
+                self.assertIsInstance(caught.exception.__cause__, error)
 
     def test_section_failure_identifies_stage_and_cause(self):
         config = section_config()
