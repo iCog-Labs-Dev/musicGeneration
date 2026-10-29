@@ -3,6 +3,12 @@
 `SectioningStrategy.SECTION_WISE` executes one graph build and one SB solve
 for every `PlanningSection`. Single-pass generation retains its existing path.
 
+The UI (`python ui.py`) defaults to section-wise planning with intro, theme,
+bridge and return, and 16 beats (four per section). Uncheck **Use section-wise
+planning** for single-pass generation. Four-section runs require at least four
+beats; section names and solver reports are saved in the downloaded manifest.
+The CLI keeps its existing default; pass `--sections` to select section-wise planning.
+
 ```powershell
 python -m aimusic.app.cli generate --seed 11 --beats 16 --sections intro theme bridge return --max-horizon-per-solve 4 --out ./outputs
 ```

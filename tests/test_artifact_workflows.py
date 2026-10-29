@@ -192,6 +192,7 @@ class TestUiArtifactWorkflow(unittest.TestCase):
             comping_program=5,
             lead_program=88,
             drum_track=["drums"],
+            section_wise=False,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
