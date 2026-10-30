@@ -24,6 +24,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+from aimusic.evaluation import endpoint_metrics as ep
 from aimusic.evaluation.schema import (
     STATUS_FAILED,
     STATUS_OK,
@@ -181,8 +182,24 @@ def sb_metrics(solution: Any, *, used: bool) -> Dict[str, Any]:
     }
 
 
+def _endpoint_support(plan: Any, side: str) -> frozenset:
+    """States carrying positive effective endpoint mass (one state in singleton mode)."""
+    report = getattr(plan, "start_mass" if side == "start" else "end_mass", None)
+    if report is not None:
+        dist = report.effective
+        return frozenset(s for s, p in zip(dist.layer.states, dist.probabilities) if p > 0.0)
+    chosen = getattr(plan.diagnostics, "chosen_start_state" if side == "start" else "chosen_end_state", None)
+    if chosen is None:
+        raise ValueError(f"plan exposes neither {side} mass diagnostics nor a chosen {side} state.")
+    return frozenset([chosen])
+
+
 def path_metrics(path: Sequence[Any], plan: Any, horizon: int) -> Dict[str, Any]:
-    """Cheap structural sanity statistics; deliberately NOT musical-quality claims."""
+    """Cheap structural sanity statistics; deliberately NOT musical-quality claims.
+
+    ``reaches_start`` / ``reaches_end`` mean the path begins / ends in the endpoint support (a single
+    state in singleton mode, the positive-mass effective support in distribution mode).
+    """
     states = list(path)
     body = states[:-1]
     n = max(len(body), 1)
@@ -193,8 +210,8 @@ def path_metrics(path: Sequence[Any], plan: Any, horizon: int) -> Dict[str, Any]
         "path_length": len(states),
         "expected_length": horizon + 1,
         "length_ok": len(states) == horizon + 1,
-        "reaches_start": states[0] == plan.endpoints.start_choice.state,
-        "reaches_end": states[-1] == plan.endpoints.end_choice.state,
+        "reaches_start": states[0] in _endpoint_support(plan, "start"),
+        "reaches_end": states[-1] in _endpoint_support(plan, "end"),
         "distinct_state_fraction": len(set(body)) / n,
         "distinct_chords": len({s.chord_id for s in body}),
         "distinct_keys": len({s.key_id for s in body}),
@@ -286,6 +303,7 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
     try:
         from aimusic.core.config import PriorWeights, SBConfig
         from aimusic.core.rng import RNGKey, derive_named_key
+        from aimusic.planning.endpoint_feasibility import EndpointFallbackPolicy, EndpointMode
         from aimusic.planning.plans import MethodARunConfig, run_method_a
         from aimusic.evaluation.baselines import reachable_uniform_walk
 
@@ -311,6 +329,11 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
             prior_weights=PriorWeights(lambda_data=spec.lambda_data, lambda_gttm=spec.lambda_gttm),
             sb_config=sb_config,
             edo=spec.edo,
+            # Always explicit: the MUS-15 library default is DISTRIBUTION, so a singleton (M1) run
+            # must say so, and a distribution run must never be collapsed to singleton.
+            endpoint_mode=EndpointMode(spec.endpoint_mode),
+            unreachable_policy=EndpointFallbackPolicy(spec.endpoint_policy),
+            endpoint_marginal_tolerance=spec.endpoint_marginal_tolerance,
         )
         plan, _ = run_method_a(run_config, key=RNGKey(seed=spec.seed), prior=prior)
         gen_wall = time.perf_counter() - start_wall
@@ -327,6 +350,21 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
 
         stage = "metrics"
         metrics = result["metrics"]
+        if spec.endpoint_mode == "distribution":
+            ep.require_distribution_diagnostics(plan, "distribution")
+            metrics["endpoint"] = ep.endpoint_metrics(plan, marginal_tolerance=spec.endpoint_marginal_tolerance)
+            stage = "calibration"
+            if spec.calibration_samples > 0:
+                starts, terminals = ep.draw_endpoint_samples(
+                    plan, derive_named_key(RNGKey(seed=spec.seed), "eval.calibration"), spec.calibration_samples
+                )
+                calibration = ep.calibration_from_samples(plan, starts, terminals)
+            else:
+                calibration = ep.calibration_unavailable(ep.CAL_NO_SAMPLES, 0)
+            ep.apply_calibration(metrics["endpoint"], calibration)
+            stage = "metrics"
+        else:
+            metrics["endpoint"] = ep.singleton_endpoint_info(plan)
         metrics["graph"] = graph_metrics(plan.graph)
         metrics["sb"] = sb_metrics(plan.sb_solution, used=spec.bridge_mode == "sb")
         metrics["path"] = path_metrics(path, plan, spec.horizon)
@@ -344,8 +382,14 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
         result["prior"] = {"mode": spec.prior_mode, "status": "requested_unavailable", "trained": False}
         result["status"] = STATUS_FAILED
     except Exception as exc:  # noqa: BLE001 - a failed run is a benchmark result
-        result["failure"] = _failure(exc, stage)
+        failure = _failure(exc, stage)
+        if isinstance(exc, ep.EndpointDiagnosticsUnavailable):
+            failure["kind"] = "endpoint_diagnostics_unavailable"
+        result["failure"] = failure
         result["status"] = STATUS_FAILED
+        classified = ep.failure_endpoint_info(exc, spec.endpoint_mode)
+        if classified is not None:
+            result["metrics"]["endpoint"] = classified
     finally:
         runtime = result["runtime"]
         runtime["wall_s"] = time.perf_counter() - start_wall

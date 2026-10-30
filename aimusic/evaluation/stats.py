@@ -16,6 +16,8 @@ import statistics
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 AGGREGATE_METRIC_SECTIONS = ("graph", "sb", "path", "tension", "gttm")
+# Endpoint-distribution metrics (MUS-15) are only meaningful, and only aggregated, in distribution mode.
+ENDPOINT_SECTION = "endpoint"
 
 # Two-sided 95% critical values of Student's t for df = 1..30.
 _T95 = (
@@ -125,6 +127,22 @@ def flatten_metrics(result: Mapping[str, Any]) -> Dict[str, float]:
             num = _numeric(value)
             if num is not None:
                 flat[f"{section}.{name}"] = num
+    if (result.get("spec") or {}).get("endpoint_mode") == "distribution":
+        endpoint = metrics.get(ENDPOINT_SECTION) or {}
+        for name, value in endpoint.items():
+            if isinstance(value, dict):
+                # per-side dicts hold flat scalars; "calibration" is a nested record already
+                # surfaced as calibration_* scalars, and residual rows are lists (skipped).
+                if name not in ("start", "terminal"):
+                    continue
+                for sub, sub_value in value.items():
+                    num = _numeric(sub_value)
+                    if num is not None:
+                        flat[f"{ENDPOINT_SECTION}.{name}.{sub}"] = num
+                continue
+            num = _numeric(value)
+            if num is not None:
+                flat[f"{ENDPOINT_SECTION}.{name}"] = num
     runtime = result.get("runtime") or {}
     for name in ("wall_s", "cpu_s", "peak_rss_mb", "generate_wall_s"):
         num = _numeric(runtime.get(name))
@@ -147,6 +165,7 @@ def _comparison_key(spec: Mapping[str, Any]) -> Tuple[Any, ...]:
     return (
         spec["horizon"], spec["edo"], spec["path_mode"],
         spec["k_max"], spec["d_max"], spec["proposal_budget"],
+        spec.get("endpoint_mode", "singleton"),  # singleton and distribution cells are never paired
     )
 
 
@@ -181,6 +200,8 @@ def aggregate(results: Sequence[Mapping[str, Any]], control: str = "full") -> Di
             "k_max": spec["k_max"],
             "d_max": spec["d_max"],
             "proposal_budget": spec["proposal_budget"],
+            "endpoint_mode": spec.get("endpoint_mode", "singleton"),
+            "generation_method": spec.get("generation_method", "method_a_singleton_endpoints"),
             "n_runs": len(runs),
             "n_ok": len(ok),
             "failure_rate": n_fail / len(runs),
