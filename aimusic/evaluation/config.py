@@ -28,6 +28,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from aimusic.evaluation.schema import (
     CONFIG_SCHEMA_VERSION,
+    DEFAULT_ENDPOINT_MARGINAL_TOLERANCE,
+    DEFAULT_ENDPOINT_POLICY,
+    ENDPOINT_MODES,
+    ENDPOINT_POLICIES,
     PATH_MODES,
     RunSpec,
     canonical_hash,
@@ -81,6 +85,12 @@ class BenchmarkConfig:
     timeout_s: float
     prior_bundle: Optional[str]
     raw: Mapping[str, Any]
+    # MUS-15 endpoint evaluation.  Optional in the file (absent => singleton, the M1 behaviour),
+    # so shipped M1 configs keep their config_hash.
+    endpoint_mode: str = "singleton"
+    endpoint_policy: str = DEFAULT_ENDPOINT_POLICY
+    endpoint_marginal_tolerance: float = DEFAULT_ENDPOINT_MARGINAL_TOLERANCE
+    calibration_samples: int = 0
 
     @property
     def config_hash(self) -> str:
@@ -119,6 +129,27 @@ def parse_config(raw: Mapping[str, Any]) -> BenchmarkConfig:
     if not grid:
         raise ValueError("graph_grid must be non-empty.")
     sb = _require(raw, "sb")
+    endpoint_mode = str(raw.get("endpoint_mode", "singleton"))
+    if endpoint_mode not in ENDPOINT_MODES:
+        raise ValueError(f"endpoint_mode must be one of {ENDPOINT_MODES}, got '{endpoint_mode}'.")
+    endpoint_policy = str(raw.get("endpoint_policy", DEFAULT_ENDPOINT_POLICY))
+    if endpoint_policy not in ENDPOINT_POLICIES:
+        raise ValueError(f"endpoint_policy must be one of {ENDPOINT_POLICIES}, got '{endpoint_policy}'.")
+    marginal_tol = float(raw.get("endpoint_marginal_tolerance", DEFAULT_ENDPOINT_MARGINAL_TOLERANCE))
+    if not marginal_tol > 0:
+        raise ValueError("endpoint_marginal_tolerance must be > 0.")
+    calibration_samples = int(raw.get("calibration_samples", 0))
+    if calibration_samples < 0:
+        raise ValueError("calibration_samples must be >= 0.")
+    if endpoint_mode == "singleton":
+        for key in ("endpoint_policy", "endpoint_marginal_tolerance", "calibration_samples"):
+            if key in raw:
+                raise ValueError(f"'{key}' only applies to endpoint_mode='distribution'.")
+    if endpoint_mode == "distribution" and "no_sb" in conditions:
+        raise ValueError(
+            "condition 'no_sb' cannot be evaluated with endpoint_mode='distribution': the "
+            "uniform baseline has no endpoint-marginal bridge.  Use a separate singleton config."
+        )
     return BenchmarkConfig(
         name=str(_require(raw, "name")),
         config_version=str(_require(raw, "config_version")),
@@ -136,6 +167,10 @@ def parse_config(raw: Mapping[str, Any]) -> BenchmarkConfig:
         timeout_s=float(_require(raw, "timeout_s")),
         prior_bundle=raw.get("prior_bundle"),
         raw=dict(raw),
+        endpoint_mode=endpoint_mode,
+        endpoint_policy=endpoint_policy,
+        endpoint_marginal_tolerance=marginal_tol,
+        calibration_samples=calibration_samples,
     )
 
 
@@ -180,6 +215,10 @@ def expand_matrix(config: BenchmarkConfig) -> List[RunSpec]:
                                     tolerance=config.tolerance,
                                     temperature=config.temperature,
                                     prior_bundle=config.prior_bundle,
+                                    endpoint_mode=config.endpoint_mode,
+                                    endpoint_policy=config.endpoint_policy,
+                                    endpoint_marginal_tolerance=config.endpoint_marginal_tolerance,
+                                    calibration_samples=config.calibration_samples,
                                     config_name=config.name,
                                     config_hash=config_hash,
                                 )

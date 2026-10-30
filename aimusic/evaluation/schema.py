@@ -21,11 +21,29 @@ RESULT_SCHEMA_VERSION = "mus28-result/1"
 AGGREGATE_SCHEMA_VERSION = "mus28-aggregate/1"
 MANIFEST_SCHEMA_VERSION = "mus28-manifest/1"
 
-# What the generator actually does today.  Recorded in every result so that a
-# result is never mistaken for a true distribution-to-distribution Method A
-# (MUS-15), Method B (MUS-18) or section-wise (MUS-16) run.
-GENERATION_METHOD = "method_a_singleton_endpoints"
+# What the generator actually does.  Recorded in every result so that a singleton
+# run is never mistaken for a true distribution-to-distribution Method A (MUS-15)
+# run, nor either for Method B (MUS-18) or section-wise (MUS-16).  The generation
+# method is derived from ``endpoint_mode``; the two can never disagree.
+ENDPOINT_MODES = ("singleton", "distribution")
+GENERATION_METHODS = {
+    "singleton": "method_a_singleton_endpoints",
+    "distribution": "method_a_distribution_endpoints",
+}
+GENERATION_METHOD = GENERATION_METHODS["singleton"]  # M1 default, kept for compatibility
 SECTIONING = "single_pass"
+
+# Mirrors ``EndpointFallbackPolicy`` values (MUS-15); validated by the runner against the enum.
+ENDPOINT_POLICIES = (
+    "strict",
+    "drop_unreachable_only",
+    "drop_and_renormalize",
+    "partial_trim_and_renormalize",
+    "conditional_drop_then_trim",
+)
+DEFAULT_ENDPOINT_POLICY = "drop_unreachable_only"  # MethodARunConfig default
+DEFAULT_ENDPOINT_MARGINAL_TOLERANCE = 1e-6
+BENCHMARK_TYPES = ("evaluation", "long_form_benchmark")
 
 PATH_MODES = ("map", "sample")
 BRIDGE_MODES = ("sb", "uniform")
@@ -64,12 +82,42 @@ class RunSpec:
     tolerance: float
     temperature: float
     prior_bundle: Optional[str] = None
-    generation_method: str = GENERATION_METHOD
+    # Derived from ``endpoint_mode`` when left empty; an explicit value must agree with it.
+    generation_method: str = ""
     sectioning: str = SECTIONING
     config_name: str = ""
     config_hash: str = ""
+    # MUS-15 endpoint evaluation.  Singleton is the M1 behaviour and the default.
+    endpoint_mode: str = "singleton"
+    endpoint_policy: str = DEFAULT_ENDPOINT_POLICY
+    endpoint_marginal_tolerance: float = DEFAULT_ENDPOINT_MARGINAL_TOLERANCE
+    # Extra sampled paths drawn from the one solved bridge to measure calibration (0 = none).
+    calibration_samples: int = 0
 
     def __post_init__(self) -> None:
+        if self.endpoint_mode not in ENDPOINT_MODES:
+            raise ValueError(f"endpoint_mode must be one of {ENDPOINT_MODES}.")
+        if self.endpoint_policy not in ENDPOINT_POLICIES:
+            raise ValueError(f"endpoint_policy must be one of {ENDPOINT_POLICIES}.")
+        if not self.endpoint_marginal_tolerance > 0:
+            raise ValueError("endpoint_marginal_tolerance must be > 0.")
+        if self.calibration_samples < 0:
+            raise ValueError("calibration_samples must be >= 0.")
+        expected = GENERATION_METHODS[self.endpoint_mode]
+        if not self.generation_method:
+            object.__setattr__(self, "generation_method", expected)
+        elif self.generation_method != expected:
+            raise ValueError(
+                f"generation_method '{self.generation_method}' contradicts endpoint_mode "
+                f"'{self.endpoint_mode}' (expected '{expected}')."
+            )
+        if self.bridge_mode == "uniform" and self.endpoint_mode == "distribution":
+            raise ValueError(
+                "The no-SB baseline has no endpoint-marginal bridge, so it cannot be evaluated "
+                "in distribution endpoint mode."
+            )
+        if self.calibration_samples and self.endpoint_mode != "distribution":
+            raise ValueError("calibration_samples requires endpoint_mode='distribution'.")
         if self.path_mode not in PATH_MODES:
             raise ValueError(f"path_mode must be one of {PATH_MODES}.")
         if self.bridge_mode not in BRIDGE_MODES:
@@ -86,7 +134,8 @@ class RunSpec:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunSpec":
-        return cls(**data)
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     @property
     def run_id(self) -> str:
@@ -96,6 +145,10 @@ class RunSpec:
         # run is recognised (and resumable) across configs that share it.
         knobs.pop("config_name")
         knobs.pop("config_hash")
+        if self.endpoint_mode == "singleton":
+            # Legacy (M1) runs never had the endpoint knobs; dropping them keeps old run ids valid.
+            for key in ("endpoint_mode", "endpoint_policy", "endpoint_marginal_tolerance", "calibration_samples"):
+                knobs.pop(key)
         digest = canonical_hash(knobs)[:8]
         return (
             f"{self.condition}-h{self.horizon}-e{self.edo}-s{self.seed}-{self.path_mode}"
@@ -108,6 +161,7 @@ class RunSpec:
         return (
             f"{self.condition}|h={self.horizon}|edo={self.edo}|{self.path_mode}"
             f"|k={self.k_max}|d={self.d_max}|pb={self.proposal_budget}"
+            f"|ep={self.endpoint_mode}"
         )
 
 
@@ -136,6 +190,9 @@ def new_result(spec: RunSpec) -> Dict[str, Any]:
             "path": {},
             "tension": {},
             "gttm": {},
+            # MUS-15 endpoint metrics; filled only in distribution mode.  A singleton run
+            # records an explicit "not_applicable" marker instead of zeros.
+            "endpoint": {},
         },
         "artifacts": {"path_sha256": None},
     }
