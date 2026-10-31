@@ -24,10 +24,14 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.core.diagnostics import RunManifest, SBDiagnostics
+from aimusic.core.protocols import Renderer, ScoreDecoder, TonalMetric
+from aimusic.core.component_types import RenderResult
+from aimusic.render.adapters import RenderResultAdapter
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, run_method_a
+from aimusic.planning.protocols import CandidateGenerator
 from aimusic.render import render_midi
 from aimusic.render.midi_render import TrackInstrumentConfig
 from aimusic.theory.edo import EDO
@@ -78,6 +82,7 @@ class GeneratedArtifacts:
     midi_path: Path
     manifest_path: Path
     wav_path: Path
+    render_result: RenderResult | None = None
 
 
 @dataclass(frozen=True)
@@ -217,7 +222,14 @@ def _build_track_instruments(params: GenerationParams) -> dict[str, TrackInstrum
     return instruments
 
 
-def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
+def _generate_artifacts(
+    params: GenerationParams,
+    *,
+    tonal_metric: TonalMetric | None = None,
+    candidate_generator: CandidateGenerator | None = None,
+    decoder: ScoreDecoder | None = None,
+    renderer: Renderer | None = None,
+) -> GeneratedArtifacts:
     style_config = StyleConfig(
         allowed_meters=(params.meter,),
         groove_families=(params.groove_family,),
@@ -237,8 +249,13 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         edo=params.edo,
     )
 
-    plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=params.seed))
-    score, _ = decode_path_to_score(
+    selected_decoder: ScoreDecoder = decode_path_to_score if decoder is None else decoder
+    selected_renderer = RenderResultAdapter(render_midi if renderer is None else renderer)
+    plan_result, next_key = run_method_a(
+        run_config, key=RNGKey(seed=params.seed),
+        tonal_metric=tonal_metric, candidate_generator=candidate_generator,
+    )
+    score, _ = selected_decoder(
         plan_result.path,
         decode_config=decode_config,
         vocabularies=plan_result.vocabularies,
@@ -251,6 +268,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         plan_result.vocabularies,
         edo=params.edo,
         sections=plan_result.endpoints.sections,
+        tonal_metric=tonal_metric,
     )
     track_instruments = _build_track_instruments(params)
     manifest = RunManifest(
@@ -280,7 +298,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
     with score_path.open("w", encoding="utf-8") as f:
         json.dump(score.to_dict(), f, indent=2)
 
-    render_midi(
+    render_result = selected_renderer(
         score,
         EDO(
             EDOConfig(
@@ -303,6 +321,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         midi_path=midi_path,
         manifest_path=manifest_path,
         wav_path=wav_path,
+        render_result=render_result,
     )
 
 

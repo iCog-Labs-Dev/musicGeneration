@@ -6,12 +6,10 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 _logger = logging.getLogger(__name__)
 
-from aimusic.planning.candidates import (
-    CandidateGenerationResult,
-    CandidateRejection,
-    get_valid_next_states,
-    is_legal_transition,
-)
+from aimusic.planning.candidates import MetricBoundCandidates, is_legal_transition
+from aimusic.core.component_types import CandidateGenerationResult, CandidateRejection
+from aimusic.core.protocols import TonalMetric
+from aimusic.planning.protocols import CandidateGenerator
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Edge, Layer
 from aimusic.core.rng import RNGKey
@@ -25,7 +23,7 @@ from aimusic.scoring.priors import (
     calculate_transition_score_breakdowns,
 )
 from aimusic.scoring.gttm_features import FEATURE_REGISTRY, TransitionWindow
-from aimusic.theory.tonal import basic_space_distance, tonal_distance
+from aimusic.theory.tonal import chord_distance, root_distance
 from aimusic.core.vocab import (
     DEFAULT_VOCABULARIES,
     Vocabularies,
@@ -66,6 +64,8 @@ def _estimate_endpoint_distance(
     end_layer: Layer,
     vocabularies: Vocabularies,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Cheap distance-to-go heuristic used for K_max pruning."""
     if len(end_layer) == 0:
@@ -79,14 +79,15 @@ def _estimate_endpoint_distance(
     for target in end_layer:
         target_key = vocabularies.keys.token_for_id(target.key_id)
         target_chord = vocabularies.chords.token_for_id(target.chord_id)
-        harmonic = basic_space_distance(
+        harmonic = chord_distance(
             source_chord.root_pc,
             source_chord.quality,
             target_chord.root_pc,
             target_chord.quality,
             resolved_edo,
+            tonal_metric=tonal_metric,
         )
-        tonal = tonal_distance(source_key.root_pc, target_key.root_pc, resolved_edo)
+        tonal = root_distance(source_key.root_pc, target_key.root_pc, resolved_edo, tonal_metric=tonal_metric)
         structural = (
             abs(state.boundary_lvl - target.boundary_lvl)
             + abs(state.beat_in_bar - target.beat_in_bar) * 0.25
@@ -106,6 +107,8 @@ def _pruning_score(
     vocabularies: Vocabularies,
     style_config: StyleConfig,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     if steps_remaining == 1 and not any(
         is_legal_transition(
@@ -122,6 +125,7 @@ def _pruning_score(
         end_layer,
         vocabularies,
         edo=edo,
+        tonal_metric=tonal_metric,
     )
     horizon_scale = max(1, steps_remaining)
     return float(best_incoming_log_mass - (endpoint_distance / horizon_scale))
@@ -134,6 +138,8 @@ def _edge_priority_score(
     vocabularies: Vocabularies,
     style_config: StyleConfig,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     if steps_remaining == 1 and not any(
         is_legal_transition(
@@ -153,6 +159,7 @@ def _edge_priority_score(
                 end_layer,
                 vocabularies,
                 edo=edo,
+                tonal_metric=tonal_metric,
             )
             / max(1, steps_remaining)
         )
@@ -404,6 +411,7 @@ def _rescore_retained_edges_with_windows(
     weights: Optional[PriorWeights],
     vocabularies: Vocabularies,
     edo: int,
+    tonal_metric: TonalMetric | None = None,
 ) -> tuple[Tuple[Tuple[Edge, ...], ...], Tuple[Tuple[EdgeScoreDiagnostics, ...], ...]]:
     """Second pass: score retained edges against their bounded retained successors.
 
@@ -458,6 +466,7 @@ def _rescore_retained_edges_with_windows(
             weights=weights,
             vocabularies=vocabularies,
             edo=edo,
+            tonal_metric=tonal_metric,
         )
         offset = 0
         rescored_pairs: list[tuple[Edge, EdgeScoreDiagnostics]] = []
@@ -525,6 +534,53 @@ def _candidate_result_for_target_layer(
     )
 
 
+def _validate_supplied_candidates(
+    result: CandidateGenerationResult,
+    key: RNGKey,
+    source: BeatState,
+    time_index: int,
+    style: StyleConfig,
+    vocabularies: Vocabularies,
+) -> None:
+    if not isinstance(result, CandidateGenerationResult):
+        raise TypeError("candidate_generator must return a CandidateGenerationResult.")
+    if not isinstance(key, RNGKey):
+        raise TypeError("candidate_generator must return an RNGKey.")
+    if result.source_state != source or result.time_index != time_index:
+        raise ValueError("candidate_generator result must match the requested source and time.")
+    if not isinstance(result.states, tuple):
+        raise TypeError("candidate_generator states must be a tuple of BeatState values.")
+    for count in (result.proposed_count, result.unique_count):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("candidate_generator counts must be nonnegative integers.")
+    if result.scores and len(result.scores) != len(result.states):
+        raise ValueError("candidate_generator scores must align with its states.")
+    for candidate in result.states:
+        if not isinstance(candidate, BeatState):
+            raise TypeError("candidate_generator states must contain BeatState values.")
+        identifiers = (
+            (vocabularies.meters, candidate.meter_id),
+            (vocabularies.keys, candidate.key_id),
+            (vocabularies.chords, candidate.chord_id),
+            (vocabularies.roles, candidate.role_id),
+            (vocabularies.heads, candidate.head_id),
+            (vocabularies.grooves, candidate.groove_id),
+            (vocabularies.boundaries, candidate.boundary_lvl),
+        )
+        if any(not vocabulary.has_id(identifier) for vocabulary, identifier in identifiers):
+            raise ValueError("candidate_generator returned an unknown vocabulary identifier.")
+        legal, reason = is_legal_transition(source, candidate, style, vocabularies)
+        if not legal:
+            raise ValueError(f"candidate_generator returned an illegal transition: {reason}")
+    if len(set(result.states)) != len(result.states):
+        raise ValueError("candidate_generator states must be deduplicated.")
+    for rejection in result.rejections:
+        if not isinstance(rejection, CandidateRejection):
+            raise TypeError("candidate_generator rejections must contain CandidateRejection values.")
+        if rejection.source_state != source or rejection.time_index != time_index:
+            raise ValueError("candidate_generator rejection must match the requested source and time.")
+
+
 def build_sparse_graph(
     start_layer: Layer,
     end_layer: Layer,
@@ -540,6 +596,8 @@ def build_sparse_graph(
     d_max: int,
     proposal_budget: Optional[int] = None,
     prior_guided_proposals: Optional[bool] = None,
+    tonal_metric: TonalMetric | None = None,
+    candidate_generator: CandidateGenerator | None = None,
 ) -> tuple[SparseGraph, RNGKey]:
     """Build a bounded sparse graph of BeatState transitions.
 
@@ -563,6 +621,9 @@ def build_sparse_graph(
     resolved_style = StyleConfig() if style_config is None else style_config
     resolved_vocabs = _resolved_vocabs(vocabularies)
     resolved_prior = _resolved_prior(prior)
+    resolved_candidates: CandidateGenerator = (
+        MetricBoundCandidates(tonal_metric) if candidate_generator is None else candidate_generator
+    )
     resolved_edo = _edo_size(resolved_vocabs) if edo is None else edo
     validate_vocabulary_compatibility(resolved_vocabs, resolved_edo)
     resolved_proposal_budget = (
@@ -613,7 +674,7 @@ def build_sparse_graph(
                     vocabularies=resolved_vocabs,
                 )
             else:
-                candidate_result, current_key = get_valid_next_states(
+                candidate_result, current_key = resolved_candidates(
                     source_state,
                     current_time,
                     style_config=resolved_style,
@@ -626,6 +687,11 @@ def build_sparse_graph(
                     proposal_budget=resolved_proposal_budget,
                     prior_guided_proposals=resolved_prior_guided_proposals,
                 )
+                if candidate_generator is not None:
+                    _validate_supplied_candidates(
+                        candidate_result, current_key, source_state, current_time,
+                        resolved_style, resolved_vocabs,
+                    )
 
             raw_candidate_count += candidate_result.proposed_count
             legal_candidate_count += candidate_result.legal_count
@@ -653,6 +719,7 @@ def build_sparse_graph(
                     weights=weights,
                     vocabularies=resolved_vocabs,
                     edo=resolved_edo,
+                    tonal_metric=tonal_metric,
                 )
                 if queries
                 else ()
@@ -675,6 +742,7 @@ def build_sparse_graph(
                         resolved_vocabs,
                         resolved_style,
                         edo=resolved_edo,
+                        tonal_metric=tonal_metric,
                     ),
                     _state_sort_key(edge.target),
                 )
@@ -717,6 +785,7 @@ def build_sparse_graph(
                             resolved_vocabs,
                             resolved_style,
                             edo=resolved_edo,
+                            tonal_metric=tonal_metric,
                         ),
                         _state_sort_key(state),
                     ),
@@ -737,6 +806,7 @@ def build_sparse_graph(
                                 resolved_vocabs,
                                 resolved_style,
                                 edo=resolved_edo,
+                                tonal_metric=tonal_metric,
                             ),
                         )
                     )
@@ -772,6 +842,7 @@ def build_sparse_graph(
         weights=weights,
         vocabularies=resolved_vocabs,
         edo=resolved_edo,
+        tonal_metric=tonal_metric,
     )
     return SparseGraph(
         layers=tuple(layers),

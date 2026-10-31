@@ -52,6 +52,24 @@ Violations raise `ContractViolation` and abort the run.
 
 ## Emission policy
 
+### Supplied renderer requirement
+
+REQ-10 lets the CLI and UI artifact helpers accept a legacy `ScoreRenderer` or a
+`ReportingScoreRenderer`. Both must write valid MIDI at the requested destination.
+Legacy renderers return `None`; reporting renderers return a `RenderResult`.
+`RenderResultAdapter` provides the actual path, format, file size and tuning
+without changing the legacy function. Inconsistent reports and missing files
+raise an error before success-manifest or package creation. The adapter passes
+a fresh temporary output path to the renderer, then atomically replaces the
+final destination after validation. Failure removes temporary output and
+preserves any previous final MIDI file. The CLI still owns score JSON, manifest, structure,
+tuning, and package emission. The UI helper writes flat score/MIDI/manifest
+files for preview and download; it does not emit a RenderPackage.
+A double that only records a call does not satisfy CLI packaging. See the
+[component extension guide](extending-components.md) for the renderer contract.
+
+### Product output
+
 **Always** emit a RenderPackage from product `generate` (cheap; every symbolic run
 is audio-ready). Legacy flat artifacts (`{run_id}_score.json`, `.mid`,
 `_manifest.json`) remain for Gradio/UI compatibility.
@@ -64,3 +82,4 @@ Audio may fill `inferred` / `host` only when planner structure is missing; then
 
 - `tests/test_render_package.py` — write/load/invariants + CLI generate emits package
 - `tests/test_architecture.py` — import quarantine
+- `tests/test_artifact_injection.py` — supplied decoder/renderer output reaches real MIDI packaging

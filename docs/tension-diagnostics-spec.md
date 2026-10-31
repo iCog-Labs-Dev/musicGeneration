@@ -1,14 +1,16 @@
 # Tension Diagnostics — Requirements & Design Spec
 
-> **Status:** Draft, pre-implementation. This document is the reference for
-> the fix and its acceptance criteria. Update it if the design changes during
-> implementation — it should stay accurate, not just aspirational.
+> **Status:** Implemented in `aimusic/scoring/tension.py`. The original problem
+> and implementation scope below preserve the tension task's history.
+> Current metric selection and signature changes from REQ-10 are documented
+> below. The executable tests are `tests/test_tension.py` and
+> `tests/test_metric_injection.py`.
 
 ---
 
-## 1. Problem statement
+## 1. Original problem statement
 
-Tension in this codebase is currently computed **four separate times**, in
+Before the tension implementation, tension was computed **four separate times**, in
 four separate places, with four separate formulas — none of which use tonal
 distance:
 
@@ -66,12 +68,12 @@ motion (with an optional head/groove contribution), and use it to:
 - **`tests/test_diagnostics.py`**
   - Remove/replace `test_compute_tension_curve` (currently asserts against the fictional vocabulary — this test is *validating the bug*). Replaced with an assertion that `StructuralDiagnostics`/`RunManifest` correctly carry the new curve/deviation fields end-to-end.
 
-### Untouched (explicitly)
+### Untouched in the original tension change
 
 - `aimusic/theory/tonal.py` — `tonal_distance()` / `basic_space_distance()` are consumed as-is, not modified.
 - `aimusic/decode.py` — `_tension_level()` stays as the rendering-dynamics function it is.
 - `aimusic/planning/plans.py` — `PlanningSection.target_tension_arc` schema is consumed as-is; no change to how sections are authored.
-- `aimusic/scoring/gttm_features.py` — has prior art (`harmonic_key_proximity_feature`, `harmonic_chord_proximity_feature`, `cadential_harmonic_motion_feature`), built on the same `tonal_distance`/`basic_space_distance` primitives over the same `(prev_state, next_state)` convention, and — like the old `compute_tension_curve` — currently dead outside its own test module. **Not reused directly**: those are unbounded, unclamped proximity scores (`1/(1+distance)`, with negative sentinel values for unresolved tokens) meant for GTTM-style prior scoring, not a clamped `[0,1]` diagnostics value. The new tension module uses the same decay family (`distance/(1+distance)`, its functional inverse) for consistency rather than inventing a third unrelated scheme. See the module docstring in `aimusic/scoring/tension.py` for the explicit rationale.
+- `aimusic/scoring/gttm_features.py` — contains harmonic proximity and cadence features used by structural scoring. Tension diagnostics use the same selected metric but do not reuse those feature scores directly. Proximity uses `1/(1+distance)` and may return negative sentinels for unresolved tokens. Diagnostic motion uses `distance/(1+distance)` before weighting and clamping. See [GTTM transition context](gttm-transition-context.md) for production scoring and rescoring.
 
 ---
 
@@ -103,7 +105,7 @@ class TensionWeights:
 Explicit, named, defaults documented with rationale (e.g. why role dominates
 boundary). No magic numbers buried in formula bodies.
 
-### 4.3 `beat_tension(prev_state, state, vocabularies, edo, weights=DEFAULT_WEIGHTS) -> float`
+### 4.3 `beat_tension(prev_state, state, vocabularies, edo, weights=DEFAULT_WEIGHTS, *, tonal_metric=None) -> float`
 
 Pure function. No I/O, no globals, no mutation. Given two consecutive
 `BeatState`s plus the `Vocabularies`/`edo` needed to resolve their labels and
@@ -122,7 +124,7 @@ For the first beat in a path (no `prev_state`), key/chord motion terms are 0
 by convention (documented) — tension there falls back to role + boundary
 only.
 
-### 4.4 `realized_tension_curve(path, vocabularies, edo, weights=DEFAULT_WEIGHTS) -> List[Tuple[float, float]]`
+### 4.4 `realized_tension_curve(path, vocabularies, edo, weights=DEFAULT_WEIGHTS, *, tonal_metric=None) -> List[Tuple[float, float]]`
 
 Walks consecutive pairs in `path`, calling `beat_tension` for each beat index,
 returning `(time, tension)` pairs. This is what replaces `cli.py`'s inline
@@ -166,12 +168,27 @@ report, no side effects.
 
 ### 4.7 Wiring into the manifest
 
-`cli.py`'s `_build_structural_diagnostics` becomes responsible for calling
-all three functions and packing the results into `StructuralDiagnostics`
-(realized + target curves) and a separate `tension_deviation` dict
-(`dataclasses.asdict(report)`) attached either on `StructuralDiagnostics` or
-directly on `RunManifest.to_dict()` — final placement decided during
-implementation, documented here once settled.
+`cli.py`'s `_build_structural_diagnostics` calls the realized-curve,
+target-curve, and comparison functions. `StructuralDiagnostics` stores
+`tension_curve`, `target_tension_curve`, and the `tension_deviation` dictionary.
+`RunManifest.to_dict()` serializes those fields under `structure` and records
+the tension model version at the top level. The UI artifact helper uses the
+same diagnostic builder.
+
+### Selected metric and experiment provenance (REQ-10)
+
+`beat_tension` and `realized_tension_curve` now accept an optional,
+keyword-only `tonal_metric: TonalMetric | None`. The CLI and UI supply the
+same metric selected for planning. Root and chord distances both use it;
+their normalization remains `distance / (1 + distance)`, and first-beat
+motion remains zero. The authored target curve is unchanged.
+
+Omitting the metric preserves the existing formulas, default weights, and
+`TENSION_MODEL_VERSION = "1.0.0"`. The model version identifies the tension
+formula, not a caller's custom component. Existing manifests do not serialize
+runtime metric objects, so custom experiments must separately record their
+implementation version and settings. See the
+[component extension guide](extending-components.md) for the full contract.
 
 ---
 

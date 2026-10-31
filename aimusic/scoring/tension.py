@@ -12,8 +12,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 from aimusic.core.core_types import BeatState
+from aimusic.core.protocols import TonalMetric
 from aimusic.core.vocab import Vocabularies
-from aimusic.theory.tonal import basic_space_distance, tonal_distance
+from aimusic.theory.tonal import chord_distance, root_distance
 
 if TYPE_CHECKING:  # pragma: no cover - import-time cycle avoidance only
     from aimusic.planning.plans import PlanningSection
@@ -84,12 +85,14 @@ def _key_motion_component(
     state: BeatState,
     vocabularies: Vocabularies,
     edo: int,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     if prev_state is None:
         return 0.0
     prev_root = vocabularies.keys.token_for_id(prev_state.key_id).root_pc
     root = vocabularies.keys.token_for_id(state.key_id).root_pc
-    distance = tonal_distance(prev_root, root, edo)
+    distance = root_distance(prev_root, root, edo, tonal_metric=tonal_metric)
     return _decay_normalize(distance)
 
 
@@ -98,15 +101,18 @@ def _chord_motion_component(
     state: BeatState,
     vocabularies: Vocabularies,
     edo: int,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     if prev_state is None:
         return 0.0
     prev_chord = vocabularies.chords.token_for_id(prev_state.chord_id)
     chord = vocabularies.chords.token_for_id(state.chord_id)
-    distance = basic_space_distance(
+    distance = chord_distance(
         prev_chord.root_pc, prev_chord.quality,
         chord.root_pc, chord.quality,
         edo,
+        tonal_metric=tonal_metric,
     )
     return _decay_normalize(distance)
 
@@ -132,6 +138,8 @@ def beat_tension(
     vocabularies: Vocabularies,
     edo: int,
     weights: TensionWeights = DEFAULT_WEIGHTS,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Compute tension in [0, 1] for `state`, given the beat that precedes it.
 
@@ -139,18 +147,18 @@ def beat_tension(
       - role component: authored harmonic function (hold < prep < change < cad)
       - boundary component: structural boundary level, normalized by the
         vocabulary's max boundary level
-      - key motion component: circle-of-fifths distance (Lerdahl's *j*)
-        between the previous and current key root, normalized by edo // 2
-      - chord motion component: full Lerdahl TPS distance (*j + k*) between
-        the previous and current chord, normalized by a generous fixed cap
+      - key motion component: selected root distance, defaulting to
+        circle-of-fifths distance, normalized by distance / (1 + distance)
+      - chord motion component: selected chord distance, defaulting to
+        Lerdahl TPS distance, normalized by distance / (1 + distance)
       - head/groove component (off by default): whether the head or groove
         token changed beat-to-beat
 
     """
     role = _role_component(state, vocabularies)
     boundary = _boundary_component(state, vocabularies)
-    key_motion = _key_motion_component(prev_state, state, vocabularies, edo)
-    chord_motion = _chord_motion_component(prev_state, state, vocabularies, edo)
+    key_motion = _key_motion_component(prev_state, state, vocabularies, edo, tonal_metric=tonal_metric)
+    chord_motion = _chord_motion_component(prev_state, state, vocabularies, edo, tonal_metric=tonal_metric)
     head_groove = _head_groove_component(prev_state, state, vocabularies)
 
     total = (
@@ -168,6 +176,8 @@ def realized_tension_curve(
     vocabularies: Vocabularies,
     edo: int,
     weights: TensionWeights = DEFAULT_WEIGHTS,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> List[Tuple[float, float]]:
     """Time-indexed realized tension curve from a selected BeatState path.
 
@@ -178,7 +188,7 @@ def realized_tension_curve(
     curve: List[Tuple[float, float]] = []
     prev_state: Optional[BeatState] = None
     for index, state in enumerate(path):
-        tension = beat_tension(prev_state, state, vocabularies, edo, weights)
+        tension = beat_tension(prev_state, state, vocabularies, edo, weights, tonal_metric=tonal_metric)
         curve.append((float(index), tension))
         prev_state = state
     return curve

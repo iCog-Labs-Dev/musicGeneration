@@ -83,3 +83,12 @@ to inspect, override, or replay independently of running the whole path.
 - Backward compatible: `generate_bass_events` / `generate_comping_events` /
   `generate_lead_events` / `generate_drum_events` keep their existing
   signatures and return types; `decode_path_to_score` required no changes.
+
+## Related interfaces
+
+REQ-10 later added a separate whole-score `ScoreDecoder` protocol, documented
+in [ADR-007](ADR-007-pluggable-component-protocols.md). It replaces the complete
+path-to-Score operation through orchestration arguments. The per-beat
+`TrackGenerator`, decoder-state values, and track wrappers described here keep
+their existing contracts. See the [component extension guide](../extending-components.md)
+for selecting a whole-score decoder.
