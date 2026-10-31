@@ -13,6 +13,7 @@ from aimusic.core.config import (
     PriorWeights,
 )
 from aimusic.core.core_types import BeatState
+from aimusic.core.protocols import TonalMetric
 from aimusic.scoring.gttm_features import (
     TransitionWindow,
     transition_feature_vector,
@@ -696,6 +697,7 @@ def _transition_score_breakdown_from_data_logp(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    tonal_metric: TonalMetric | None = None,
 ) -> TransitionScoreBreakdown:
     raw = transition_feature_vector(
         query.prev_state,
@@ -705,6 +707,7 @@ def _transition_score_breakdown_from_data_logp(
         meters=meters,
         vocabularies=vocabularies,
         edo=edo,
+        tonal_metric=tonal_metric,
     )
     weighted = weighted_feature_breakdown(
         query.prev_state,
@@ -715,6 +718,7 @@ def _transition_score_breakdown_from_data_logp(
         vocabularies=vocabularies,
         edo=edo,
         weights=weights,
+        tonal_metric=tonal_metric,
     )
     gttm_score = float(sum(weighted.values()))
     gttm_energy = -gttm_score
@@ -745,6 +749,7 @@ def calculate_transition_score_breakdown(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    tonal_metric: TonalMetric | None = None,
 ) -> TransitionScoreBreakdown:
     """Scalar transition scoring with raw and weighted feature diagnostics."""
     resolved_weights = PriorWeights() if weights is None else weights
@@ -758,6 +763,7 @@ def calculate_transition_score_breakdown(
         meters=meters,
         vocabularies=vocabularies,
         edo=edo,
+        tonal_metric=tonal_metric,
     )
 
 
@@ -770,6 +776,7 @@ def calculate_transition_score_breakdowns(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    tonal_metric: TonalMetric | None = None,
 ) -> Tuple[TransitionScoreBreakdown, ...]:
     """Batch transition scoring with windows aligned one-to-one with queries."""
     query_items = tuple(queries)
@@ -794,6 +801,7 @@ def calculate_transition_score_breakdowns(
             meters=meters,
             vocabularies=vocabularies,
             edo=edo,
+            tonal_metric=tonal_metric,
         )
         for idx, query in enumerate(query_items)
     )
@@ -811,6 +819,7 @@ def calculate_transition_log_weight(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Combine prior data likelihood and GTTM energy into one graph-ready edge weight."""
     return calculate_transition_score_breakdown(
@@ -824,6 +833,7 @@ def calculate_transition_log_weight(
         meters=meters,
         vocabularies=vocabularies,
         edo=edo,
+        tonal_metric=tonal_metric,
     ).final_log_weight
 
 
@@ -836,6 +846,7 @@ def calculate_transition_log_weights(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    tonal_metric: TonalMetric | None = None,
 ) -> Tuple[float, ...]:
     """Batch version of transition log-weight scoring."""
     return tuple(
@@ -848,6 +859,7 @@ def calculate_transition_log_weights(
             meters=meters,
             vocabularies=vocabularies,
             edo=edo,
+            tonal_metric=tonal_metric,
         )
     )
 

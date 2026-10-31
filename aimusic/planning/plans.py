@@ -21,6 +21,10 @@ from aimusic.core.config import (
 )
 from aimusic.core.core_types import BeatState, EndpointDistribution, Layer, Score
 from aimusic.core.rng import RNGKey, allocate_named_keys, random_unit
+from aimusic.core.protocols import Renderer, ScoreDecoder, TonalMetric
+from aimusic.core.component_types import RenderResult
+from aimusic.render.adapters import RenderResultAdapter
+from aimusic.planning.protocols import CandidateGenerator
 from aimusic.core.vocab import TonalContext, Vocabularies, build_tonal_context
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.graph import EdgeScoreDiagnostics, SparseGraph, build_sparse_graph
@@ -250,6 +254,7 @@ class ExactBridgeDemoResult:
     plan_result: MethodAPlanResult
     score: Score
     output_path: str
+    render_result: RenderResult | None = None
 
 
 def _resolved_vocabs(
@@ -608,6 +613,8 @@ def run_method_a(
     key: RNGKey,
     prior: Optional[Prior] = None,
     vocabularies: Optional[Vocabularies] = None,
+    tonal_metric: TonalMetric | None = None,
+    candidate_generator: CandidateGenerator | None = None,
 ) -> tuple[MethodAPlanResult, RNGKey]:
     """Run Method A from endpoint planning through SB path extraction."""
     _logger.info(f"Method A: {run_config.total_beats} beats, seed={run_config.seed}")
@@ -660,6 +667,8 @@ def run_method_a(
         edo=run_config.edo,
         key=streams["candidate_proposal"],
         d_max=resolved_sb.d_max,
+        tonal_metric=tonal_metric,
+        candidate_generator=candidate_generator,
     )
     _logger.info(f"Graph built: {len(graph.layers)} layers, {sum(len(l.states) for l in graph.layers)} states")
     # feasibility (L1 + L2 max-flow) -> fallback by policy -> build_sb_problem ->
@@ -765,6 +774,10 @@ def render_exact_bridge_demo(
     decode_config: Optional[DecodeConfig] = None,
     tempo_bpm: float = 120.0,
     edo: int = 12,
+    tonal_metric: TonalMetric | None = None,
+    candidate_generator: CandidateGenerator | None = None,
+    decoder: ScoreDecoder | None = None,
+    renderer: Renderer | None = None,
 ) -> ExactBridgeDemoResult:
     """Render a short bridge example using the current Method A pipeline.
 
@@ -782,8 +795,13 @@ def render_exact_bridge_demo(
         decode_config=resolved_decode,
         edo=edo,
     )
-    plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=seed))
-    score, _ = decode_path_to_score(
+    plan_result, next_key = run_method_a(
+        run_config, key=RNGKey(seed=seed),
+        tonal_metric=tonal_metric, candidate_generator=candidate_generator,
+    )
+    selected_decoder: ScoreDecoder = decode_path_to_score if decoder is None else decoder
+    selected_renderer = RenderResultAdapter(render_midi if renderer is None else renderer)
+    score, _ = selected_decoder(
         plan_result.path,
         decode_config=resolved_decode,
         vocabularies=plan_result.vocabularies,
@@ -791,7 +809,7 @@ def render_exact_bridge_demo(
         tempo_bpm=tempo_bpm,
         key=next_key,
     )
-    render_midi(
+    render_result = selected_renderer(
         score,
         EDO(EDOConfig(n=plan_result.tonal_context.n, base_tuning=0)),
         output_path,
@@ -800,4 +818,5 @@ def render_exact_bridge_demo(
         plan_result=plan_result,
         score=score,
         output_path=output_path,
+        render_result=render_result,
     )

@@ -13,8 +13,12 @@ Design principles (per readme §2.1):
 from __future__ import annotations
 
 from functools import lru_cache
+from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 from typing import Dict, FrozenSet, Tuple
 
+from aimusic.core.protocols import TonalMetric
 from aimusic.theory.edo import EDO
 
 
@@ -293,6 +297,65 @@ def nearest_roots(root_pc: int, edo: int = 12, limit: int = 3) -> Tuple[int, ...
 
     candidates.sort(key=lambda item: (item[0], item[1]))
     return tuple(root for _, root in candidates[:limit])
+
+
+@dataclass(frozen=True)
+class ExistingTonalMetric:
+    """Default metric adapter preserving the existing cached formulas."""
+
+    def tonal_distance(self, a_root: int, b_root: int, edo: int = 12) -> float:
+        return tonal_distance(a_root, b_root, edo)
+
+    def basic_space_distance(
+        self, a_root: int, a_quality: str,
+        b_root: int, b_quality: str, edo: int = 12,
+    ) -> float:
+        return basic_space_distance(a_root, a_quality, b_root, b_quality, edo)
+
+
+def _checked_distance(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("tonal metrics must return a real numeric distance.")
+    if not isfinite(value) or value < 0:
+        raise ValueError("tonal metrics must return finite nonnegative distances.")
+    return float(value)
+
+
+def root_distance(
+    a_root: int, b_root: int, edo: int = 12,
+    *, tonal_metric: TonalMetric | None = None,
+) -> float:
+    """Use the selected metric without putting plugin objects in default caches."""
+    if tonal_metric is None:
+        return tonal_distance(a_root, b_root, edo)
+    return _checked_distance(tonal_metric.tonal_distance(a_root, b_root, edo))
+
+
+def chord_distance(
+    a_root: int, a_quality: str, b_root: int, b_quality: str, edo: int = 12,
+    *, tonal_metric: TonalMetric | None = None,
+) -> float:
+    if tonal_metric is None:
+        return basic_space_distance(a_root, a_quality, b_root, b_quality, edo)
+    return _checked_distance(
+        tonal_metric.basic_space_distance(a_root, a_quality, b_root, b_quality, edo)
+    )
+
+
+def nearest_roots_for_metric(
+    root_pc: int, edo: int = 12, limit: int = 3,
+    *, tonal_metric: TonalMetric | None = None,
+) -> Tuple[int, ...]:
+    """Derive neighbors from the selected metric, preserving deterministic ties."""
+    if tonal_metric is None or type(tonal_metric) is ExistingTonalMetric:
+        return nearest_roots(root_pc, edo, limit)
+    if limit <= 0:
+        return ()
+    candidates = (
+        (root_distance(root_pc, other, edo, tonal_metric=tonal_metric), other)
+        for other in range(edo) if other != root_pc % edo
+    )
+    return tuple(root for _, root in sorted(candidates)[:limit])
 
 
 # ===================================================================

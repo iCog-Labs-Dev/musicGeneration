@@ -1,0 +1,72 @@
+"""Four deliberately invalid implementations. This file is mypy input only."""
+
+from typing import Mapping, Sequence
+
+from aimusic.core.component_types import CandidateGenerationResult, SymbolicNote, TrackInstrumentConfig
+from aimusic.core.config import DecodeConfig, StyleConfig
+from aimusic.core.core_types import BeatState, Score
+from aimusic.core.protocols import ReportingScoreRenderer, ScoreDecoder, ScoreRenderer, TonalMetric
+from aimusic.render.midi_render import render_midi
+from aimusic.core.rng import RNGKey
+from aimusic.core.vocab import Vocabularies
+from aimusic.planning.protocols import CandidateGenerator
+from aimusic.scoring.priors import Prior, PriorContext
+from aimusic.theory.edo import EDO
+
+
+class WrongMetric:
+    def tonal_distance(self, a_root: int, b_root: int, edo: int = 12) -> str:
+        return "not a numeric distance"
+
+    def basic_space_distance(
+        self, a_root: int, a_quality: str, b_root: int, b_quality: str, edo: int = 12
+    ) -> float:
+        return 0.0
+
+
+def wrong_candidates(
+    source: BeatState,
+    t: int,
+    key: RNGKey,
+    d_max: int,
+    style_config: StyleConfig | None = None,
+    vocabularies: Vocabularies | None = None,
+    prior: Prior | None = None,
+    context: PriorContext | None = None,
+    edo: int | None = None,
+    proposal_budget: int | None = None,
+    prior_guided_proposals: bool = False,
+) -> tuple[CandidateGenerationResult, RNGKey]:
+    return CandidateGenerationResult(t, source, ()), key
+
+
+def wrong_decoder(
+    path: list[BeatState],
+    *,
+    key: RNGKey,
+    decode_config: DecodeConfig | None = None,
+    vocabularies: Vocabularies,
+    edo: int = 12,
+    ticks_per_beat: int = 480,
+    tempo_bpm: float = 120.0,
+    include_terminal_state: bool = False,
+) -> tuple[Score, RNGKey]:
+    return Score(), key
+
+
+def wrong_renderer(
+    notes: Sequence[SymbolicNote] | Score,
+    edo: EDO,
+    output_path: str,
+    ticks_per_beat: int = 480,
+    *,
+    track_instruments: Mapping[str, TrackInstrumentConfig] | None = None,
+) -> str:
+    return output_path
+
+
+metric: TonalMetric = WrongMetric()
+candidate: CandidateGenerator = wrong_candidates
+decoder: ScoreDecoder = wrong_decoder
+renderer: ScoreRenderer = wrong_renderer
+reporting_renderer: ReportingScoreRenderer = render_midi

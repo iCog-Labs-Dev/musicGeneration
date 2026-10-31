@@ -1,8 +1,21 @@
 # EPICs and Phases for the Full Music Generation Pipeline
 
+## Current component-interface checkpoint
+
+REQ-10 is implemented: tonal metrics, candidate generators, whole-score
+decoders, and renderers have typed replacement interfaces and injection
+points. See the [extension guide](docs/extending-components.md),
+[implementation record](docs/req-10-implementation.md), and
+[ADR-007](docs/decisions/ADR-007-pluggable-component-protocols.md).
+
+The roadmap below preserves an earlier baseline and its work breakdown.
+Its checklists span planning checkpoints and are not a current feature
+inventory. In particular, shared core types, Method A, track decoding, and
+the bridge solver already exist. The README describes the current workflow.
+
 ## Planning Basis
 
-This plan is based on the current repository state plus the project design documents:
+This plan was based on the repository state at its original planning checkpoint and these design documents:
 
 - `Software Design GTTM SB.pdf`
 - `dev_plan.md`
@@ -25,9 +38,9 @@ synthesis remains out of scope for the **symbolic MVP**. Optional post-MVP
 MIDI→audio integration (RenderPackage + `aimusic.audio`) is tracked as
 **EPIC 11** — see [`docs/audio-roadmap.md`](docs/audio-roadmap.md).
 
-## Current Repository Baseline
+## Original planning baseline
 
-The repo already contains useful foundations, but it is still well short of the full pipeline:
+At that checkpoint, the repository contained these foundations:
 
 - `config.py` currently defines only `EDOConfig` and `MicrotonalRendering`.
 - `edo.py` provides EDO pitch-class math and MIDI conversion helpers.
@@ -36,7 +49,7 @@ The repo already contains useful foundations, but it is still well short of the 
 - `rhythm_features.py` introduces a `BeatState`-like structure and simple meter/boundary/groove scoring heuristics.
 - Tests currently cover EDO math, tonal utilities, early GTTM logic, and rhythm scoring.
 
-The major missing pieces are:
+The major missing pieces at that checkpoint were:
 
 - Unified core types for `BeatState`, `NoteEvent`, `Score`, `Layer`, and `Edge`
 - Vocabulary layer for meters, keys, chords, roles, groove families, and head tokens

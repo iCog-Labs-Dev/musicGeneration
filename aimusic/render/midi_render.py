@@ -8,6 +8,7 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 import mido
 
 from aimusic.core.config import MicrotonalRendering
+from aimusic.core.component_types import SymbolicNote, TrackInstrumentConfig
 from aimusic.core.core_types import NoteEvent, Score
 from aimusic.theory.edo import EDO
 
@@ -16,16 +17,6 @@ DEFAULT_DRUM_CHANNEL = 9
 MELODIC_CHANNELS = tuple(channel for channel in range(1, 16) if channel != DEFAULT_DRUM_CHANNEL)
 
 
-@dataclass(frozen=True)
-class SymbolicNote:
-    """A renderer-agnostic representation of a musical note."""
-
-    pitch_height: int
-    start_time: float
-    end_time: float
-    velocity: int = 64
-    timbre: int | None = None
-    pressure: int | None = None
 
 
 @dataclass(frozen=True)
@@ -41,12 +32,6 @@ class _TrackSpec:
     is_drum: bool = False
 
 
-@dataclass(frozen=True)
-class TrackInstrumentConfig:
-    """Optional per-track instrument override for score-based MIDI export."""
-
-    program: int | None = None
-    is_drum: bool = False
 
 
 def _track_spec(

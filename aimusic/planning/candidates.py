@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence, Tuple, Iterator
 
 from aimusic.core.config import StyleConfig
+from aimusic.core.protocols import TonalMetric
+from aimusic.core.component_types import CandidateGenerationResult, CandidateRejection
 from aimusic.core.core_types import BeatState
 from aimusic.core.rng import RNGKey, shuffle
 from aimusic.scoring.gttm_features import beats_per_bar
 from aimusic.scoring.priors import NullPrior, Prior, PriorContext, PriorQuery, prior_logps
-from aimusic.theory.tonal import get_fifth_steps, nearest_roots
+from aimusic.theory.tonal import get_fifth_steps, nearest_roots_for_metric
 from aimusic.core.vocab import (
     ChordToken,
     DEFAULT_VOCABULARIES,
@@ -187,47 +189,8 @@ def _top_k_prior_chord_ids(
     )
 
 
-@dataclass(frozen=True)
-class CandidateRejection:
-    """Traceable explanation for why a proposed BeatState was filtered out."""
-    time_index: int
-    source_state: BeatState
-    candidate_state: BeatState
-    reason: str
 
 
-@dataclass(frozen=True)
-class CandidateGenerationResult:
-    """Deterministic candidate-generation output plus rejection diagnostics.
-
-    Counts are tracked separately at every pipeline stage (see REQ-13):
-    ``proposed`` -> ``unique`` -> ``legal`` (``states``) -> ``scored``.
-    Retention against ``D_max`` happens one layer up, at the edge level in
-    ``aimusic.planning.graph``, so it is intentionally not tracked here.
-    """
-    time_index: int
-    source_state: BeatState
-    states: Tuple[BeatState, ...]
-    rejections: Tuple[CandidateRejection, ...] = ()
-    proposed_count: int = 0
-    unique_count: int = 0
-    scores: Tuple[float, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.scores and len(self.scores) != len(self.states):
-            raise ValueError("scores must be empty or aligned 1:1 with states.")
-
-    @property
-    def legal_count(self) -> int:
-        return len(self.states)
-
-    @property
-    def rejected_count(self) -> int:
-        return len(self.rejections)
-
-    @property
-    def scored_count(self) -> int:
-        return len(self.scores)
 
 
 def apply_meter_constraints(
@@ -434,14 +397,16 @@ def propose_key_ids(
     next_role_id: int,
     vocabularies: Vocabularies,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> Tuple[int, ...]:
     resolved_edo = _edo_size(vocabularies) if edo is None else edo
     validate_vocabulary_compatibility(vocabularies, resolved_edo)
     role_label = vocabularies.roles.token_for_id(next_role_id).label
     proposals = [prev_state.key_id]
     if next_boundary_lvl >= 2 or role_label in {"change", "cad"}:
-        for root_pc in nearest_roots(
-            _key_root(prev_state, vocabularies), resolved_edo, limit=2
+        for root_pc in nearest_roots_for_metric(
+            _key_root(prev_state, vocabularies), resolved_edo, limit=2, tonal_metric=tonal_metric
         ):
             if vocabularies.keys.has_id(root_pc):
                 proposals.append(root_pc)
@@ -461,6 +426,8 @@ def propose_chord_ids(
     vocabularies: Vocabularies,
     top_k_prior: int = 3,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> Tuple[int, ...]:
     resolved_edo = _edo_size(vocabularies) if edo is None else edo
     validate_vocabulary_compatibility(vocabularies, resolved_edo)
@@ -471,7 +438,7 @@ def propose_chord_ids(
 
     proposals = [prev_state.chord_id]
     proposals.extend(_chord_ids_for_root(prev_chord.root_pc, _qualities_for_role(role_label), vocabularies))
-    for root_pc in nearest_roots(prev_chord.root_pc, resolved_edo, limit=2):
+    for root_pc in nearest_roots_for_metric(prev_chord.root_pc, resolved_edo, limit=2, tonal_metric=tonal_metric):
         proposals.extend(_chord_ids_for_root(root_pc, _qualities_for_role(role_label), vocabularies))
 
     if role_label == "cad":
@@ -549,6 +516,8 @@ def _candidate_generator(
     key: RNGKey,
     edo: int,
     key_state: Optional[list[RNGKey]] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> Iterator[BeatState]:
     """Yields candidate states iteratively to avoid combinatorial memory explosions."""
     
@@ -568,12 +537,12 @@ def _candidate_generator(
                 for groove_id in _shuffled(propose_groove_ids(prev_state, bound_lvl, role_id, vocabs)):
                     for key_id in _shuffled(
                         propose_key_ids(
-                            prev_state, bound_lvl, role_id, vocabs, edo=edo
+                            prev_state, bound_lvl, role_id, vocabs, edo=edo, tonal_metric=tonal_metric
                         )
                     ):
                         for chord_id in _shuffled(propose_chord_ids(
                             prev_state, key_id, meter_id, beat_in_bar, bound_lvl,
-                            role_id, groove_id, prior, context, vocabs, edo=edo
+                            role_id, groove_id, prior, context, vocabs, edo=edo, tonal_metric=tonal_metric
                         )):
                             for head_id in _shuffled(propose_head_ids(chord_id, meter_id, beat_in_bar, bound_lvl, role_id, vocabs)):
                                 yield BeatState(
@@ -607,6 +576,8 @@ def get_valid_next_states(
     edo: Optional[int] = None,
     proposal_budget: Optional[int] = None,
     prior_guided_proposals: bool = False,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> tuple[CandidateGenerationResult, RNGKey]:
     """Generate a bounded pool of legal BeatState successors for one source state.
 
@@ -655,6 +626,7 @@ def get_valid_next_states(
         key,
         resolved_edo,
         key_state,
+        tonal_metric=tonal_metric,
     )
 
     for candidate in candidate_gen:
@@ -717,3 +689,30 @@ def get_valid_next_states(
     )
     # Only proposal work actually performed advances the supplied stream.
     return result, key_state[0]
+
+
+@dataclass(frozen=True)
+class MetricBoundCandidates:
+    """Bind a distance implementation while keeping the candidate call contract."""
+
+    tonal_metric: TonalMetric | None = None
+
+    def __call__(
+        self,
+        prev_state: BeatState,
+        t: int,
+        key: RNGKey,
+        d_max: int,
+        style_config: StyleConfig | None = None,
+        vocabularies: Vocabularies | None = None,
+        prior: Prior | None = None,
+        context: PriorContext | None = None,
+        edo: int | None = None,
+        proposal_budget: int | None = None,
+        prior_guided_proposals: bool = False,
+    ) -> tuple[CandidateGenerationResult, RNGKey]:
+        return get_valid_next_states(
+            prev_state, t, key, d_max, style_config, vocabularies, prior,
+            context, edo, proposal_budget, prior_guided_proposals,
+            tonal_metric=self.tonal_metric,
+        )

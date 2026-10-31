@@ -6,8 +6,10 @@ from .midi_render import (
     score_to_track_notes,
     summarize_midi,
 )
+from .adapters import RenderResultAdapter
 
 __all__ = [
+    "RenderResultAdapter",
     "SymbolicNote",
     "TrackInstrumentConfig",
     "render_midi",
