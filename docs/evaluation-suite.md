@@ -124,11 +124,82 @@ run, with roughly 0.4 GB and 0.8 GB of memory growth. A 1,024-beat matrix of 4 c
   (relevant to the MUS-23 "registered but never activated" check).
 * Chord changes are rare (about 0.05 per beat) in every condition.
 
+## MUS-15 endpoint-distribution evaluation (`m2_distribution_method_a`)
+
+MUS-15 made Method A a true distribution-to-distribution bridge. The evaluation measures whether it handles
+multi-state start and terminal distributions correctly. It is a **correctness/fidelity check at small horizons
+(8 and 16 beats), not a long-form quality benchmark**, and it defines no pass/fail thresholds.
+
+**Endpoint mode.** `RunSpec.endpoint_mode` is `singleton` or `distribution`, set in the config with
+`"endpoint_mode"` (absent = `singleton`, so the M1 configs, their hashes and their run ids are unchanged).
+The generation method is derived from it and cannot disagree: `method_a_singleton_endpoints` vs
+`method_a_distribution_endpoints`. Every run sets the mode explicitly on `MethodARunConfig`, because the MUS-15
+library default is `distribution`; a singleton run never inherits it and a distribution run is never collapsed.
+Other distribution-only config keys: `endpoint_policy` (an `EndpointFallbackPolicy` value, default
+`drop_unreachable_only`, the pipeline default), `endpoint_marginal_tolerance` (default 1e-6) and
+`calibration_samples` (extra repeated samples per run, default 0). The `no_sb` condition is rejected in
+distribution mode (a uniform walk has no endpoint-marginal bridge). Singleton and distribution cells have
+different group keys (`|ep=...`), are aggregated separately, and are never paired in ablation deltas.
+
+**MUS-15 APIs used (nothing is re-implemented).** `MethodARunConfig` (`endpoint_mode`, `unreachable_policy`,
+`endpoint_marginal_tolerance`), `run_method_a`, and from the plan result `start_mass` / `end_mass`
+(`EndpointMassReport`: `requested`, `effective`, `requested_mass`, `feasible_mass`, `removed_state_mass`,
+`trimmed_mass`, `realized_probabilities`, `total_variation_shift`), `endpoint_resolution`
+(`EndpointResolution`: policy, `request_modified`, `modifications`, flow checks, `termination_reason`),
+`diagnostics.endpoint_mode` / `bridge_converged`, the `EndpointFeasibilityError` family (strict failures), and
+`sample_bridge_path` on the solved bridge for calibration. If a plan lacks these diagnostics, or reports a
+different endpoint mode than requested, the run fails with kind `endpoint_diagnostics_unavailable`.
+
+**Metrics** (`aimusic/evaluation/endpoint_metrics.py`, `metrics.endpoint`; JSON only):
+
+* Identity and mass accounting: `generation_method`, `endpoint_mode`, `endpoint_support_size_start|terminal`
+  (effective support), `requested_|feasible_|removed_|trimmed_|effective_|realized_ start|terminal _mass`.
+  The same names exist per side under `start` / `terminal`.
+* Outcome (`accounting_status`, per side and overall): `no_modification` (all support feasible, nothing removed),
+  `removed_and_renormalized` (unreachable states dropped, survivors renormalized, mass reported),
+  `trimmed_and_renormalized`, `removed_trimmed_and_renormalized`, `interior_blend`, and `strict_failure`
+  (the policy forbade changing the request: the run fails before solving, with `failure_kind`
+  `level1_unreachable_support` or `level2_mass_infeasible`).
+* Marginal error, per side: L1 and max-abs of realized vs requested (includes removed/trimmed mass) and vs
+  effective (the solver's own error).
+* Residuals: per-state rows `{state, requested, effective, realized, residual_vs_effective,
+  residual_vs_requested, removed, within_tolerance}`, plus `residual_max_abs`, `residual_mean_abs`,
+  `residual_within_tolerance` and `requested_equals_realized_within_tolerance` against
+  `endpoint_marginal_tolerance`.
+* Entropy (nats): requested, effective, realized and, when samples exist, empirical.
+* Calibration: draws `calibration_samples` paths from the single solved bridge (independent derived RNG keys
+  `eval.calibration`) and compares empirical start/terminal frequencies with the effective and requested
+  distributions (L1, max-abs, max z-score, mass outside support, and the L1 a perfectly calibrated sampler
+  would show from sampling noise alone). With fewer than 30 samples (including a MAP path or a single sampled
+  path) the status is `unavailable_*` and no numbers are written. A single path is never called calibrated.
+
+In singleton mode the endpoint section is only `{status: "not_applicable"}` plus the support sizes; the dashboard
+shows "Distribution metrics unavailable: singleton endpoint mode." rather than zeros.
+
+Reports gain `## Endpoint-distribution evaluation` (handling outcome, start/terminal mass accounting, marginal
+error and residuals, entropy, calibration status); the dashboard gains an *Endpoint distribution* tab, endpoint
+rows in the run inspector and the config panel, and an `EVALUATION` config type.
+
+Run it (about 90 s; results in `docs/benchmarks/m2_distribution_method_a/`):
+
+```bash
+python -m aimusic.evaluation run --config config/benchmarks/m2_distribution_method_a.json \
+  --out outputs/benchmarks/m2_distribution_method_a --workers 1
+python -m aimusic.evaluation report --out outputs/benchmarks/m2_distribution_method_a
+```
+
+Controlled tests: `python -m unittest tests.test_evaluation_method_a_distribution` (hand-built graphs through
+`solve_endpoint_bridge`: feasible multi-state, singleton compatibility, strict vs drop/renormalize vs trim,
+determinism, repeated sampling, dashboard views).
+
 ## Not measured / deferred
 
-* True distribution-to-distribution Method A (MUS-15). `run_method_a` still collapses to one start and
-  one terminal state, so SB converges in about one iteration and endpoint-marginal error, residuals and
-  calibration are meaningless today. Results are tagged `generation_method = method_a_singleton_endpoints`.
+* Distribution-to-distribution Method A (MUS-15) is evaluated only by `m2_distribution_method_a` (8/16 beats,
+  12-EDO, `full`, sampled paths). The M1 matrices are singleton-endpoint runs, tagged
+  `generation_method = method_a_singleton_endpoints`, and have no endpoint-marginal, residual or calibration
+  metrics. Not covered for MUS-15: other policies (trim, conditional) on the real pipeline, 19-EDO, long
+  horizons, ablations in distribution mode (no `no_sb`), and calibration of the terminal marginal beyond what
+  one solved bridge shows (the sampler is checked against that bridge, not against an independent oracle).
 * Method B (MUS-18) and section-wise SB with soft stitching (MUS-16): the config enums exist but
   `plans.py` does not branch on them, so no A/B or monolithic/section-wise comparison.
 * NGramPrior (MUS-26) and trained neural prior (MUS-27): the `trained_prior` condition reports an
@@ -152,7 +223,7 @@ run, with roughly 0.4 GB and 0.8 GB of memory growth. A 1,024-beat matrix of 4 c
 * **Config-aware controls (MUS-28 UI).** Selecting a config shows a *Benchmark Configuration* panel read straight
   from the JSON (purpose, version, type, horizons, EDOs, seeds, conditions with explanations, path modes,
   `K_max`/`D_max`/proposal budget, SB settings, timeout, expected run count) and a `SMOKE` / `PROFILE` /
-  `BENCHMARK` label. The type is inferred from the config name/description, or set with an optional
+  `BENCHMARK` / `EVALUATION` label and the endpoint mode. The type is inferred from the config name/description, or set with an optional
   `"benchmark_type"` key (do not add it to shipped configs: it would change their `config_hash`). Condition
   descriptions live in `ui.CONDITION_DESCRIPTIONS` and can be overridden per config with an optional
   `"condition_descriptions": {name: text}` object. Condition/horizon/EDO/seed filters are checkbox groups that
@@ -168,7 +239,8 @@ run, with roughly 0.4 GB and 0.8 GB of memory growth. A 1,024-beat matrix of 4 c
   reference view only.
 * **Views.** Overview cards, runtime/memory bars with CIs, run-status chart, paired ablation deltas vs `full`,
   tension target-vs-realized, runtime/memory scaling by horizon, 12- vs 19-EDO (EDOs are never pooled), and a
-  per-run inspector (including failure records).
+  per-run inspector (including failure records), and an *Endpoint distribution* tab (mass accounting, support
+  sizes, marginal error, residuals, entropy, calibration status; distribution cells only).
 * **Tension curves.** New runs record `metrics.tension.target_curve` / `realized_curve` (per-beat lists, ignored by
   the aggregator). Results produced before this change have only summary tension metrics; the dashboard shows those
   instead and says so. Re-run to get curves.

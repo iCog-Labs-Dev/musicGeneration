@@ -346,6 +346,78 @@ class TestSchemaAndAggregates(unittest.TestCase):
         self.assertFalse(any(k.startswith("endpoint.") for k in flatten_metrics(results[0])))
 
 
+class TestDashboardEndpointViews(unittest.TestCase):
+    @staticmethod
+    def _dataset(*results):
+        from pathlib import Path
+
+        from aimusic.evaluation.ui import EvaluationDataset
+
+        results = list(results)
+        return EvaluationDataset(Path("."), {}, results, aggregate(results), "recomputed")
+
+    @staticmethod
+    def _distribution_result(seed=0):
+        g = _graph([A0, A1, A2], [B0, B1, B2], FULL)
+        solved = _solve(
+            g, _dist(0, {A0: 0.4, A1: 0.4, A2: 0.2}), _dist(1, {B0: 0.4, B1: 0.4, B2: 0.2}),
+            Policy.DROP_AND_RENORMALIZE,
+        )
+        metrics = ep.endpoint_metrics(_plan(solved), marginal_tolerance=TOL)
+        ep.apply_calibration(metrics, ep.calibration_unavailable(ep.CAL_NO_SAMPLES, 0))
+        spec = _spec(endpoint_mode="distribution", seed=seed)
+        return {"status": "ok", "run_id": spec.run_id, "spec": spec.to_dict(), "failure": None,
+                "runtime": {}, "metrics": {"path": {}, "endpoint": metrics}}
+
+    def test_singleton_dataset_shows_unavailable_message_not_zeros(self):
+        from aimusic.evaluation import ui
+
+        spec = _spec()
+        res = {"status": "ok", "run_id": spec.run_id, "spec": spec.to_dict(), "failure": None, "runtime": {},
+               "metrics": {"path": {}, "endpoint": {"status": "not_applicable"}}}
+        text = ui.render_endpoint_overview(self._dataset(res))
+        self.assertIn("Distribution metrics unavailable: singleton endpoint mode.", text)
+        self.assertNotIn("0.0", text)
+        self.assertIn("Distribution metrics unavailable: singleton endpoint mode.", ui.render_endpoint_run_details(res))
+        fig = ui.make_endpoint_chart(self._dataset(res))
+        self.assertEqual(len(fig.data), 0)
+
+    def test_distribution_dataset_shows_mass_accounting_and_unavailable_calibration(self):
+        from aimusic.evaluation import ui
+
+        ds = self._dataset(self._distribution_result())
+        text = ui.render_endpoint_overview(ds)
+        self.assertIn("Start boundary", text)
+        self.assertIn("removed_and_renormalized", text)
+        self.assertIn("unavailable_no_repeated_samples", text)
+        self.assertIn("unavailable", text)  # calibration L1 has no value: shown as unavailable, not 0
+        self.assertGreater(len(ui.make_endpoint_chart(ds).data), 0)
+        details = ui.render_endpoint_run_details(self._distribution_result())
+        self.assertIn("Per-state residuals", details)
+        self.assertIn("removed mass", details)
+
+    def test_dashboard_never_mixes_modes(self):
+        from aimusic.evaluation import ui
+
+        spec = _spec()
+        singleton = {"status": "ok", "run_id": spec.run_id, "spec": spec.to_dict(), "failure": None,
+                     "runtime": {}, "metrics": {"path": {}, "endpoint": {"status": "not_applicable"}}}
+        ds = self._dataset(singleton, self._distribution_result())
+        self.assertEqual(len(ui.endpoint_cells(ds)), 1)
+        self.assertIn("singleton cell(s) are not shown", ui.render_endpoint_overview(ds))
+
+    def test_config_panel_and_type_show_endpoint_mode(self):
+        from aimusic.evaluation import ui
+
+        meta = ui.load_config_metadata("m2_distribution_method_a.json")
+        self.assertEqual(meta.benchmark_type, ui.TYPE_EVALUATION)
+        self.assertEqual(meta.endpoint_mode, "distribution")
+        self.assertIn("method_a_distribution_endpoints", ui.render_config_panel(meta))
+        m1 = ui.load_config_metadata("m1_smoke.json")
+        self.assertEqual(m1.endpoint_mode, "singleton")
+        self.assertIn("singleton", ui.render_config_panel(m1))
+
+
 class TestEndToEndDeterminism(unittest.TestCase):
     """Two full 8-beat runs with identical config, seed and RNG key."""
 

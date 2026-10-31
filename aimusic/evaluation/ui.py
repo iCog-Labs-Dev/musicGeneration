@@ -1080,6 +1080,8 @@ def render_run_details(result: Optional[Mapping[str, Any]]) -> str:
         _kv_table([
             ("condition", spec.get("condition")), ("seed", spec.get("seed")), ("horizon (beats)", spec.get("horizon")),
             ("EDO", spec.get("edo")), ("path mode", spec.get("path_mode")), ("bridge", spec.get("bridge_mode")),
+            ("generation method", spec.get("generation_method")),
+            ("endpoint mode", spec.get("endpoint_mode", "singleton")),
             ("prior", (result.get("prior") or {}).get("mode", spec.get("prior_mode"))),
             ("prior status", (result.get("prior") or {}).get("status")),
             ("lambda_data / lambda_gttm", f"{spec.get('lambda_data')} / {spec.get('lambda_gttm')}"),
@@ -1101,6 +1103,7 @@ def render_run_details(result: Optional[Mapping[str, Any]]) -> str:
         rows = _scalar_rows(section)
         parts += ["", f"#### {titles[key]}"]
         parts.append(_kv_table(rows) if rows else "_not available_")
+    parts += ["", "#### Endpoint distribution", render_endpoint_run_details(result)]
     artifacts = result.get("artifacts") or {}
     parts += ["", "#### Generated artifacts", _kv_table(list(artifacts.items())) if artifacts else "_none recorded_"]
     parts.append(
@@ -1139,17 +1142,201 @@ def run_tension_figure(result: Optional[Mapping[str, Any]]) -> Any:
 
 
 # --------------------------------------------------------------------------------------
+# Endpoint-distribution views (MUS-15).  Singleton data never produces distribution numbers.
+# --------------------------------------------------------------------------------------
+SINGLETON_UNAVAILABLE = "Distribution metrics unavailable: singleton endpoint mode."
+_SIDES = ("start", "terminal")
+
+
+def _result_mode(result: Mapping[str, Any]) -> str:
+    return str((result.get("spec") or {}).get("endpoint_mode", "singleton"))
+
+
+def _ep_val(value: Any, digits: int = 4) -> str:
+    """Format an endpoint number; absent/None is "unavailable" (never a fabricated 0)."""
+    if value is None:
+        return "unavailable"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        return f"{value:.2e}" if value != 0.0 and abs(value) < 1e-3 else f"{value:.{digits}g}"
+    return str(value)
+
+
+def render_endpoint_run_details(result: Mapping[str, Any]) -> str:
+    """Endpoint section of one run: singleton -> explicit unavailable note; distribution -> real numbers."""
+    if _result_mode(result) != "distribution":
+        return f"_{SINGLETON_UNAVAILABLE}_"
+    ep = (result.get("metrics") or {}).get("endpoint") or {}
+    if not ep:
+        return "_No endpoint metrics were recorded for this run._"
+    if ep.get("status") == "failed":
+        failed_rows = [("accounting", ep.get("accounting_status")), ("failure kind", ep.get("failure_kind")),
+                       ("message", ep.get("message")), ("offending states", ep.get("offending_state_count"))]
+        return _kv_table(failed_rows) + "\n\nThe run failed during endpoint resolution, so no realized marginals exist."
+    parts = [_kv_table([
+        ("policy", ep.get("policy")), ("outcome", ep.get("accounting_status")),
+        ("request modified", ep.get("request_modified")), ("modifications", ep.get("modifications")),
+        ("termination", ep.get("termination_reason")), ("marginal tolerance", ep.get("marginal_tolerance")),
+        ("calibration", ep.get("calibration_status")), ("calibration samples", ep.get("calibration_n_samples")),
+    ])]
+    for side in _SIDES:
+        sec = ep.get(side) or {}
+        parts += ["", f"**{side.title()} boundary**", "", _kv_table([
+            ("support size (requested / effective / realized)",
+             f"{sec.get('support_size_requested')} / {sec.get('support_size_effective')} / {sec.get('support_size_realized')}"),
+            ("requested mass", sec.get("requested_mass")), ("feasible mass", sec.get("feasible_mass")),
+            ("removed mass", sec.get("removed_mass")), ("trimmed mass", sec.get("trimmed_mass")),
+            ("effective mass", sec.get("effective_mass")), ("realized mass", sec.get("realized_mass")),
+            ("marginal L1 vs requested", sec.get("marginal_l1_vs_requested")),
+            ("marginal max abs vs requested", sec.get("marginal_max_abs_vs_requested")),
+            ("marginal L1 vs effective", sec.get("marginal_l1_vs_effective")),
+            ("max per-state residual", sec.get("residual_max_abs")),
+            ("residuals within tolerance", sec.get("residual_within_tolerance")),
+            ("entropy requested / effective / empirical (nats)",
+             " / ".join(_ep_val(sec.get(k)) for k in ("entropy_requested", "entropy_effective", "entropy_empirical"))),
+            ("calibration L1 vs effective", sec.get("calibration_l1_vs_effective")),
+        ])]
+        residual_rows = sec.get("residuals") or []
+        if residual_rows:
+            parts += ["", "<details><summary>Per-state residuals</summary>", "",
+                      "| state (meter,beat,bound,key,chord,role,head,groove) | requested | effective | realized | realized - effective | removed |",
+                      "|---|---|---|---|---|---|"]
+            for r in residual_rows:
+                st = r.get("state") or {}
+                parts.append(
+                    f"| {','.join(str(v) for v in st.values())} | {_ep_val(r.get('requested'))} | "
+                    f"{_ep_val(r.get('effective'))} | {_ep_val(r.get('realized'))} | "
+                    f"{_ep_val(r.get('residual_vs_effective'))} | {_ep_val(r.get('removed'))} |"
+                )
+            parts += ["", "</details>"]
+    return "\n".join(parts)
+
+
+def endpoint_cells(dataset: EvaluationDataset) -> List[Tuple[str, Dict[str, Any]]]:
+    """Distribution-mode aggregate cells only (singleton cells are never mixed in)."""
+    cells = [(k, c) for k, c in dataset.cells.items() if c.get("endpoint_mode") == "distribution"]
+    return sorted(cells, key=lambda kc: _cell_sort(kc[1]))
+
+
+def _ep_label(cell: Mapping[str, Any]) -> str:
+    return f"{cell['condition']} / {_cell_label(cell, True, False)}"
+
+
+def _cell_ep_metric(cell: Mapping[str, Any], name: str) -> Optional[Point]:
+    return _point((cell.get("metrics") or {}).get(f"endpoint.{name}"))
+
+
+def _pt(point: Optional[Point], digits: int = 4) -> str:
+    if point is None:
+        return "unavailable"
+    text = _ep_val(point.mean, digits)
+    if point.low is not None and point.high is not None:
+        text += f" [{_ep_val(point.low, digits)}, {_ep_val(point.high, digits)}]"
+    return text
+
+
+def render_endpoint_overview(dataset: EvaluationDataset) -> str:
+    """Markdown for the Endpoint distribution tab."""
+    if not dataset.cells:
+        return "_No results loaded._"
+    cells = endpoint_cells(dataset)
+    if not cells:
+        return f"**{SINGLETON_UNAVAILABLE}**\n\nEvery loaded cell used singleton endpoints."
+    skipped = len(dataset.cells) - len(cells)
+    parts = ["Values are `mean [95% interval over seeds]`; `unavailable` means the metric was not measured "
+             "(never a zero)."]
+    if skipped:
+        parts.append(f"_{skipped} singleton cell(s) are not shown: {SINGLETON_UNAVAILABLE}_")
+    runs_by_cell: Dict[str, List[Mapping[str, Any]]] = {}
+    for r in dataset.results:
+        runs_by_cell.setdefault(RunSpec.from_dict(dict(r["spec"])).group_key, []).append(r)
+    for side in _SIDES:
+        parts += ["", f"### {side.title()} boundary", "",
+                  "| cell | support (requested → effective) | requested | feasible | removed | trimmed | realized |"
+                  " L1 vs requested | max abs vs requested | residual max | entropy requested / effective / empirical |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|"]
+        for key, c in cells:
+            def m(name: str, side: str = side, c: Dict[str, Any] = c) -> Optional[Point]:
+                return _cell_ep_metric(c, f"{side}.{name}")
+
+            ent = " / ".join(_pt(m(n), 3) for n in ("entropy_requested", "entropy_effective", "entropy_empirical"))
+            parts.append(
+                f"| {_ep_label(c)} | {_pt(m('support_size_requested'), 3)} → {_pt(m('support_size_effective'), 3)} | "
+                f"{_pt(m('requested_mass'))} | {_pt(m('feasible_mass'))} | {_pt(m('removed_mass'))} | "
+                f"{_pt(m('trimmed_mass'))} | {_pt(m('realized_mass'))} | {_pt(m('marginal_l1_vs_requested'))} | "
+                f"{_pt(m('marginal_max_abs_vs_requested'))} | {_pt(m('residual_max_abs'))} | {ent} |"
+            )
+    parts += ["", "### Outcome and calibration", "",
+              "| cell | outcome (runs) | calibration status (runs) | samples/run | start L1 vs effective | terminal L1 vs effective |",
+              "|---|---|---|---|---|---|"]
+    for key, c in cells:
+        outcomes: Counter[str] = Counter()
+        cal: Counter[str] = Counter()
+        n_samples = 0
+        for run in runs_by_cell.get(key, []):
+            ep = (run.get("metrics") or {}).get("endpoint") or {}
+            outcomes[str(ep.get("accounting_status", "no_diagnostics"))] += 1
+            if run.get("status") == "ok":
+                cal[str(ep.get("calibration_status", "unavailable"))] += 1
+                n_samples = max(n_samples, int(ep.get("calibration_n_samples") or 0))
+        fmt = lambda counter: ", ".join(f"{k} x{v}" for k, v in sorted(counter.items())) or "-"  # noqa: E731
+        parts.append(
+            f"| {_ep_label(c)} | {fmt(outcomes)} | {fmt(cal)} | {n_samples or 'unavailable'} | "
+            f"{_pt(_cell_ep_metric(c, 'start.calibration_l1_vs_effective'))} | "
+            f"{_pt(_cell_ep_metric(c, 'terminal.calibration_l1_vs_effective'))} |"
+        )
+    parts += ["", "`removed` = mass of unreachable states dropped by the policy; survivors are renormalized "
+              "(`effective` = 1). `L1 vs requested` therefore includes removed mass, while `residual max` is "
+              "the solver's own error against the effective target."]
+    return "\n".join(parts)
+
+
+def make_endpoint_chart(dataset: EvaluationDataset) -> Any:
+    """Requested / feasible / removed / realized mass per distribution cell, start and terminal."""
+    title = "Endpoint mass accounting"
+    if not dataset.cells:
+        return _empty_figure("No results loaded.", title)
+    cells = endpoint_cells(dataset)
+    if not cells:
+        return _empty_figure(SINGLETON_UNAVAILABLE, title)
+    go = _go()
+    fig = _make_subplots(rows=1, cols=2, subplot_titles=("Start boundary", "Terminal boundary"), shared_yaxes=True)
+    colors = {"requested_mass": "#2a78d6", "feasible_mass": "#1f8a5b", "removed_mass": "#c4452d", "realized_mass": "#6250d6"}
+    labels = [_ep_label(c) for _, c in cells]
+    for col, side in enumerate(_SIDES, start=1):
+        for name, color in colors.items():
+            points = [_cell_ep_metric(c, f"{side}.{name}") for _, c in cells]
+            ys, plus, minus = _error_arrays(points)
+            fig.add_trace(
+                go.Bar(
+                    name=name.replace("_mass", ""), x=labels, y=ys, marker={"color": color},
+                    error_y={"type": "data", "symmetric": False, "array": plus, "arrayminus": minus},
+                    showlegend=col == 1, legendgroup=name,
+                ),
+                row=1, col=col,
+            )
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title_text="probability mass", row=1, col=1)
+    return _style(fig, title, height=440)
+
+
+# --------------------------------------------------------------------------------------
 # Config metadata, filter choices and validation (pure: no Gradio, no benchmark execution)
 # --------------------------------------------------------------------------------------
 TYPE_SMOKE = "SMOKE"
 TYPE_PROFILE = "PROFILE"
 TYPE_BENCHMARK = "BENCHMARK"
+TYPE_EVALUATION = "EVALUATION"
 BENCHMARK_TYPE_TITLES = {
+    TYPE_EVALUATION: "Endpoint-distribution evaluation (not a quality benchmark)",
     TYPE_SMOKE: "Smoke test",
     TYPE_PROFILE: "Scaling/profile test",
     TYPE_BENCHMARK: "Main benchmark",
 }
-BENCHMARK_TYPE_COLORS = {TYPE_SMOKE: "#c98500", TYPE_PROFILE: "#6250d6", TYPE_BENCHMARK: "#2a78d6"}
+BENCHMARK_TYPE_COLORS = {
+    TYPE_SMOKE: "#c98500", TYPE_PROFILE: "#6250d6", TYPE_BENCHMARK: "#2a78d6", TYPE_EVALUATION: "#1f8a5b",
+}
 
 # One central place for condition explanations.  A config may override or extend these with an
 # optional ``"condition_descriptions": {name: text}`` object (config.raw is the source of truth);
@@ -1174,6 +1361,10 @@ TERM_HELP: Dict[str, str] = {
         "into 19 pitch steps. It is the pitch-space resolution used throughout graph construction, "
         "scoring, decoding, and rendering."
     ),
+    "Endpoint mode": (
+        "singleton = the plan starts and ends in one chosen state each (M1 behaviour); distribution = "
+        "Method A bridges a start distribution to a terminal distribution (MUS-15)."
+    ),
     "Seed": "Random starting value used to reproduce a run or compare repeated runs.",
     "Condition": "A system variant used to measure the contribution of a component.",
     "Workers": (
@@ -1197,6 +1388,8 @@ def benchmark_type(config: BenchmarkConfig) -> str:
     explicit = str(config.raw.get("benchmark_type", "")).strip().upper()
     if explicit in BENCHMARK_TYPE_TITLES:
         return explicit
+    if config.endpoint_mode == "distribution":
+        return TYPE_EVALUATION
     name = config.name.lower()
     if "smoke" in name:
         return TYPE_SMOKE
@@ -1263,6 +1456,10 @@ class ConfigMetadata:
     timeout_s: float
     expected_runs: int
     condition_descriptions: Dict[str, str]
+    endpoint_mode: str = "singleton"
+    endpoint_policy: str = ""
+    endpoint_marginal_tolerance: float = 0.0
+    calibration_samples: int = 0
 
 
 def _unique(values: Sequence[Any]) -> Tuple[Any, ...]:
@@ -1300,6 +1497,12 @@ def config_metadata(config: BenchmarkConfig, file_name: str = "") -> ConfigMetad
         timeout_s=config.timeout_s,
         expected_runs=len(expand_matrix(config)),
         condition_descriptions={c: condition_description(c, overrides) for c in config.conditions},
+        endpoint_mode=config.endpoint_mode,
+        endpoint_policy=config.endpoint_policy if config.endpoint_mode == "distribution" else "",
+        endpoint_marginal_tolerance=(
+            config.endpoint_marginal_tolerance if config.endpoint_mode == "distribution" else 0.0
+        ),
+        calibration_samples=config.calibration_samples,
     )
 
 
@@ -1427,6 +1630,16 @@ def _term(label: str, key: str) -> str:
     return f'<abbr title="{html.escape(TERM_HELP[key], quote=True)}" style="cursor:help">{html.escape(label)}</abbr>'
 
 
+def _endpoint_mode_text(meta: ConfigMetadata) -> str:
+    if meta.endpoint_mode != "distribution":
+        return "singleton (method_a_singleton_endpoints): distribution metrics are not produced"
+    samples = f"{meta.calibration_samples} calibration samples/run" if meta.calibration_samples else "no calibration samples"
+    return (
+        f"distribution (method_a_distribution_endpoints); policy {meta.endpoint_policy}, marginal tolerance "
+        f"{meta.endpoint_marginal_tolerance:g}, {samples}"
+    )
+
+
 def render_config_panel(meta: Optional[ConfigMetadata], error: str = "") -> str:
     """HTML for the "Benchmark Configuration" panel.  Theme-agnostic, like the overview cards."""
     css = (
@@ -1460,6 +1673,7 @@ def render_config_panel(meta: Optional[ConfigMetadata], error: str = "") -> str:
         (_term("Seeds", "Seed"), vals(meta.seeds)),
         (_term("Conditions", "Condition"), f"<ul>{conds}</ul>"),
         ("Path modes", vals(meta.path_modes)),
+        (_term("Endpoint mode", "Endpoint mode"), html.escape(_endpoint_mode_text(meta))),
         (_term("K_max", "K_max"), vals(meta.k_max)),
         (_term("D_max", "D_max"), vals(meta.d_max)),
         (_term("Proposal budget", "Proposal budget"), vals(meta.proposal_budget)),
@@ -2040,6 +2254,9 @@ def build_evaluation_page(demo: Any = None) -> None:
     with gr.Tab("EDO comparison"):
         edo_horizon = gr.Dropdown(label="Horizon", choices=[], value=None)
         edo_plot = gr.Plot(label="12-EDO vs 19-EDO")
+    with gr.Tab("Endpoint distribution"):
+        endpoint_plot = gr.Plot(label="Endpoint mass accounting")
+        endpoint_md = gr.Markdown(f"_{SINGLETON_UNAVAILABLE}_")
     with gr.Tab("Run details"):
         run_dd = gr.Dropdown(label="Run", choices=[], value=None, filterable=True)
         run_plot = gr.Plot(label="Selected run")
@@ -2061,7 +2278,7 @@ def build_evaluation_page(demo: Any = None) -> None:
 
     dash_outputs = [
         cards, notes_md, runtime_plot, status_plot, ablation_cell, ablation_plot, tension_cell, tension_plot, tension_note,
-        scaling_plot, edo_horizon, edo_plot, run_dd, report_md,
+        scaling_plot, edo_horizon, edo_plot, run_dd, report_md, endpoint_plot, endpoint_md,
     ]
 
     def _cell_value(h: Optional[int], e: Optional[int]) -> Optional[str]:
@@ -2085,6 +2302,7 @@ def build_evaluation_page(demo: Any = None) -> None:
                 render_overview_cards(None), gr.update(value=f"**{exc}**", visible=True), empty, empty,
                 gr.update(choices=[], value=None), empty, gr.update(choices=[], value=None), empty, "",
                 empty, gr.update(choices=[], value=None), empty, gr.update(choices=[], value=None), "_No report loaded._",
+                empty, "_No results loaded._",
             )
         summary = summarize_results(ds)
         warn = list(ds.warnings)
@@ -2109,6 +2327,7 @@ def build_evaluation_page(demo: Any = None) -> None:
             gr.update(choices=horizons, value=horizons[-1] if horizons else None), make_edo_chart(ds, horizons[-1] if horizons else None),
             gr.update(choices=run_choices(ds), value=None),
             ds.report_text or "_No report.md in this directory yet (it is written when a run finishes or via Generate Report)._",
+            make_endpoint_chart(ds), render_endpoint_overview(ds),
         )
 
     def on_load(out_dir, metric):

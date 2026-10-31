@@ -5,10 +5,18 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 CONDITION_ORDER = ("full", "no_gttm", "no_prior", "no_sb", "trained_prior")
 
+MUS15_SINGLETON_ONLY = (
+    "Distribution-to-distribution Method A (MUS-15) was **not evaluated** in this output: every cell is "
+    "singleton-endpoint, so endpoint-marginal error, residuals, entropy and calibration are not measured. "
+    "Use `config/benchmarks/m2_distribution_method_a.json`."
+)
+MUS15_DISTRIBUTION = (
+    "Endpoint-distribution evaluation is a correctness/fidelity check of Method A at small horizons "
+    "(8/16 beats here), not a long-form quality benchmark; calibration compares repeated samples from "
+    "one solved bridge and says nothing about MAP paths."
+)
+
 DEFERRED = (
-    "True distribution-to-distribution Method A (MUS-15): generation still collapses to one start "
-    "and one terminal state, so SB convergence is trivial and endpoint-marginal error, residuals "
-    "and calibration are **not measured**.",
     "Method B start-middle-return planning (MUS-18): not implemented in `plans.py`; no A/B comparison.",
     "Section-wise SB with soft stitching (MUS-16): not implemented; no monolithic vs section-wise comparison.",
     "Factorized corpus NGramPrior (MUS-26) and a trained neural prior (MUS-27): `trained_prior` "
@@ -40,11 +48,24 @@ def _sort_key(item: Any) -> Any:
     _, cell = item
     cond = cell["condition"]
     rank = CONDITION_ORDER.index(cond) if cond in CONDITION_ORDER else len(CONDITION_ORDER)
-    return (cell["edo"], cell["horizon"], cell["path_mode"], cell["k_max"], cell["d_max"], cell["proposal_budget"], rank)
+    return (_mode(cell), cell["edo"], cell["horizon"], cell["path_mode"], cell["k_max"], cell["d_max"], cell["proposal_budget"], rank)
+
+
+def _mode(cell: Mapping[str, Any]) -> str:
+    return str(cell.get("endpoint_mode", "singleton"))
 
 
 def _label(cell: Mapping[str, Any]) -> str:
-    return f"{cell['condition']} / {cell['horizon']}b / {cell['edo']}-EDO / {cell['path_mode']}"
+    base = f"{cell['condition']} / {cell['horizon']}b / {cell['edo']}-EDO / {cell['path_mode']}"
+    # Cells of different endpoint modes are never merged; the mode is shown whenever it is not the M1 default.
+    return base if _mode(cell) == "singleton" else f"{base} / {_mode(cell)}"
+
+
+def _sci(summary: Mapping[str, Any]) -> str:
+    """Scientific notation: marginal errors are ~1e-9, which fixed-point formatting would print as 0.000."""
+    if not summary or summary.get("n", 0) == 0:
+        return "-"
+    return f"{summary['mean']:.2e}"
 
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> List[str]:
@@ -57,10 +78,143 @@ def _metric(cell: Mapping[str, Any], name: str, digits: int = 3) -> str:
     return _ci(cell["metrics"].get(name, {}), digits)
 
 
+def _cell_results(results: Sequence[Mapping[str, Any]]) -> Dict[str, List[Mapping[str, Any]]]:
+    from aimusic.evaluation.schema import RunSpec
+
+    grouped: Dict[str, List[Mapping[str, Any]]] = {}
+    for r in results:
+        grouped.setdefault(RunSpec.from_dict(dict(r["spec"])).group_key, []).append(r)
+    return grouped
+
+
+def _endpoint_section(cells: Sequence[Any], results: Sequence[Mapping[str, Any]]) -> List[str]:
+    """``## Endpoint-distribution evaluation``: distribution cells only; singleton cells are listed as unavailable."""
+    lines = ["## Endpoint-distribution evaluation", ""]
+    dist = [(k, c) for k, c in cells if _mode(c) == "distribution"]
+    singleton = [c for _, c in cells if _mode(c) == "singleton"]
+    if singleton:
+        lines += [
+            f"Distribution metrics unavailable: singleton endpoint mode ({len(singleton)} cell(s) not shown; "
+            "singleton and distribution cells are never combined).",
+            "",
+        ]
+    if not dist:
+        return lines
+    by_cell = _cell_results(results)
+
+    lines += ["### Endpoint handling outcome", "",
+              "How each run's requested endpoints were treated by the MUS-15 policy "
+              "(`no_modification` = all support feasible, nothing removed; `removed_and_renormalized` = "
+              "unreachable states dropped and survivors renormalized; `strict_failure` = the policy forbade "
+              "changing the request, so the run failed before solving).", ""]
+    rows = []
+    for key, c in dist:
+        counts: Dict[str, int] = {}
+        for r in by_cell.get(key, []):
+            ep = (r.get("metrics") or {}).get("endpoint") or {}
+            status = str(ep.get("accounting_status", "no_diagnostics"))
+            counts[status] = counts.get(status, 0) + 1
+        policy = next(
+            (r["spec"].get("endpoint_policy") for r in by_cell.get(key, [])), "-"
+        )
+        rows.append([_label(c), f"`{policy}`", ", ".join(f"{k} x{v}" for k, v in sorted(counts.items())) or "-"])
+    lines += _table(["cell", "policy", "outcome (runs)"], rows)
+
+    for side, title in (("start", "Start"), ("terminal", "Terminal")):
+        lines += [f"### {title} boundary: mass accounting and support", ""]
+        rows = []
+        for _, c in dist:
+            def m(name: str, digits: int = 3, side: str = side, c: Mapping[str, Any] = c) -> str:
+                return _metric(c, f"endpoint.{side}.{name}", digits)
+
+            rows.append([
+                _label(c), m("support_size_requested", 1), m("support_size_effective", 1),
+                m("requested_mass"), m("feasible_mass"), m("removed_mass"), m("trimmed_mass"),
+                m("effective_mass"), m("realized_mass"),
+            ])
+        lines += _table(
+            ["cell", "support requested", "support effective", "requested mass", "feasible mass",
+             "removed mass", "trimmed mass", "effective mass", "realized mass"],
+            rows,
+        )
+    lines += ["Masses are probability mass; `effective` is what the solver was asked to match (1 after "
+              "renormalization) and `realized` is the bridge's measured marginal.", ""]
+
+    lines += ["### Marginal error and residuals", ""]
+    rows = []
+    for _, c in dist:
+        for side in ("start", "terminal"):
+            def ms(name: str, side: str = side, c: Mapping[str, Any] = c) -> Mapping[str, Any]:
+                return c["metrics"].get(f"endpoint.{side}.{name}", {})
+
+            rows.append([
+                _label(c), side,
+                _sci(ms("marginal_l1_vs_requested")), _sci(ms("marginal_max_abs_vs_requested")),
+                _sci(ms("marginal_l1_vs_effective")), _sci(ms("marginal_max_abs_vs_effective")),
+                _sci(ms("residual_max_abs")), _fmt(ms("residual_within_tolerance").get("mean"), 2),
+                _fmt(ms("requested_equals_realized_within_tolerance").get("mean"), 2),
+            ])
+    lines += _table(
+        ["cell", "side", "L1 vs requested", "max abs vs requested", "L1 vs effective", "max abs vs effective",
+         "max per-state residual", "within tolerance (rate)", "realized = requested (rate)"],
+        rows,
+    )
+    lines += ["`vs requested` includes any mass removed or trimmed by the policy; `vs effective` is the solver's "
+              "own marginal error (residual = realized - effective per state, checked against "
+              "`endpoint_marginal_tolerance`). Per-state rows are in `metrics.endpoint.<side>.residuals`.", ""]
+
+    lines += ["### Entropy (nats)", ""]
+    rows = []
+    for _, c in dist:
+        for side in ("start", "terminal"):
+            rows.append([
+                _label(c), side, _metric(c, f"endpoint.{side}.entropy_requested"),
+                _metric(c, f"endpoint.{side}.entropy_effective"),
+                _metric(c, f"endpoint.{side}.entropy_empirical"),
+            ])
+    lines += _table(["cell", "side", "requested", "effective", "empirical (sampled)"], rows)
+
+    lines += ["### Calibration (repeated samples from the solved bridge)", ""]
+    rows = []
+    for key, c in dist:
+        runs = by_cell.get(key, [])
+        statuses: Dict[str, int] = {}
+        samples = []
+        for r in runs:
+            ep = (r.get("metrics") or {}).get("endpoint") or {}
+            if r["status"] != "ok":
+                continue
+            st = str(ep.get("calibration_status", "unavailable_no_diagnostics"))
+            statuses[st] = statuses.get(st, 0) + 1
+            samples.append(int(ep.get("calibration_n_samples", 0)))
+        for side in ("start", "terminal"):
+            rows.append([
+                _label(c), side,
+                ", ".join(f"{k} x{v}" for k, v in sorted(statuses.items())) or "-",
+                str(max(samples)) if samples else "-",
+                _metric(c, f"endpoint.{side}.calibration_l1_vs_effective"),
+                _metric(c, f"endpoint.{side}.calibration_expected_l1_sampling_noise"),
+                _metric(c, f"endpoint.{side}.calibration_max_abs_z_vs_effective", 2),
+            ])
+    lines += _table(
+        ["cell", "side", "status (runs)", "samples/run", "L1 vs effective", "expected L1 noise",
+         "max abs z"],
+        rows,
+    )
+    lines += ["Calibration needs at least 30 repeated samples; otherwise it is reported as unavailable (shown as `-`), "
+              "never as zero. A single MAP or sampled path is not a calibration. `expected L1 noise` is the L1 a "
+              "perfectly calibrated sampler would show from finite sampling alone.", ""]
+    return lines
+
+
 def render_report(manifest: Mapping[str, Any], results: Sequence[Mapping[str, Any]], agg: Mapping[str, Any]) -> str:
     cells = sorted(agg["cells"].items(), key=_sort_key)
     repro = (results[0].get("reproducibility") if results else None) or manifest.get("created_with", {})
     n_ok = sum(1 for r in results if r["status"] == "ok")
+    methods = ", ".join(
+        f"`{m}`" for m in sorted({c.get("generation_method", "method_a_singleton_endpoints") for _, c in cells})
+    ) or "`method_a_singleton_endpoints`"
+    has_distribution = any(_mode(c) == "distribution" for _, c in cells)
     lines: List[str] = [
         f"# MUS-28 benchmark report: {manifest['config_name']}",
         "",
@@ -71,9 +225,10 @@ def render_report(manifest: Mapping[str, Any], results: Sequence[Mapping[str, An
         f"numpy {repro.get('numpy')}",
         f"- Runs: {agg['completed_runs']}/{agg['expected_runs']} completed, {n_ok} ok, "
         f"{len(results) - n_ok} failed/timeout/crashed",
-        "- Generation: `method_a_singleton_endpoints`, single pass. `full` uses the **placeholder** structured "
+        f"- Generation: {methods}, single pass. `full` uses the **placeholder** structured "
         "prior (a deterministic heuristic, not a trained or corpus-backed model).",
-        "- Values are `mean [95% t-interval over seeds]`. Cells never mix EDOs, horizons, or path modes. "
+        "- Values are `mean [95% t-interval over seeds]`. Cells never mix EDOs, horizons, path modes or "
+        "endpoint modes. "
         "No pass/fail thresholds are defined yet, so nothing here is a quality claim.",
         "",
     ]
@@ -149,7 +304,8 @@ def render_report(manifest: Mapping[str, Any], results: Sequence[Mapping[str, An
             _metric(c, "sb.effective_entropy"),
         ])
     lines += _table(["cell", "converged rate", "iterations", "effective entropy"], rows)
-    lines += ["With singleton endpoints the bridge is degenerate (about one iteration); see Deferred.", ""]
+    if any(_mode(c) == "singleton" for _, c in cells):
+        lines += ["With singleton endpoints the bridge is degenerate (about one iteration); see Deferred.", ""]
 
     lines += ["## Path, tension and GTTM", ""]
     rows = []
@@ -170,6 +326,8 @@ def render_report(manifest: Mapping[str, Any], results: Sequence[Mapping[str, An
     )
     lines += ["`mean GTTM score/edge` uses the per-family feature weights, not `lambda_gttm`, so it is "
               "comparable between `full` and `no_gttm`.", ""]
+
+    lines += _endpoint_section(cells, results)
 
     lines += ["## Ablations: paired differences vs `full` (same seeds)", ""]
     shown = (
@@ -195,5 +353,6 @@ def render_report(manifest: Mapping[str, Any], results: Sequence[Mapping[str, An
         lines += ["No ablation cell has a matching `full` cell yet.", ""]
 
     lines += ["## Not measured / deferred", ""]
+    lines += [f"- {MUS15_DISTRIBUTION if has_distribution else MUS15_SINGLETON_ONLY}"]
     lines += [f"- {item}" for item in DEFERRED] + [""]
     return "\n".join(lines)
