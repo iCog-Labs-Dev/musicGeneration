@@ -10,3 +10,4 @@ gradio
 pytest
 scipy
 hypothesis>=6.90.0
+plotly

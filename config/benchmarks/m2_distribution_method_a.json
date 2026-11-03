@@ -1,0 +1,30 @@
+{
+  "schema_version": "mus28-config/1",
+  "name": "m2_distribution_method_a",
+  "config_version": "1.0.0",
+  "description": "MUS-15 distribution-to-distribution Method A evaluation (endpoint marginals, mass accounting, entropy, calibration). Not a long-form quality benchmark.",
+  "benchmark_type": "evaluation",
+  "horizons": [8, 16],
+  "seeds": [0, 1, 2],
+  "edos": [12],
+  "path_modes": ["sample"],
+  "conditions": ["full"],
+  "endpoint_mode": "distribution",
+  "endpoint_policy": "drop_unreachable_only",
+  "endpoint_marginal_tolerance": 1e-6,
+  "calibration_samples": 200,
+  "graph_grid": [
+    {
+      "k_max": 64,
+      "d_max": 8,
+      "proposal_budget": 256
+    }
+  ],
+  "prior_guided_proposals": false,
+  "sb": {
+    "max_iterations": 200,
+    "tolerance": 1e-6,
+    "temperature": 1.0
+  },
+  "timeout_s": 600
+}
