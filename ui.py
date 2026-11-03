@@ -21,6 +21,8 @@ from aimusic.core.config import (
     DecodeConfig,
     EDOConfig,
     MicrotonalRendering,
+    PlanConfig,
+    SectioningStrategy,
     StyleConfig,
 )
 from aimusic.core.diagnostics import RunManifest, SBDiagnostics
@@ -33,6 +35,7 @@ from aimusic.render.midi_render import TrackInstrumentConfig
 from aimusic.theory.edo import EDO
 
 
+DEFAULT_SECTION_NAMES = ("intro", "theme", "bridge", "return")
 OUTPUT_DIR = Path("./outputs")
 SOUNDFONT_PATH = Path("/usr/share/sounds/sf2/FluidR3_GM.sf2")
 PREVIEW_SAMPLE_RATE = 22050
@@ -69,6 +72,7 @@ class GenerationParams:
     comping_program: int
     lead_program: int
     drum_track: list[str]
+    section_wise: bool = True
 
 
 @dataclass(frozen=True)
@@ -159,6 +163,7 @@ def _normalize_inputs(
     comping_program: Any,
     lead_program: Any,
     drum_track: list[str],
+    section_wise: bool = True,
 ) -> GenerationParams:
     meter = str(meter).strip()
     groove_family = str(groove_family).strip()
@@ -195,6 +200,7 @@ def _normalize_inputs(
         comping_program=_as_int("comping program", comping_program, minimum=0, maximum=127),
         lead_program=_as_int("lead program", lead_program, minimum=0, maximum=127),
         drum_track=drum_track,
+        section_wise=bool(section_wise),
     )
 
 
@@ -218,6 +224,11 @@ def _build_track_instruments(params: GenerationParams) -> dict[str, TrackInstrum
 
 
 def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
+    if params.section_wise and params.beats < len(DEFAULT_SECTION_NAMES):
+        raise ValueError(
+            "Section-wise planning needs at least 4 beats for intro/theme/bridge/return. "
+            "Increase beats or turn off section-wise planning."
+        )
     style_config = StyleConfig(
         allowed_meters=(params.meter,),
         groove_families=(params.groove_family,),
@@ -235,6 +246,11 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         style_config=style_config,
         decode_config=decode_config,
         edo=params.edo,
+        plan_config=PlanConfig(
+            sectioning_strategy=(SectioningStrategy.SECTION_WISE if params.section_wise
+                                 else SectioningStrategy.SINGLE_PASS),
+            section_names=DEFAULT_SECTION_NAMES if params.section_wise else (),
+        ),
     )
 
     plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=params.seed))
@@ -268,7 +284,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
             }
         ),
         structural_stats=structural_stats,
-        sb_stats=SBDiagnostics.from_solution(plan_result.sb_solution),
+        sb_stats=SBDiagnostics.from_plan(plan_result),
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -848,6 +864,7 @@ def generate_music(
     comping_program: Any,
     lead_program: Any,
     drum_track: list[str],
+    section_wise: bool = True,
 ) -> tuple[
     str,
     dict[str, Any],
@@ -876,6 +893,7 @@ def generate_music(
             comping_program,
             lead_program,
             drum_track,
+            section_wise,
         )
         artifacts = _generate_artifacts(params)
         summary = _score_summary(artifacts.score_path, artifacts.manifest_path)
@@ -942,7 +960,11 @@ with gr.Blocks(title="MIDI Generator", fill_height=True) as demo:
     with gr.Row(equal_height=False):
         with gr.Column(scale=0):
             seed = gr.Number(label="seed", value=11, precision=0)
-            beats = gr.Number(label="beats", value=8, precision=0)
+            beats = gr.Number(label="beats", value=16, precision=0)
+            section_wise = gr.Checkbox(
+                label="Use section-wise planning", value=True,
+                info="Intro / theme / bridge / return. Turn off for single-pass planning.",
+            )
             edo = gr.Number(label="edo", value=12, precision=0)
             meter = gr.Dropdown(
                 label="meter",
@@ -1043,6 +1065,7 @@ with gr.Blocks(title="MIDI Generator", fill_height=True) as demo:
             comping_program,
             lead_program,
             drum_track,
+            section_wise,
         ],
         outputs=[
             dashboard,
