@@ -304,7 +304,7 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
         from aimusic.core.config import PriorWeights, SBConfig
         from aimusic.core.rng import RNGKey, derive_named_key
         from aimusic.planning.endpoint_feasibility import EndpointFallbackPolicy, EndpointMode
-        from aimusic.planning.plans import MethodARunConfig, run_method_a
+        from aimusic.planning.plans import MethodARunConfig, SectionWisePlanResult, run_method_a
         from aimusic.evaluation.baselines import reachable_uniform_walk
 
         stage = "prior"
@@ -336,6 +336,10 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
             endpoint_marginal_tolerance=spec.endpoint_marginal_tolerance,
         )
         plan, _ = run_method_a(run_config, key=RNGKey(seed=spec.seed), prior=prior)
+        if isinstance(plan, SectionWisePlanResult):
+            raise ep.EndpointDiagnosticsUnavailable(
+                "The Milestone 1 evaluator does not yet aggregate section-wise plan results."
+            )
         gen_wall = time.perf_counter() - start_wall
 
         stage = "path"
