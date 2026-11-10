@@ -16,7 +16,11 @@ Ordered backlog. Prefer one P0/P1 item per session. Full roadmap:
 - [x] CLI `render-audio` with lazy import; validate-only default in PR2
 - [x] Native `from_score` loader; prefer planner `structure.json`
 - [x] Port M1 CI-safe remainder: groove apply, simple render, orchestrator + m2a bridge
-- [ ] Port fluidsynth render backend (optional `[audio-render]`)
+- [x] Human rough-demo acceptance of the implemented clean-room FluidSynth backend
+  (`[audio-render]`): [all four embedded players worked; rough demos accepted](audio-listening-review.md).
+  Human timing comparison is recorded (“No defects heard”); no aesthetic groove
+  improvement claimed. [Final integration review is complete](audio-testing.md#final-acceptance-review-114)
+  (**42/42** demo tasks); MUS-35 remains partial and later dependencies are unchanged.
 - [ ] CI reconcile on fixtures
 
 ## P2 — Safe generative loop

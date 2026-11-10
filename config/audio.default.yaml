@@ -11,8 +11,10 @@ groove:
   models: {groovae_drums: false, midi_gpt: false}
 render:
   sample_rate: 48000
+  release_tail_sec: 0.25
+  mix_peak: 0.95  # attenuation-only mix; never boost quiet content or silence
   headroom_dbfs: -12
-  backend: simple  # CI-safe default; use fluidsynth in production
+  backend: simple  # lightweight preview; listening selects fluidsynth
   allow_simple_fallback: true
   routing:
     drums: {default: fluidsynth, microtonal: fluidsynth}

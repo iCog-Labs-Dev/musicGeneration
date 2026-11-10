@@ -259,5 +259,145 @@ class TestRenderPackage(unittest.TestCase):
             load_render_package(packages[0])
 
 
+class TestPackageIntegrity(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.score, self.path = _tiny_score()
+        self.midi = self.root / 'source.mid'
+        render_midi(self.score, EDO(EDOConfig(n=12)), str(self.midi))
+        self.manifest = RunManifest(seed=1, config_dump={})
+        self.package = self.write()
+
+    def write(self):
+        return write_render_package(
+            self.root, score=self.score, midi_path=self.midi,
+            manifest=self.manifest, path=self.path, run_id='integrity',
+        )
+
+    def metadata(self):
+        return json.loads(self.package.manifest_path.read_text())
+
+    def save_metadata(self, data):
+        self.package.manifest_path.write_text(json.dumps(data))
+
+    def test_new_digests_cover_payload_bytes_not_manifest(self) -> None:
+        import hashlib
+
+        digests = self.metadata()['render_package']['file_digests']
+        self.assertEqual(set(digests), {
+            'score.json', 'score.mid', 'structure.json', 'tuning.json', 'beatstates.jsonl',
+        })
+        for name, digest in digests.items():
+            self.assertEqual(digest, hashlib.sha256((self.package.root / name).read_bytes()).hexdigest())
+        # Provenance edits are deliberately not self-hashed.
+        data = self.metadata()
+        data['audio'] = {'status': 'pending'}
+        self.save_metadata(data)
+        self.assertEqual(load_render_package(self.package.root).content_hash, self.package.content_hash)
+
+    def test_v1_serialization_identity_and_single_package_aliases(self) -> None:
+        import hashlib
+
+        source = hashlib.sha256(
+            json.dumps(self.score.to_dict(), sort_keys=True).encode()
+            + self.midi.read_bytes() + b"12"
+        ).hexdigest()
+        package = hashlib.sha256(
+            source.encode()
+            + self.package.structure_path.read_bytes()
+            + self.package.tuning_path.read_bytes()
+            + (self.package.root / "beatstates.jsonl").read_bytes()
+        ).hexdigest()
+        self.assertEqual(self.package.source_hash, source)
+        self.assertEqual(self.package.content_hash, package)
+        original = self.metadata()
+        for alias in ("package_hash", "content_hash"):
+            data = json.loads(json.dumps(original))
+            data["render_package"].pop(alias)
+            data["render_package"].pop("file_digests")
+            self.save_metadata(data)
+            # v1 canonical JSON ignores indentation, but not metadata values.
+            structure = json.loads(self.package.structure_path.read_text())
+            self.package.structure_path.write_text(json.dumps(structure))
+            self.assertEqual(load_render_package(self.package.root).content_hash, package)
+
+    def test_corrupt_payload_reports_file_expected_and_actual(self) -> None:
+        for name in ('score.json', 'score.mid', 'structure.json', 'tuning.json', 'beatstates.jsonl'):
+            with self.subTest(name=name):
+                path = self.package.root / name
+                original = path.read_bytes()
+                path.write_bytes(original + b' ')
+                with self.assertRaisesRegex(ContractViolation, rf'{name}.*expected=.*actual='):
+                    load_render_package(self.package.root)
+                path.write_bytes(original)
+
+    def test_legacy_identity_and_aggregate_group_diagnostics(self) -> None:
+        data = self.metadata()
+        data['render_package'].pop('file_digests', None)
+        self.save_metadata(data)
+        loaded = load_render_package(self.package.root)
+        self.assertEqual(loaded.content_hash, self.package.content_hash)
+        for name, group in (('score.json', 'source'), ('score.mid', 'source'),
+                            ('structure.json', 'package'), ('tuning.json', 'package'),
+                            ('beatstates.jsonl', 'package')):
+            with self.subTest(name=name):
+                path = self.package.root / name
+                original = path.read_bytes()
+                if name.endswith('.json'):
+                    payload = json.loads(original)
+                    payload['corruption'] = True
+                    path.write_text(json.dumps(payload))
+                else:
+                    path.write_bytes(original + b' ')
+                with self.assertRaisesRegex(ContractViolation, rf'{group} aggregate.*expected=.*actual=') as error:
+                    load_render_package(self.package.root)
+                self.assertIn(name, str(error.exception))
+                path.write_bytes(original)
+
+    def test_manifest_aliases_and_structure_source_must_agree(self) -> None:
+        original = self.metadata()
+        for field in ('source_hash', 'package_hash', 'content_hash'):
+            with self.subTest(field=field):
+                data = self.metadata()
+                data['render_package'][field] = '0' * 64
+                self.save_metadata(data)
+                with self.assertRaisesRegex(ContractViolation, 'expected=.*actual='):
+                    load_render_package(self.package.root)
+                self.save_metadata(original)
+        data = self.metadata()
+        data['render_package'].pop('file_digests', None)
+        self.save_metadata(data)
+        structure = json.loads(self.package.structure_path.read_text())
+        structure['source_hash'] = 'sha256:' + '0' * 64
+        self.package.structure_path.write_text(json.dumps(structure))
+        with self.assertRaisesRegex(ContractViolation, r'structure.source_hash.*expected=.*actual='):
+            load_render_package(self.package.root)
+
+    def test_reused_corrupt_directory_is_not_returned_or_overwritten(self) -> None:
+        self.package.midi_path.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(ContractViolation, 'score.mid'):
+            self.write()
+        self.assertEqual(self.package.midi_path.read_bytes(), b'corrupt')
+
+    def test_absent_legacy_beatstates_only_matches_empty_aggregate(self) -> None:
+        data = self.metadata()
+        data['render_package'].pop('file_digests', None)
+        self.save_metadata(data)
+        (self.package.root / 'beatstates.jsonl').unlink()
+        with self.assertRaisesRegex(ContractViolation, 'package aggregate'):
+            load_render_package(self.package.root)
+        empty = write_render_package(
+            self.root, score=self.score, midi_path=self.midi, manifest=self.manifest,
+            path=(), run_id='empty',
+        )
+        data = json.loads(empty.manifest_path.read_text())
+        data['render_package'].pop('file_digests', None)
+        empty.manifest_path.write_text(json.dumps(data))
+        (empty.root / 'beatstates.jsonl').unlink()
+        self.assertEqual(load_render_package(empty.root).content_hash, empty.content_hash)
+
+
 if __name__ == "__main__":
     unittest.main()

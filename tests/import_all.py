@@ -12,7 +12,7 @@ import aimusic
 OPTIONAL_MODULE_PREFIXES = ("aimusic.ml.",)
 
 
-def import_all_executable_modules(*, include_optional: bool = False) -> tuple[str, ...]:
+def import_all_executable_modules(*, include_optional: bool = False, include_ui: bool = True) -> tuple[str, ...]:
     """Import executable surfaces available in the selected installation."""
     module_names = tuple(
         sorted(
@@ -26,8 +26,10 @@ def import_all_executable_modules(*, include_optional: bool = False) -> tuple[st
     )
     for module_name in module_names:
         importlib.import_module(module_name)
-    importlib.import_module("ui")
-    return (*module_names, "ui")
+    if include_ui:
+        importlib.import_module("ui")
+        return (*module_names, "ui")
+    return module_names
 
 
 if __name__ == "__main__":

@@ -416,27 +416,54 @@ def handle_export(args: argparse.Namespace) -> None:
 
 
 def handle_render_audio(args: argparse.Namespace) -> None:
-    """Validate (or eventually render) a RenderPackage directory."""
-    package_root = Path(args.package)
-    if not package_root.is_dir():
-        print(f"Error: RenderPackage directory not found: {package_root}", file=sys.stderr)
+    """Keep audio imports optional, including during CLI help and generation."""
+    _handle_audio(args, imported=False)
+
+
+def handle_render_midi(args: argparse.Namespace) -> None:
+    _handle_audio(args, imported=True)
+
+
+def _handle_audio(args: argparse.Namespace, *, imported: bool) -> None:
+    command = "render-midi" if imported else "render-audio"
+    source = Path(args.midi if imported else args.package)
+    valid_path = source.is_file() if imported else source.is_dir()
+    if not valid_path:
+        kind = "MIDI file" if imported else "RenderPackage directory"
+        print(f"Error: {kind} not found: {source}", file=sys.stderr)
         sys.exit(1)
     try:
         entry = importlib.import_module("aimusic.audio.entry")
-    except ImportError:
+        render = entry.render_midi if imported else entry.render_audio
+        exit_code = render(
+            source,
+            profile=args.profile,
+            validate_only=args.validate_only,
+            output_dir=getattr(args, "output_dir", None),
+            soundfont=getattr(args, "soundfont", None),
+        )
+    except ImportError as exc:
         print(
-            "Error: render-audio requires optional audio dependencies.\n"
+            f"Error: {command} requires optional audio dependencies ({exc}).\n"
             "Install with: pip install -e '.[audio]'",
             file=sys.stderr,
         )
         sys.exit(1)
-    profile = Path(args.profile) if args.profile else None
-    exit_code = entry.render_audio(
-        package_root,
-        profile=profile,
-        validate_only=args.validate_only,
-    )
+    except (ValueError, OSError, RuntimeError) as exc:
+        print(f"Error: {command}: {exc}", file=sys.stderr)
+        sys.exit(1)
     sys.exit(exit_code)
+
+
+def _audio_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--profile", type=str, default=None,
+                        help="Named preview/listening profile or audio config YAML path")
+    parser.add_argument("--out", "--output-dir", dest="output_dir", type=str, default=None,
+                        help="Exact audio output directory (existing artifacts are never overwritten)")
+    parser.add_argument("--soundfont", type=str, default=None,
+                        help="Local license-approved SoundFont; overrides profile/config and AIMUSIC_SOUNDFONT")
+    parser.add_argument("--validate-only", action=argparse.BooleanOptionalAction, default=True,
+                        help="Validate input only (default); --no-validate-only generates WAV stems and rough mix")
 
 
 def main() -> None:
@@ -538,19 +565,13 @@ def main() -> None:
         type=str,
         help="Path to run_<hash>/ RenderPackage directory",
     )
-    render_parser.add_argument(
-        "--profile",
-        type=str,
-        default=None,
-        help="Audio config YAML (default: config/audio.default.yaml)",
-    )
-    render_parser.add_argument(
-        "--validate-only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Validate RenderPackage only (default). Use --no-validate-only to attempt full render.",
-    )
+    _audio_options(render_parser)
     render_parser.set_defaults(func=handle_render_audio)
+
+    midi_parser = subparsers.add_parser("render-midi", help="Validate or render supported imported MIDI")
+    midi_parser.add_argument("midi", type=str, help="Path to a type-0/type-1 MIDI file (never modified)")
+    _audio_options(midi_parser)
+    midi_parser.set_defaults(func=handle_render_midi)
 
     args = parser.parse_args()
     args.func(args)

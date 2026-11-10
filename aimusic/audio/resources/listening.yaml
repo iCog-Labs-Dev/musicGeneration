@@ -1,0 +1,9 @@
+# Instrument listening requires optional FluidSynth and a user-supplied asset.
+render:
+  backend: fluidsynth
+  allow_simple_fallback: false
+  routing:
+    drums: {default: fluidsynth, microtonal: fluidsynth}
+    bass: {default: fluidsynth, microtonal: fluidsynth}
+    comping: {default: fluidsynth, microtonal: fluidsynth}
+    lead: {default: fluidsynth, microtonal: fluidsynth}

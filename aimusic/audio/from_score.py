@@ -7,12 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aimusic.audio.analysis.reconcile import ReconciliationReport, reconcile
 from aimusic.core.core_types import Score
 from aimusic.core.render_package import (
     STRUCTURE_SCHEMA,
     RenderPackage,
     StructureDoc,
-    assert_contract_invariants,
+    ContractViolation,
     load_render_package,
 )
 
@@ -26,6 +27,44 @@ class AudioPackageContext:
     structure: StructureDoc
     provenance: str
     run_id: str
+    tuning: dict[str, Any]
+    role_source: str = "structure.json"
+    count_source: str = "score.json"
+
+    @property
+    def verified_identity(self) -> dict[str, str]:
+        return {"source_hash": self.package.source_hash, "package_hash": self.package.content_hash}
+
+    @property
+    def track_roles(self) -> dict[str, str]:
+        return {
+            t["name"]: "comping" if t["role"] == "comp" else t["role"]
+            for t in self.structure.tracks
+        }
+
+    @property
+    def track_note_counts(self) -> dict[str, int]:
+        return self.score.track_event_counts()
+
+    def analysis_document(self) -> dict[str, Any]:
+        """Planner values adapted to the existing audio-stage sidecar shape."""
+        return {
+            **self.structure.to_dict(),
+            "provenance": self.provenance,
+            "verified_identity": self.verified_identity,
+            "inputs_hash": self.package.content_hash,
+            "tuning": self.tuning,
+            "resolution": self.score.ticks_per_beat,
+            "tempo_bpm": self.score.tempo_bpm,
+            "bar_boundaries_sec": [row[1] for row in self.structure.bar_table],
+            "total_notes": len(self.score),
+            "tracks": [
+                {**track, "role": self.track_roles[track["name"]],
+                 "note_count": self.track_note_counts[track["name"]],
+                 "role_source": self.role_source, "count_source": self.count_source}
+                for track in self.structure.tracks
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -41,6 +80,7 @@ class ValidationReport:
     microtonal_tracks: tuple[str, ...]
     content_hash: str
     package_root: Path
+    reconciliation: ReconciliationReport
 
 
 def _structure_from_dict(data: dict[str, Any]) -> StructureDoc:
@@ -74,12 +114,18 @@ def from_score(package_root: Path | str) -> AudioPackageContext:
         structure=structure,
         provenance=structure.provenance,
         run_id=run_id,
+        tuning=json.loads(package.tuning_path.read_text(encoding="utf-8")),
     )
 
 
 def validate_package(ctx: AudioPackageContext) -> ValidationReport:
     """Assert contract invariants and return a human-readable summary."""
-    assert_contract_invariants(ctx.package, score=ctx.score)
+    verified = load_render_package(ctx.package.root)
+    if verified.content_hash != ctx.package.content_hash:
+        raise ContractViolation(
+            f"package identity changed since admission: expected={ctx.package.content_hash}, "
+            f"actual={verified.content_hash}; reload the context"
+        )
     microtonal = tuple(
         str(track["name"])
         for track in ctx.structure.tracks
@@ -96,4 +142,5 @@ def validate_package(ctx: AudioPackageContext) -> ValidationReport:
         microtonal_tracks=microtonal,
         content_hash=ctx.package.content_hash,
         package_root=ctx.package.root,
+        reconciliation=reconcile(ctx),
     )

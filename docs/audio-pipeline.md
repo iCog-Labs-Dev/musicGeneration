@@ -2,7 +2,11 @@
 
 **Status:** M0 landed (RenderPackage contract); M1 PR2 entry spine + M1 PR3
 CI-safe deterministic spine (`from_score`, groove, simple render, orchestrator,
-optional m2a bridge). Fluidsynth and generative stages follow the roadmap.  
+optional m2a bridge). Clean-room FluidSynth dispatch is implemented behind
+`[audio-render]`; [four pinned native demos](audio-demo-sources.md) are measured
+locally and [accepted as rough demos, including human timing review](audio-listening-review.md).
+No aesthetic groove improvement is claimed. [Final integration review is complete](audio-testing.md#final-acceptance-review-114)
+(**42/42** tasks); generative stages remain out of scope.
 **Canonical design:** sibling repo `midi2audio_generative/AUDIO_PIPELINE_ARCHITECTURE.pdf`
 (*From BeatState to Master*, v0.1). This document is the in-repo product digest.
 
@@ -67,11 +71,14 @@ Native `aimusic.audio` is the default product path
 (``AIMUSIC_AUDIO_BACKEND=native`` or unset). Optional bridge:
 ``AIMUSIC_AUDIO_BACKEND=m2a`` after ``pip install -e ".[audio-bridge]"``
 (pins ``midi2audio-generative@46b3dfe``). Default render backend is ``simple``
-(CI-safe additive synth); fluidsynth deferred.
+(CI-safe additive synth). Optional FluidSynth setup and evidence limits:
+[audio-fluidsynth.md](audio-fluidsynth.md).
 
 ## Determinism, caching, provenance
 
-- Cache keys: content hashes of inputs + canonical config subset + code version.
+- Cache keys resolve actual per-role renderers first and include verified inputs,
+  normalized config/routes, capabilities/runtime/code and SoundFont bytes. Complete
+  manifests verify every cached output; see [renderer/cache contracts](audio-renderer-cache.md).
 - Nondeterministic steps (LLM groove authoring, paid endpoints) sit behind artifact
   boundaries; cache hits are bit-identical.
 - `RunManifest` is extended with audio stage records (prompts, seeds, costs, hashes).
@@ -86,8 +93,11 @@ so DSP never blocks on symbolic changes. The contract is the decoupler.
 
 ## Related docs
 
+- [audio-imported-midi.md](audio-imported-midi.md) — validation-first MIDI/package CLI and preview evidence
+- [audio-stems.md](audio-stems.md) — logical stems, safe filenames and role index
 - [render-package-contract.md](render-package-contract.md)
 - [audio-roadmap.md](audio-roadmap.md) — M0–M6 quarter plan
 - [audio-stages.md](audio-stages.md) — STAGE 1–6 design
 - [audio-next-steps.md](audio-next-steps.md) — agent backlog
 - [docs/decisions/](decisions/) — ADRs
+- [audio-publication-safety.md](audio-publication-safety.md) - publication containment, rollback, and crash recovery

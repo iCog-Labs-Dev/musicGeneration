@@ -44,6 +44,7 @@ class RenderPackage:
     manifest_path: Path
     content_hash: str
     beatstates_path: Path | None = None
+    source_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +55,7 @@ class RenderPackage:
             "tuning_path": str(self.tuning_path),
             "manifest_path": str(self.manifest_path),
             "content_hash": self.content_hash,
+            "source_hash": self.source_hash,
             "beatstates_path": str(self.beatstates_path) if self.beatstates_path else None,
         }
 
@@ -438,6 +440,16 @@ def write_render_package(
         "package_hash": package_hash,
         "content_hash": package_hash,
         "structure_schema": STRUCTURE_SCHEMA,
+        "file_digests": {
+            name: _content_hash_bytes(blob)
+            for name, blob in {
+                "score.json": score_bytes,
+                "score.mid": midi_bytes,
+                "structure.json": structure_bytes,
+                "tuning.json": tuning_bytes,
+                "beatstates.jsonl": beatstates_bytes,
+            }.items()
+        },
     }
     manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
@@ -449,10 +461,16 @@ def write_render_package(
         tuning_path=tuning_path,
         manifest_path=manifest_path,
         content_hash=package_hash,
+        source_hash=source_hash,
         beatstates_path=beatstates_path,
     )
     assert_contract_invariants(package, score=score)
     return package
+
+
+def _check_digest(label: str, expected: Any, actual: str) -> None:
+    if expected != actual:
+        raise ContractViolation(f"{label} digest mismatch: expected={expected!r}, actual={actual!r}")
 
 
 def load_render_package(root: Path | str) -> RenderPackage:
@@ -465,12 +483,46 @@ def load_render_package(root: Path | str) -> RenderPackage:
     beatstates = root / "beatstates.jsonl"
     manifest_data = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     render_meta = manifest_data.get("render_package") or {}
-    package_hash = render_meta.get("package_hash")
-    if isinstance(package_hash, str) and package_hash:
-        content_hash = package_hash
-    else:
-        structure = json.loads((root / "structure.json").read_text(encoding="utf-8"))
-        content_hash = str(structure.get("source_hash", "")).removeprefix("sha256:") or "unknown"
+    # New manifests locate corrupt bytes before parsing. Legacy v1 manifests
+    # can only locate corruption to an aggregate's input group.
+    payloads = {name: (root / name).read_bytes() for name in required[:-1]}
+    if beatstates.is_file():
+        payloads["beatstates.jsonl"] = beatstates.read_bytes()
+    if "file_digests" in render_meta:
+        digests = render_meta["file_digests"]
+        if not isinstance(digests, dict) or set(digests) != set(payloads):
+            raise ContractViolation(
+                f"file_digests payload set: expected={sorted(payloads)!r}, actual={digests!r}"
+            )
+        for name, blob in payloads.items():
+            _check_digest(name, digests[name], _content_hash_bytes(blob))
+
+    try:
+        score_data = json.loads(payloads["score.json"])
+        structure = json.loads(payloads["structure.json"])
+        tuning = json.loads(payloads["tuning.json"])
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ContractViolation(f"invalid RenderPackage JSON: {exc}") from exc
+    source_hash = _content_hash_bytes(
+        json.dumps(score_data, sort_keys=True).encode("utf-8"),
+        payloads["score.mid"],
+        str(structure["edo"]).encode("utf-8"),
+    )
+    _check_digest(
+        "source aggregate (score.json, score.mid, structure.edo)",
+        render_meta.get("source_hash"), source_hash,
+    )
+    _check_digest("structure.source_hash", structure.get("source_hash"), f"sha256:{source_hash}")
+    content_hash = _content_hash_bytes(
+        source_hash.encode("utf-8"), _canonical_json_bytes(structure),
+        _canonical_json_bytes(tuning), payloads.get("beatstates.jsonl", b""),
+    )
+    _check_digest(
+        "package aggregate (source digest, structure.json, tuning.json, beatstates.jsonl)",
+        render_meta.get("package_hash", render_meta.get("content_hash")), content_hash,
+    )
+    if "content_hash" in render_meta:
+        _check_digest("manifest content_hash alias", render_meta["content_hash"], content_hash)
     package = RenderPackage(
         root=root,
         midi_path=root / "score.mid",
@@ -479,6 +531,7 @@ def load_render_package(root: Path | str) -> RenderPackage:
         tuning_path=root / "tuning.json",
         manifest_path=root / "manifest.json",
         content_hash=content_hash,
+        source_hash=source_hash,
         beatstates_path=beatstates if beatstates.is_file() else None,
     )
     assert_contract_invariants(package)

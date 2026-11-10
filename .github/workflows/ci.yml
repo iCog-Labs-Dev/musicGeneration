@@ -98,3 +98,28 @@ jobs:
           python -m compileall -q aimusic
           python -m tests.import_all --include-optional
           python -m pytest tests/test_count_prior.py tests/test_ml_bundle.py tests/test_ml_dataset.py tests/test_ml_train.py tests/test_ml_integration.py -q
+
+  windows-audio:
+    # Temporarily deferred after fork run 42789164898 failed in the
+    # standard-user Start-Process bootstrap. Restore under OpenSpec task 8.0a.
+    if: ${{ false }}
+    name: Windows audio (asset-free wheel)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Provision standard user and run native installed-wheel checks
+        run: ./scripts/test-windows-audio-as-standard-user.ps1 -Python python
+      - name: Evidence preflight (no secrets, assets, or native renderer)
+        run: python -S -m tests.windows_fluidsynth_evidence --preflight

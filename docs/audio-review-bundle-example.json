@@ -1,0 +1,1222 @@
+{
+  "schema": "aimusic.review-bundle/1",
+  "sources": [
+    {
+      "kind": "imported_midi",
+      "files": [
+        {
+          "path": "private/source.mid",
+          "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "size": 2
+        }
+      ],
+      "identity": {
+        "midi_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+      }
+    }
+  ],
+  "renders": [
+    {
+      "source_sha256": "5323e3f3da1e83bcf49c63c5c6885cb5d3669af224decd856f9eb4d471ff7d88",
+      "manifest": {
+        "path": "private/render.json",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "reports": [
+        {
+          "path": "private/evidence.json",
+          "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "size": 2
+        },
+        {
+          "path": "private/raw.wav",
+          "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "size": 2
+        }
+      ],
+      "effective_config": {
+        "render": {
+          "sample_rate": 48000,
+          "backend": "simple",
+          "allow_simple_fallback": false,
+          "routing": {},
+          "release_tail_sec": 0.25,
+          "mix_peak": 0.95
+        },
+        "stages": {
+          "analysis": true,
+          "expressivization": false,
+          "render": true,
+          "prompts": false,
+          "restyle": false,
+          "scoring": false,
+          "mixmaster": false
+        },
+        "paths": {}
+      },
+      "application_backend": {
+        "requested_backend": "native",
+        "effective_backend": "native",
+        "fallback_reason": null
+      },
+      "runtime": {
+        "python": "3.11",
+        "platform": "test",
+        "dependencies": {
+          "numpy": "test"
+        }
+      },
+      "renderers": [
+        {
+          "requested_backend": "simple",
+          "effective_backend": "simple",
+          "soundfont_sha256": null,
+          "fallback_reason": null,
+          "required_tuning": "direct_12",
+          "source_track_index": 1,
+          "role": "lead",
+          "role_source": "inferred",
+          "tuning_evidence": null,
+          "backend": {
+            "name": "simple",
+            "version": "3",
+            "code_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "native_versions": [
+              [
+                "numpy",
+                "test"
+              ]
+            ],
+            "settings": [],
+            "capabilities": {
+              "tuning_modes": [
+                "direct_12"
+              ],
+              "revision": "1",
+              "instrument_fidelity": false
+            }
+          }
+        }
+      ],
+      "metrics": [
+        {
+          "name": "CLAP",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "FAD",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "LUFS",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "rhythm_f_score",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "note_f1",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "polyphonic_f0",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "integrity",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "source_identity",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "backend_asset",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "finite_audio",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "alignment",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "bounded_peak",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "expected_signal",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "events",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "routing",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "reconciliation",
+          "state": "not_applicable",
+          "reason": "imported MIDI",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "controlled_tuning",
+          "state": "not_applicable",
+          "reason": "no controlled windows",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "negative_control",
+          "state": "not_applicable",
+          "reason": "not a control",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        }
+      ]
+    },
+    {
+      "source_sha256": "5323e3f3da1e83bcf49c63c5c6885cb5d3669af224decd856f9eb4d471ff7d88",
+      "manifest": {
+        "path": "private/render.json",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "reports": [
+        {
+          "path": "private/evidence.json",
+          "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "size": 2
+        },
+        {
+          "path": "private/raw.wav",
+          "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "size": 2
+        }
+      ],
+      "effective_config": {
+        "render": {
+          "sample_rate": 48000,
+          "backend": "simple",
+          "allow_simple_fallback": false,
+          "routing": {},
+          "release_tail_sec": 0.25,
+          "mix_peak": 0.95
+        },
+        "stages": {
+          "analysis": true,
+          "expressivization": false,
+          "render": true,
+          "prompts": false,
+          "restyle": false,
+          "scoring": false,
+          "mixmaster": false
+        },
+        "paths": {}
+      },
+      "application_backend": {
+        "requested_backend": "native",
+        "effective_backend": "native",
+        "fallback_reason": null
+      },
+      "runtime": {
+        "python": "3.11",
+        "platform": "test",
+        "dependencies": {
+          "numpy": "test"
+        }
+      },
+      "renderers": [
+        {
+          "requested_backend": "simple",
+          "effective_backend": "simple",
+          "soundfont_sha256": null,
+          "fallback_reason": null,
+          "required_tuning": "direct_12",
+          "source_track_index": 1,
+          "role": "lead",
+          "role_source": "inferred",
+          "tuning_evidence": null,
+          "backend": {
+            "name": "simple",
+            "version": "3",
+            "code_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "native_versions": [
+              [
+                "numpy",
+                "test"
+              ]
+            ],
+            "settings": [],
+            "capabilities": {
+              "tuning_modes": [
+                "direct_12"
+              ],
+              "revision": "1",
+              "instrument_fidelity": false
+            }
+          }
+        }
+      ],
+      "metrics": [
+        {
+          "name": "CLAP",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "FAD",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "LUFS",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "rhythm_f_score",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "note_f1",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "polyphonic_f0",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "integrity",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "source_identity",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "backend_asset",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "finite_audio",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "alignment",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "bounded_peak",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "expected_signal",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "events",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "routing",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "reconciliation",
+          "state": "not_applicable",
+          "reason": "imported MIDI",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "controlled_tuning",
+          "state": "passed",
+          "reason": "no controlled windows",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "negative_control",
+          "state": "not_applicable",
+          "reason": "not a control",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        }
+      ]
+    },
+    {
+      "source_sha256": "5323e3f3da1e83bcf49c63c5c6885cb5d3669af224decd856f9eb4d471ff7d88",
+      "manifest": {
+        "path": "private/render.json",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "reports": [
+        {
+          "path": "private/evidence.json",
+          "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "size": 2
+        },
+        {
+          "path": "private/raw.wav",
+          "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+          "size": 2
+        }
+      ],
+      "effective_config": {
+        "render": {
+          "sample_rate": 48000,
+          "backend": "simple",
+          "allow_simple_fallback": false,
+          "routing": {},
+          "release_tail_sec": 0.25,
+          "mix_peak": 0.95
+        },
+        "stages": {
+          "analysis": true,
+          "expressivization": false,
+          "render": true,
+          "prompts": false,
+          "restyle": false,
+          "scoring": false,
+          "mixmaster": false
+        },
+        "paths": {}
+      },
+      "application_backend": {
+        "requested_backend": "native",
+        "effective_backend": "native",
+        "fallback_reason": null
+      },
+      "runtime": {
+        "python": "3.11",
+        "platform": "test",
+        "dependencies": {
+          "numpy": "test"
+        }
+      },
+      "renderers": [
+        {
+          "requested_backend": "simple",
+          "effective_backend": "simple",
+          "soundfont_sha256": null,
+          "fallback_reason": null,
+          "required_tuning": "direct_12",
+          "source_track_index": 1,
+          "role": "lead",
+          "role_source": "inferred",
+          "tuning_evidence": null,
+          "backend": {
+            "name": "simple",
+            "version": "3",
+            "code_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "native_versions": [
+              [
+                "numpy",
+                "test"
+              ]
+            ],
+            "settings": [],
+            "capabilities": {
+              "tuning_modes": [
+                "direct_12"
+              ],
+              "revision": "1",
+              "instrument_fidelity": false
+            }
+          }
+        }
+      ],
+      "metrics": [
+        {
+          "name": "CLAP",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "FAD",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "LUFS",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "rhythm_f_score",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "note_f1",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "polyphonic_f0",
+          "state": "unmeasured",
+          "reason": "not run",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "integrity",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "source_identity",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "backend_asset",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "finite_audio",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "alignment",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "bounded_peak",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "expected_signal",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "events",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "routing",
+          "state": "passed",
+          "reason": "synthetic test evidence",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "reconciliation",
+          "state": "not_applicable",
+          "reason": "imported MIDI",
+          "method": null,
+          "evidence": [],
+          "observations": {}
+        },
+        {
+          "name": "controlled_tuning",
+          "state": "failed",
+          "reason": "calibration",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        },
+        {
+          "name": "negative_control",
+          "state": "passed",
+          "reason": "calibration",
+          "method": "test",
+          "evidence": [
+            {
+              "path": "private/evidence.json",
+              "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+              "size": 2
+            }
+          ],
+          "observations": {}
+        }
+      ]
+    }
+  ],
+  "presentations": [
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s00.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s01.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "000d1ba3d36bd82774a8dc5e0e4f7e13b970d4b77083c9493fef1c8de5316038",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s02.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s03.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s04.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s05.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s06.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s07.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s08.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s09.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s10.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "005b034430afab48f9b6abfdc57c42ce1938608961b782f860480add5145e053",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s11.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "000d1ba3d36bd82774a8dc5e0e4f7e13b970d4b77083c9493fef1c8de5316038",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s12.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    },
+    {
+      "render_sha256": "e1703fdb9c3fda4c8ac6c2e38c2aa398e8f95aedddeea868f12705e5ee76e88c",
+      "source_wav": {
+        "path": "private/raw.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "output": {
+        "path": "media/s13.wav",
+        "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "size": 2
+      },
+      "start_sample": 0,
+      "stop_sample": 100,
+      "gain": 1.0
+    }
+  ],
+  "stimuli": [
+    {
+      "id": "s00",
+      "presentation_sha256": "bc3f8493b81ff2d6961a76d0d4026efb92ca1a747663acda38399d039b5ed101"
+    },
+    {
+      "id": "s01",
+      "presentation_sha256": "ccb0eac694c8bfe99f11ddd77cdb74861b2f96bcc4cdb381f05bf0f78a8fa625"
+    },
+    {
+      "id": "s02",
+      "presentation_sha256": "9ed154488f27c1f29c5d9ce1068d76424ab8dbc6babebdecc37ed4e590f4bc54"
+    },
+    {
+      "id": "s03",
+      "presentation_sha256": "8dc9bbabe96e32b09ddddf6aa3fe80861b9af5a84da2de9fa6fa581f1a6da6cd"
+    },
+    {
+      "id": "s04",
+      "presentation_sha256": "407bed1224f353aeb376539dc64f5d5581c16d65699874d76b16aa08d6979a8c"
+    },
+    {
+      "id": "s05",
+      "presentation_sha256": "538bf324ededff44d7ea710aa9c28bcad07a01682f51d17c98a0dfb5b736c1cd"
+    },
+    {
+      "id": "s06",
+      "presentation_sha256": "19b0856649bcb4c5c443f072218ac32d75d80b9bf06b1df9e6b390d34596a114"
+    },
+    {
+      "id": "s07",
+      "presentation_sha256": "01582846c7e83d14860338ba1610d7de18e2a46e1ae0f07302efc390adc4fbfb"
+    },
+    {
+      "id": "s08",
+      "presentation_sha256": "110d0e533b99b86796afc4c479184104b1bbd72b9fa8b70f0be538be7f19c7c6"
+    },
+    {
+      "id": "s09",
+      "presentation_sha256": "ccd39dd57184b7141c0fc797ba8a1ccbfb7f2d19454b5e992a4b2155d7341a85"
+    },
+    {
+      "id": "s10",
+      "presentation_sha256": "6c1371b4925cf88d28ea1a372c056deed7c9d855d08158bd281ee99c29bef7f7"
+    },
+    {
+      "id": "s11",
+      "presentation_sha256": "04b0ef935e4d3a5e865a5f328773138cea69ee4d3a32d31e9d67500bfdf27d37"
+    },
+    {
+      "id": "s12",
+      "presentation_sha256": "0b95fe17f6dbf85110ffe7cbdf2589d7aa477ad5bb2b37c415ec50d95bfe1cfa"
+    },
+    {
+      "id": "s13",
+      "presentation_sha256": "5ffa53f38f27769a707362fa6dcb6cd09cc9f069108c07c9463bb80f80feb544"
+    }
+  ],
+  "panels": [
+    {
+      "purpose": "canonical",
+      "stimuli": [
+        "s00",
+        "s01",
+        "s02",
+        "s03"
+      ]
+    },
+    {
+      "purpose": "roles",
+      "stimuli": [
+        "s04",
+        "s05",
+        "s06",
+        "s07"
+      ]
+    },
+    {
+      "purpose": "parity",
+      "stimuli": [
+        "s08",
+        "s09"
+      ]
+    },
+    {
+      "purpose": "timing",
+      "stimuli": [
+        "s10",
+        "s11"
+      ]
+    },
+    {
+      "purpose": "tuning",
+      "stimuli": [
+        "s12",
+        "s13"
+      ]
+    }
+  ],
+  "blind_map": {
+    "path": "private/blind-map.json",
+    "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "size": 2
+  },
+  "assignment_directory": "assignments",
+  "finding_directory": "findings"
+}

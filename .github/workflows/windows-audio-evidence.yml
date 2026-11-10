@@ -1,0 +1,85 @@
+name: Windows renderer evidence (opt-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_renderer:
+        description: 'Enable approved local native assets on the protected self-hosted runner'
+        type: boolean
+        default: false
+      approved_manifest:
+        description: 'Existing absolute approved-asset JSON path on the runner (never a secret)'
+        type: string
+        required: false
+      fluidsynth_dll:
+        description: 'Existing absolute FluidSynth 2.6.2 x64 DLL path on the runner'
+        type: string
+        required: false
+      dll_sha256:
+        description: 'Approved DLL SHA-256 (lowercase, 64 digits)'
+        type: string
+        required: false
+      evidence_parent:
+        description: 'Existing absolute external evidence directory on the runner'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Reject incomplete enabled requests before scheduling the asset runner
+        if: ${{ inputs.run_renderer }}
+        shell: pwsh
+        env:
+          APPROVED_MANIFEST: ${{ inputs.approved_manifest }}
+          FLUIDSYNTH_DLL: ${{ inputs.fluidsynth_dll }}
+          DLL_SHA256: ${{ inputs.dll_sha256 }}
+          EVIDENCE_PARENT: ${{ inputs.evidence_parent }}
+        run: |
+          foreach ($name in @('APPROVED_MANIFEST', 'FLUIDSYNTH_DLL', 'DLL_SHA256', 'EVIDENCE_PARENT')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Enabled renderer requires input $name; pre-provision approved local prerequisites"
+            }
+          }
+      - name: Asset-free plan only
+        shell: pwsh
+        run: python -S -m tests.windows_fluidsynth_evidence --preflight
+
+  renderer:
+    if: ${{ inputs.run_renderer }}
+    needs: preflight
+    runs-on: [self-hosted, Windows, X64, aimusic-fluidsynth-2.6.2]
+    environment: windows-audio-evidence
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Build wheel and record pinned canonical evidence
+        shell: pwsh
+        env:
+          APPROVED_MANIFEST: ${{ inputs.approved_manifest }}
+          FLUIDSYNTH_DLL: ${{ inputs.fluidsynth_dll }}
+          DLL_SHA256: ${{ inputs.dll_sha256 }}
+          EVIDENCE_PARENT: ${{ inputs.evidence_parent }}
+        run: |
+          ./scripts/test-windows-audio.ps1 -Python python -Renderer `
+            -Manifest $env:APPROVED_MANIFEST -Dll $env:FLUIDSYNTH_DLL `
+            -DllSha256 $env:DLL_SHA256 -EvidenceParent $env:EVIDENCE_PARENT
+      # No upload: local-only asset approval does not authorize redistributing audio.

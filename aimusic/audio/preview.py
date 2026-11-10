@@ -11,6 +11,9 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 import wave
+import tempfile
+
+from aimusic.audio.publication import pin_output
 
 import mido
 import numpy as np
@@ -92,12 +95,16 @@ def render_midi_preview(midi_path: Path | str, output_path: Path | str, *, sampl
         mix[offset:offset + len(signal), :] += signal[:, None] / np.sqrt(2)
     mix *= 0.9 / max(float(np.max(np.abs(mix))), 1e-9)
     output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(output), "wb") as stream:
-        stream.setnchannels(2)
-        stream.setsampwidth(2)
-        stream.setframerate(sample_rate)
-        stream.writeframes((mix * 32767).astype("<i2").tobytes())
+    with pin_output(output.parent) as root:
+        root.check_new_files([output.name])
+        with tempfile.TemporaryDirectory(prefix='aimusic-preview-') as tmp:
+            staging = Path(tmp)
+            with wave.open(str(staging / output.name), "wb") as stream:
+                stream.setnchannels(2)
+                stream.setsampwidth(2)
+                stream.setframerate(sample_rate)
+                stream.writeframes((mix * 32767).astype("<i2").tobytes())
+            root.publish(staging, [output.name], replace=False, sources=(Path(midi_path),))
     return output
 
 

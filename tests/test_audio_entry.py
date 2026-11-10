@@ -63,6 +63,74 @@ class TestAudioEntry(unittest.TestCase):
             self.assertTrue(report.track_names)
             self.assertEqual(report.package_root, package_root)
 
+    def test_context_retains_tuning_identity_and_count_sources(self) -> None:
+        import json
+        from aimusic.audio.from_score import from_score
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = from_score(_generate_package(Path(tmp)))
+            self.assertEqual(ctx.tuning, json.loads(ctx.package.tuning_path.read_text()))
+            self.assertEqual(ctx.verified_identity["package_hash"], ctx.package.content_hash)
+            self.assertEqual(ctx.verified_identity["source_hash"], ctx.package.source_hash)
+            self.assertEqual(ctx.track_note_counts, ctx.score.track_event_counts())
+            self.assertEqual(ctx.track_roles, {t["name"]: t["role"] for t in ctx.structure.tracks})
+            self.assertEqual(ctx.role_source, "structure.json")
+            self.assertEqual(ctx.count_source, "score.json")
+
+    def test_validate_package_rechecks_loaded_files(self) -> None:
+        from aimusic.audio.from_score import from_score, validate_package
+        from aimusic.core.render_package import ContractViolation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = from_score(_generate_package(Path(tmp)))
+            ctx.package.tuning_path.write_bytes(ctx.package.tuning_path.read_bytes() + b" ")
+            with self.assertRaisesRegex(ContractViolation, "tuning.json.*expected=.*actual="):
+                validate_package(ctx)
+
+    def test_native_entry_receives_context_not_only_midi(self) -> None:
+        from unittest.mock import patch
+        from aimusic.audio.entry import render_audio
+        from aimusic.audio.from_score import AudioPackageContext
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = _generate_package(Path(tmp))
+            with patch("aimusic.audio.orchestrator.Orchestrator") as orch, patch.dict(
+                os.environ, {"AIMUSIC_AUDIO_BACKEND": "native"}
+            ):
+                orch.return_value.run.return_value = Path(tmp)
+                self.assertEqual(render_audio(package, validate_only=False), 0)
+                context = orch.return_value.run.call_args.args[0]
+                self.assertIsInstance(context, AudioPackageContext)
+                self.assertEqual(context.provenance, "planner")
+
+    def test_bridge_entry_receives_effective_named_profile(self) -> None:
+        from unittest.mock import patch
+        from aimusic.audio.entry import render_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            package = _generate_package(Path(tmp))
+            with patch("aimusic.audio.bridge.render_audio_from_package") as bridge, patch.dict(
+                os.environ, {"AIMUSIC_AUDIO_BACKEND": "m2a"}
+            ):
+                bridge.return_value = Path(tmp)
+                render_audio(package, profile="listening", validate_only=False)
+                config = bridge.call_args.kwargs["config"]
+                self.assertEqual(config["render"]["backend"], "fluidsynth")
+                self.assertFalse(config["render"]["allow_simple_fallback"])
+
+    def test_validate_only_does_not_import_synth_or_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            package = _generate_package(Path(tmp))
+            code = (
+                "import sys; from aimusic.audio.entry import render_audio; "
+                f"assert render_audio({str(package)!r}) == 0; "
+                "assert not any(n.startswith(('aimusic.audio.render', "
+                "'aimusic.audio.orchestrator', 'pretty_midi', 'soundfile', "
+                "'fluidsynth')) for n in sys.modules)"
+            )
+            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_load_audio_config_default(self) -> None:
         from aimusic.audio.config import load_audio_config
 
@@ -92,16 +160,29 @@ class TestAudioEntry(unittest.TestCase):
             self.assertIn("not found", result.stderr.lower())
 
     def test_full_render_writes_stems(self) -> None:
+        import soundfile as sf
+
         with tempfile.TemporaryDirectory() as tmp:
-            package_root = _generate_package(Path(tmp))
+            package_root = _generate_package(Path(tmp) / 'generated')
+            originals = {p: p.read_bytes() for p in package_root.iterdir() if p.is_file()}
+            output = Path(tmp) / 'audio'
             result = _run_cli(
                 "render-audio",
                 str(package_root),
+                "--profile", "preview", "--output-dir", str(output),
                 "--no-validate-only",
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr + result.stdout)
             self.assertIn("Audio render OK", result.stdout)
             self.assertIn("rough_mix", result.stdout.lower())
+            stems = list((output / 'stems').glob('track_*.wav'))
+            self.assertTrue(stems)
+            for wav in stems + [output / 'stems/rough_mix.wav']:
+                self.assertGreater(wav.stat().st_size, 44)
+                samples, rate = sf.read(wav)
+                self.assertGreater(samples.size, 0)
+                self.assertEqual(rate, 48000)
+            self.assertEqual(originals, {p: p.read_bytes() for p in package_root.iterdir() if p.is_file()})
 
     def test_core_import_still_light(self) -> None:
         code = (

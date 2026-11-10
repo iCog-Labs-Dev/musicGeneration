@@ -1,0 +1,4 @@
+# Lightweight preview; renderer capability checks still govern compatibility.
+render:
+  backend: simple
+  allow_simple_fallback: true

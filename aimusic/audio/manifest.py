@@ -67,6 +67,6 @@ def write_manifest(
         config_subset=cfg,
         code_version=code_version,
         metadata=metadata or {},
-        output_path=str(artifact_path),
+        output_path=Path(artifact_path).name,
     )
     return manifest.write_sidecar(artifact_path)

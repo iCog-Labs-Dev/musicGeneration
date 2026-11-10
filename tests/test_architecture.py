@@ -12,6 +12,7 @@ Three rules:
 from __future__ import annotations
 
 import ast
+import aimusic
 import os
 import subprocess
 import sys
@@ -19,7 +20,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-AIMUSIC = REPO_ROOT / "aimusic"
+AIMUSIC = Path(aimusic.__file__).resolve().parent
 ALLOWED_AUDIO_AIMUSIC_PREFIXES = ("aimusic.core", "aimusic.theory", "aimusic.audio")
 
 
@@ -39,6 +40,11 @@ def _imported_modules(tree: ast.AST) -> set[str]:
 
 
 class TestArchitectureGuardrails(unittest.TestCase):
+    def test_package_sources_exist_so_scan_cannot_pass_vacuously(self) -> None:
+        self.assertTrue((AIMUSIC / 'core').is_dir())
+        self.assertTrue((AIMUSIC / 'audio').is_dir())
+        self.assertGreater(len(_iter_py_files(AIMUSIC)), 20)
+
     def test_no_non_audio_module_imports_aimusic_audio(self) -> None:
         """Rule 1: symbolic packages must not import the audio quarantine."""
         violations: list[str] = []
@@ -51,7 +57,7 @@ class TestArchitectureGuardrails(unittest.TestCase):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for name in _imported_modules(tree):
                 if name == "aimusic.audio" or name.startswith("aimusic.audio."):
-                    violations.append(f"{path.relative_to(REPO_ROOT)} imports {name}")
+                    violations.append(f"{path.relative_to(AIMUSIC)} imports {name}")
         self.assertEqual(violations, [], msg="Rule 1 violated:\n" + "\n".join(violations))
 
     def test_audio_only_imports_core_and_theory_from_aimusic(self) -> None:
@@ -67,7 +73,7 @@ class TestArchitectureGuardrails(unittest.TestCase):
                     continue
                 if any(name == p or name.startswith(p + ".") for p in ALLOWED_AUDIO_AIMUSIC_PREFIXES):
                     continue
-                violations.append(f"{path.relative_to(REPO_ROOT)} imports {name}")
+                violations.append(f"{path.relative_to(AIMUSIC)} imports {name}")
         self.assertEqual(violations, [], msg="Rule 2 violated:\n" + "\n".join(violations))
 
     def test_core_import_does_not_pull_heavy_audio_deps(self) -> None:

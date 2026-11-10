@@ -1,0 +1,244 @@
+{
+  "schema": "aimusic.native-listening-summary/1",
+  "date": "2026-11-02",
+  "local_directory": "fluidsynth-evidence-g_19b5em",
+  "production_commit": "0eb35c1dc0656a196334385b66684e7ec2ce41a6",
+  "harness_sha256": "483c25739bb2daffd92a3169a99054e9aa3184f35bbdba21af3f412ec75bb122",
+  "evidence_sha256": "e1387ac3996272cb38e18278502d90050bbfcfc21fe9d019d290bb39f8a4f758",
+  "python": "3.12.12",
+  "platform": "macOS-27.2-arm64-arm-64bit",
+  "hardware": {
+    "machdep.cpu.brand_string": "Apple M4 Pro",
+    "hw.ncpu": "14",
+    "hw.memsize": "25769803776"
+  },
+  "native_versions": {
+    "pyfluidsynth": "1.3.4",
+    "libfluidsynth": "2.6.2",
+    "soundfile": "0.14.0",
+    "libsndfile": "1.2.2"
+  },
+  "asset": {
+    "soundfont_sha256": "9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe",
+    "soundfont_name": "GeneralUser GS",
+    "soundfont_version": "2.0.3",
+    "source_url": "https://github.com/mrbumpy409/GeneralUser-GS",
+    "source_commit": "684543d5e5efaef08d02be50dcda8d552478fa60",
+    "license_url": "https://github.com/mrbumpy409/GeneralUser-GS/blob/684543d5e5efaef08d02be50dcda8d552478fa60/documentation/LICENSE.txt",
+    "license_summary": "Unrestricted private/commercial music use and software-project use/modification; contained samples allow full music-production use. Author discloses historical sample-origin uncertainty. User approved local-only use; no redistribution here.",
+    "license_approved": true,
+    "native_version": "2.6.2",
+    "binding_version": "1.3.4"
+  },
+  "runtime_files_sha256": {
+    "fluidsynth.py": "45fdf0b9e00b77080d6c5e0a1d57498d27a6b3504d3a34225a1e2334ab7a42a4",
+    "libfluidsynth.3.6.2.dylib": "9c6732846300884c1d001e0d6f98acd9314c6a59cc096568db815570855e9dc8",
+    "LICENSE.txt": "7b32efefdf95ce38a043799f0659853ddc00fbaa14d8c50f0aca16b9b8b405be"
+  },
+  "pip_freeze_sha256": "e2fca12ce535c6918b9dc8500fde4102decff934dc833d6708f910203887805c",
+  "native_command": "python -m pytest tests/test_audio_fluidsynth_integration.py -q -s",
+  "native_result": "5 passed; no skips",
+  "sample_rate": 48000,
+  "release_tail_sec": 0.25,
+  "rms_window_sec": [0.1, 0.4],
+  "floors": {
+    "active_rms_exclusive_min": 1e-05,
+    "peak_max": 0.95,
+    "event_pitch_abs_cents_max": 1,
+    "reference_tone_abs_cents_max": 5,
+    "mean_p95_cents_max": 15,
+    "reference_coverage": 1
+  },
+  "workflows": {
+    "fixture-12": {
+      "source": "fixture-12/source.mid",
+      "seed": 11,
+      "source_files_sha256": {
+        "expected.json": "43dc4f8cc024359105b555f6fb0efc8c39ffbd9c2f17f08417acbf62474ca5a8",
+        "source.json": "337707335e002aaad4656eed8510534e15d413698b66e5ec634152c35f0deaae",
+        "source.mid": "e97c8db92fc495ff79810a76af38c0aec3d28ac901580462c69a6e744c8f215f"
+      },
+      "frames": 780000,
+      "elapsed_sec": {
+        "cold": 0.88802,
+        "cold-repeat": 0.871579,
+        "warm": 0.350573
+      },
+      "cold_caches": "expression and render miss; independent repeat misses",
+      "warm_caches": "expression and render hit",
+      "cold_repeat_wav_equal": true,
+      "cold_repeat_metadata_exception": "source.expressive.mid.json: wall_clock_utc only",
+      "warm_all_artifacts_equal": true,
+      "finite_equal_frames_rate": true,
+      "click_excluded_exactly": true,
+      "event_payloads_equal": true,
+      "event_pitch_max_abs_cents": null,
+      "reconciliation": "not_applicable: inferred MIDI",
+      "role_source": "inferred",
+      "effective_renderer": "fluidsynth (no fallback)",
+      "required_tuning": ["direct_12"],
+      "signal_columns": ["file", "active_rms", "peak"],
+      "signals": [
+        ["track_0001_drums.wav", 0.000967487849, 0.064514160156],
+        ["track_0002_bass.wav", 0.014692156118, 0.041717529297],
+        ["track_0003_comping.wav", 0.012433238045, 0.054138183594],
+        ["track_0004_lead.wav", 0.010266097798, 0.033386230469],
+        ["rough_mix.wav", 0.021610963793, 0.118316650391]
+      ],
+      "wav_sha256": {
+        "stems/track_0001_drums.wav": "51257495039dee3343e6fb06be6b3d1e915454e32ee18d5f05d36adfca4a11f3",
+        "stems/track_0004_lead.wav": "57d1c423a2a592fb9144ce92418609e644d22d6c9da44b5cde47279903edf468",
+        "stems/track_0002_bass.wav": "5e2cb6f137fdcc6d11da543e2278b4921448b2a8a304cc438a9ac0707d03a316",
+        "stems/click.wav": "48900f2b522d62ee1909154847ddf63e89f180810770db64a524a4615d7d5e9e",
+        "stems/rough_mix.wav": "071f378fdf989b2672f2fa8049807cdfa2e9d46ce05573d71574b5832243a471",
+        "stems/track_0003_comping.wav": "344c082e8f4739060c84e7c689619f03af1401cef18777577ea9f9251d01e635"
+      },
+      "render_manifest_sha256": "36e3eddcdd5a11bf51c0475f64c45365869ee5ed4267edc8870d9e2b47ae1f0d"
+    },
+    "generated-12": {
+      "source": "generated-12/run_12cb5ba3_8e1cec6bed3c/score.mid",
+      "seed": 11,
+      "source_files_sha256": {
+        "beatstates.jsonl": "37411cbb835037722ddf75041b17624bd203718bf959a0bb5225d9629e0bf76d",
+        "score.json": "cf4e2a040ddcd1d9116e5ba0756dac310593b896a917742bbb63bf1f9d51c583",
+        "structure.json": "ec28b496a90706b948a3d8e0161e3b2f29d247a21a4c21a022e0ba88fee303f4",
+        "score.mid": "a607e8c6ec3daeb2687056b7f150aacd1f85f192946584ac8078557613ea6f41",
+        "manifest.json": "0eb31525944e242e14cf2b0ce03db6d36047ead53db4989d29e3c4f6cc4835cb",
+        "tuning.json": "3adc8cc15c001fa2dce27c96e558fd4ebffad98a7dc8ca03c597ed3e3841921c"
+      },
+      "frames": 108000,
+      "elapsed_sec": {
+        "cold": 0.675739,
+        "cold-repeat": 0.659749,
+        "warm": 0.281069
+      },
+      "cold_caches": "expression and render miss; independent repeat misses",
+      "warm_caches": "expression and render hit",
+      "cold_repeat_wav_equal": true,
+      "cold_repeat_metadata_exception": "score.expressive.mid.json: wall_clock_utc only",
+      "warm_all_artifacts_equal": true,
+      "finite_equal_frames_rate": true,
+      "click_excluded_exactly": true,
+      "event_payloads_equal": true,
+      "event_pitch_max_abs_cents": null,
+      "reconciliation": "passed: original MIDI vs planner/Score",
+      "role_source": "structure.json",
+      "effective_renderer": "fluidsynth (no fallback)",
+      "required_tuning": ["direct_12"],
+      "signal_columns": ["file", "active_rms", "peak"],
+      "signals": [
+        ["track_0001_bass.wav", 0.01969961812, 0.045593261719],
+        ["track_0002_comping.wav", 0.019021656366, 0.086364746094],
+        ["track_0003_drums.wav", 0.003599520135, 0.069519042969],
+        ["track_0004_lead.wav", 0.014155922573, 0.048034667969],
+        ["rough_mix.wav", 0.031423186012, 0.190490722656]
+      ],
+      "wav_sha256": {
+        "stems/track_0001_bass.wav": "5469ba9cebd827e85ea4bf3307301a5216b1fc2801830c1a84fe46c8d38a9ce7",
+        "stems/track_0002_comping.wav": "cff2884dfe09b4db1abae496089b6b581dc0ac2b53454a044785f20f58a702b3",
+        "stems/track_0004_lead.wav": "f8ea03f692f8bfef23c79703893a5247f143eb91be7e9a1be445269bc8216c6b",
+        "stems/track_0003_drums.wav": "722395dbede577f0e8bd82389c28db999e2c61c6058472e2e5837c8345b8ef72",
+        "stems/click.wav": "c1a46c20230ebdaa5d8177535119592adabddcd037204f77fe0889e38eb22e28",
+        "stems/rough_mix.wav": "c1cb38a53ced1d0d9146e144d78e45671141f3ca93519480def95ee744b3ead0"
+      },
+      "render_manifest_sha256": "9735f19196540b2c3a6de4c1b6118f7a96ca2ae241bcbff5baefd444809e91c0"
+    },
+    "reference-19": {
+      "source": "reference-19/source.mid",
+      "seed": null,
+      "source_files_sha256": {
+        "expected.json": "51f862faad901b86effc9d7be9f831ccaa5092c76488f6856e488ce0d71f8b33",
+        "source.json": "f03e5ae8d03821f90fbb3c549372ec7fe3e440a29225fe9df3a5566c7aec8f8c",
+        "source.mid": "0b7f7debe5b2c95d360cc25247534293be1c361f193442cf56c7f733ade23db6"
+      },
+      "frames": 228000,
+      "elapsed_sec": {
+        "cold": 0.198997,
+        "cold-repeat": 0.193662,
+        "warm": 0.089191
+      },
+      "cold_caches": "expression and render miss; independent repeat misses",
+      "warm_caches": "expression and render hit",
+      "cold_repeat_wav_equal": true,
+      "cold_repeat_metadata_exception": "source.expressive.mid.json: wall_clock_utc only",
+      "warm_all_artifacts_equal": true,
+      "finite_equal_frames_rate": true,
+      "click_excluded_exactly": true,
+      "event_payloads_equal": true,
+      "event_pitch_max_abs_cents": 0.00899465460514491,
+      "reconciliation": "not_applicable: inferred MIDI",
+      "role_source": "inferred",
+      "effective_renderer": "fluidsynth (no fallback)",
+      "required_tuning": ["channel_pitch"],
+      "signal_columns": ["file", "active_rms", "peak"],
+      "signals": [
+        ["track_0001_reference.wav", 0.009882402156, 0.026092529297],
+        ["rough_mix.wav", 0.009882396234, 0.026077270508]
+      ],
+      "wav_sha256": {
+        "stems/track_0001_reference.wav": "690d6939edbcd53fbbcc79a2fc1b684963a77d499fd7a1e8e92b3fcc370b3aad",
+        "stems/click.wav": "faee1e5d2d936c37a36b69e708416c22c1ce97ad43eafdf48c58d0e05021dba6",
+        "stems/rough_mix.wav": "78332dae6df612b05ef6258206d2fc5c9721d4db7af43d116828a5a6c278772d"
+      },
+      "render_manifest_sha256": "54e587524ff129982fdaf6f9ab0f9aadd6d839593a9230e8578d435e7e817303",
+      "controlled_tuning": {
+        "coverage": 1.0,
+        "mean_abs_cents": 1.490956281579514,
+        "p95_abs_cents": 2.526436466624631,
+        "passed": true,
+        "per_tone_abs_cents": [0.38650119289158624, 1.439118025047037, 2.647249626799919],
+        "report_sha256": "0e7f7973a20ce90355b2375e6005f8dd044b610f88cac9549acac9f99e35a4cd"
+      }
+    },
+    "multitrack-19": {
+      "source": "multitrack-19/source.mid",
+      "seed": null,
+      "source_files_sha256": {
+        "expected.json": "3b6c3912a78bca4c71fa383043e7838082b96a64e87db47470d79d5c3f39448b",
+        "source.json": "1b8b884c860237b1f63a33ebd0115cfc793639731c90468bca23af2e19ed7439",
+        "source.mid": "6e76a9b1b7dde2ee97455c6d5044dc94ec2a94be65f9587566e2444b26a29fe8"
+      },
+      "frames": 204000,
+      "elapsed_sec": {
+        "cold": 0.521925,
+        "cold-repeat": 0.518941,
+        "warm": 0.219632
+      },
+      "cold_caches": "expression and render miss; independent repeat misses",
+      "warm_caches": "expression and render hit",
+      "cold_repeat_wav_equal": true,
+      "cold_repeat_metadata_exception": "source.expressive.mid.json: wall_clock_utc only",
+      "warm_all_artifacts_equal": true,
+      "finite_equal_frames_rate": true,
+      "click_excluded_exactly": true,
+      "event_payloads_equal": true,
+      "event_pitch_max_abs_cents": 0.011564555920658528,
+      "reconciliation": "not_applicable: inferred MIDI",
+      "role_source": "inferred",
+      "effective_renderer": "fluidsynth (no fallback)",
+      "required_tuning": ["channel_pitch"],
+      "signal_columns": ["file", "active_rms", "peak"],
+      "signals": [
+        ["track_0001_bass.wav", 0.013299439563, 0.037170410156],
+        ["track_0002_comping.wav", 0.012071008227, 0.051330566406],
+        ["track_0003_lead.wav", 0.009570011539, 0.026519775391],
+        ["rough_mix.wav", 0.022462457651, 0.077621459961]
+      ],
+      "wav_sha256": {
+        "stems/track_0001_bass.wav": "004bf40a6822e9e446ac2817fcb4297d0ebf44343b2d62c0c2e5cb5945eecc2d",
+        "stems/track_0002_comping.wav": "66edff0c544ec727048400cab4b3309f9243a79cacfbe8930491f6f2a6649f4f",
+        "stems/click.wav": "10bf929cb74531964ec14affbc206f2084ec0d05c7b1044cef07070c621c5bca",
+        "stems/track_0003_lead.wav": "c0305128449dd7bec87709c6b6fbb2e08533bf5f3f26799c919f969043fdf9f0",
+        "stems/rough_mix.wav": "21f2da5d4172a29dd48d70b5fe9832d5f734f97204083532ddf72b1d4813e7a4"
+      },
+      "render_manifest_sha256": "07a2d76fd8f72f282c415e71dcea1a5bcd37be347e9b4203bc6edf314029d641"
+    }
+  },
+  "mts": {
+    "rejected": true,
+    "successful_outputs": [],
+    "diagnostic": "fluidsynth does not support tuning mts; select a verified compatible renderer (no pitch flattening)"
+  },
+  "human_listening": "pending",
+  "unmeasured": ["polyphonic f0", "role recognizability", "rhythm F-score", "notes F1", "CLAP", "FAD", "mastering"]
+}

@@ -10,3 +10,8 @@ gradio
 pytest
 scipy
 hypothesis>=6.90.0
+
+# Offline wheel build/install smoke test (no native audio assets).
+pip
+setuptools>=68
+wheel
