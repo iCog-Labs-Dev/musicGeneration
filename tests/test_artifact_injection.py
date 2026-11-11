@@ -142,7 +142,7 @@ class TestArtifactInjection(unittest.TestCase):
                             tempo_bpm=105.0, sample_path=False, drum_density=0.75,
                             bass_density=0.6, comping_density=0.55, lead_density=0.45,
                             pitch_bend_range=2, rendering_method="MPE", bass_program=34,
-                            comping_program=5, lead_program=88, drum_track=["drums"],
+                            comping_program=5, lead_program=88, drum_track=["drums"], section_wise=False,
                         )
                         with patch.object(ui, "OUTPUT_DIR", directory):
                             artifacts = ui._generate_artifacts(
@@ -285,7 +285,7 @@ class TestArtifactInjection(unittest.TestCase):
                 tempo_bpm=105.0, sample_path=False, drum_density=0.75,
                 bass_density=0.6, comping_density=0.55, lead_density=0.45,
                 pitch_bend_range=2, rendering_method="MPE", bass_program=34,
-                comping_program=5, lead_program=88, drum_track=["drums"],
+                comping_program=5, lead_program=88, drum_track=["drums"], section_wise=False,
             )
             decoder = KnownScoreDecoder()
             renderer = RecordingRenderer()

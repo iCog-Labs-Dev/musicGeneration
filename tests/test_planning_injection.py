@@ -10,7 +10,7 @@ from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import Vocabularies
 from aimusic.planning.graph import build_sparse_graph
 from aimusic.planning.candidates import get_valid_next_states
-from aimusic.planning.plans import MethodARunConfig, render_exact_bridge_demo, run_method_a
+from aimusic.planning.plans import MethodAPlanResult, MethodARunConfig, render_exact_bridge_demo, run_method_a
 from aimusic.scoring.priors import Prior, PriorContext
 from tests.test_graph import state
 
@@ -108,6 +108,7 @@ class TestPlanningInjection(unittest.TestCase):
             candidate_generator=generator,
         )
         self.assertEqual(len(result.path), 5)
+        assert isinstance(result, MethodAPlanResult)
         markers = [
             rejection
             for layer in result.graph.diagnostics.layer_diagnostics

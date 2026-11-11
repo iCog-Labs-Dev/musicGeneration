@@ -1,10 +1,12 @@
 import unittest
+from unittest.mock import patch
 from aimusic.core.rng import RNGKey
 
 from aimusic.planning.candidates import is_legal_transition
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Layer
 from aimusic.planning.graph import build_sparse_graph
+from aimusic.planning import graph as graph_module
 from aimusic.scoring.priors import NeuralPrior
 from aimusic.core.vocab import DEFAULT_VOCABULARIES
 
@@ -36,6 +38,15 @@ def state(
 
 
 class TestSparseGraphBuilder(unittest.TestCase):
+    def test_endpoint_heuristic_is_computed_once_per_candidate_per_layer(self):
+        with patch.object(graph_module, "_pruning_score", wraps=graph_module._pruning_score) as heuristic:
+            build_sparse_graph(self.start_layer, self.end_layer, 3, sb_config=self.sb_config,
+                               style_config=self.style, vocabularies=VOCABS, key=RNGKey(42),
+                               d_max=self.sb_config.d_max)
+        keys = [(call.args[0], call.args[2]) for call in heuristic.call_args_list]
+        self.assertGreater(len(keys), 0)
+        self.assertEqual(len(keys), len(set(keys)))
+
     def setUp(self):
         self.style = StyleConfig(
             allowed_meters=("4/4", "5/4", "7/4"),
