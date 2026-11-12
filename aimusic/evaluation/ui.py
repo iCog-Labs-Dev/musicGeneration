@@ -284,7 +284,23 @@ class EvaluationSummary:
 
 def _condition_rank(name: str) -> Tuple[int, str]:
     order = {c: i for i, c in enumerate(CONDITION_ORDER)}
-    return (order.get(name, len(order)), name)
+    return (order.get(name.split(" (")[0], len(order)), name)
+
+
+def _sectioning_modes(dataset: "EvaluationDataset") -> List[str]:
+    """Sectioning modes present in the dataset (single_pass first); older outputs only have single_pass."""
+    modes = {str(c.get("sectioning", "single_pass")) for c in dataset.cells.values()}
+    modes |= {str((r.get("spec") or {}).get("sectioning", "single_pass")) for r in dataset.results}
+    return sorted(modes, key=lambda m: (m != "single_pass", m))
+
+
+def _series_name(condition: str, sectioning: str, multi: bool) -> str:
+    """Series/legend name: the condition, plus the sectioning mode when a dataset mixes modes.
+
+    Cells of different sectioning modes must never share a bar or a line, so with both modes present the
+    section-wise series is ``full (section_wise)`` next to plain ``full``.
+    """
+    return f"{condition} ({sectioning})" if multi and sectioning != "single_pass" else condition
 
 
 def _sorted_conditions(names: Sequence[str]) -> List[str]:
@@ -459,11 +475,13 @@ def grouped_metric_data(dataset: EvaluationDataset, metric: str) -> GroupedChart
         label = _cell_label(cell, with_mode, with_grid)
         if label not in categories:
             categories.append(label)
-    conditions = _sorted_conditions([c["condition"] for c in ordered])
+    multi = len(_sectioning_modes(dataset)) > 1
+    names = [_series_name(c["condition"], c.get("sectioning", "single_pass"), multi) for c in ordered]
+    conditions = _sorted_conditions(names)
     series: Dict[str, List[Optional[Point]]] = {c: [None] * len(categories) for c in conditions}
-    for cell in ordered:
+    for cell, name in zip(ordered, names):
         idx = categories.index(_cell_label(cell, with_mode, with_grid))
-        series[cell["condition"]][idx] = _point(cell["metrics"].get(metric))
+        series[name][idx] = _point(cell["metrics"].get(metric))
     notes: List[str] = []
     if any(p is not None and p.low is None for pts in series.values() for p in pts):
         notes.append("Groups with a single successful seed have no confidence interval.")
@@ -608,6 +626,7 @@ def tension_chart_data(
     if horizon is None or edo is None or (horizon, edo) not in {(h, e) for h, e, _ in options}:
         horizon, edo = options[0][0], options[0][1]
     target: Optional[List[float]] = None
+    multi = len(_sectioning_modes(dataset)) > 1
     by_condition: Dict[str, List[List[float]]] = {}
     for res in dataset.results:
         spec = res["spec"]
@@ -616,8 +635,10 @@ def tension_chart_data(
         realized = _curve(res, "realized_curve")
         if realized is None:
             continue
-        by_condition.setdefault(spec["condition"], []).append(realized)
-        if target is None:
+        by_condition.setdefault(
+            _series_name(spec["condition"], spec.get("sectioning", "single_pass"), multi), []
+        ).append(realized)
+        if target is None and (not multi or spec.get("sectioning", "single_pass") == "single_pass"):
             target = _curve(res, "target_curve")
     curves: List[TensionCurveSeries] = []
     for cond in _sorted_conditions(list(by_condition)):
@@ -637,6 +658,9 @@ def tension_chart_data(
         )
     else:
         notes.append("Lines are the mean over seeds; shaded bands span the min-max over seeds.")
+        if multi:
+            notes.append("The dashed target is the single-pass whole-song arc; section-wise runs plan against the authored "
+                         "per-section arcs (see the Section-wise tab for tension on the shared section plan).")
     return TensionChartData(horizon, edo, target, curves, mae, corr, bool(curves), notes)
 
 
@@ -658,14 +682,16 @@ def scaling_chart_data(
     """Metric vs horizon, one line per condition, separate panel per EDO."""
     out: Dict[str, Dict[int, Dict[str, List[Tuple[int, Point]]]]] = {m: {} for m in metrics}
     edos: set[int] = set()
+    multi = len(_sectioning_modes(dataset)) > 1
     for cell in dataset.cells.values():
         if conditions and cell["condition"] not in conditions:
             continue
         edos.add(cell["edo"])
+        name = _series_name(cell["condition"], cell.get("sectioning", "single_pass"), multi)
         for m in metrics:
             pt = _point(cell["metrics"].get(m))
             if pt is not None:
-                out[m].setdefault(cell["edo"], {}).setdefault(cell["condition"], []).append((cell["horizon"], pt))
+                out[m].setdefault(cell["edo"], {}).setdefault(name, []).append((cell["horizon"], pt))
     for per_edo in out.values():
         for per_cond in per_edo.values():
             for series in per_cond.values():
@@ -700,15 +726,19 @@ def edo_comparison_data(
     if horizon not in horizons:
         horizon = horizons[-1] if horizons else None
     edos = sorted({c["edo"] for c in dataset.cells.values()})
-    conditions = _sorted_conditions([c["condition"] for c in dataset.cells.values()])
+    multi = len(_sectioning_modes(dataset)) > 1
+    conditions = _sorted_conditions(
+        [_series_name(c["condition"], c.get("sectioning", "single_pass"), multi) for c in dataset.cells.values()]
+    )
     out: Dict[str, Dict[int, Dict[str, Optional[Point]]]] = {
         m: {e: {c: None for c in conditions} for e in edos} for m in metrics
     }
     for cell in dataset.cells.values():
         if cell["horizon"] != horizon:
             continue
+        name = _series_name(cell["condition"], cell.get("sectioning", "single_pass"), multi)
         for m in metrics:
-            out[m][cell["edo"]][cell["condition"]] = _point(cell["metrics"].get(m))
+            out[m][cell["edo"]][name] = _point(cell["metrics"].get(m))
     return EdoChartData(horizon, out, conditions, edos, horizons)
 
 
@@ -725,7 +755,12 @@ def status_chart_data(dataset: EvaluationDataset) -> StatusChartData:
     done = {r["run_id"]: r for r in dataset.results}
     for rid, res in done.items():
         manifest_specs.setdefault(rid, res["spec"])
-    conditions = _sorted_conditions([s.get("condition", "?") for s in manifest_specs.values()])
+    multi = len({s.get("sectioning", "single_pass") for s in manifest_specs.values()}) > 1
+
+    def name_of(spec: Mapping[str, Any]) -> str:
+        return _series_name(spec.get("condition", "?"), spec.get("sectioning", "single_pass"), multi)
+
+    conditions = _sorted_conditions([name_of(s) for s in manifest_specs.values()])
     statuses = list(STATUS_ORDER) + [STATUS_NOT_RUN]
     for res in dataset.results:
         if res["status"] not in statuses:
@@ -733,7 +768,7 @@ def status_chart_data(dataset: EvaluationDataset) -> StatusChartData:
     counts = {s: {c: 0 for c in conditions} for s in statuses}
     for rid, spec in manifest_specs.items():
         status = done[rid]["status"] if rid in done else STATUS_NOT_RUN
-        counts[status][spec.get("condition", "?")] += 1
+        counts[status][name_of(spec)] += 1
     totals = {s: sum(v.values()) for s, v in counts.items()}
     return StatusChartData(conditions, counts, totals)
 
@@ -1015,11 +1050,13 @@ def run_choices(dataset: EvaluationDataset) -> List[Tuple[str, str]]:
     out = []
     for r in sorted(
         dataset.results,
-        key=lambda r: (r["spec"]["edo"], r["spec"]["horizon"], _condition_rank(r["spec"]["condition"]), r["spec"]["seed"]),
+        key=lambda r: (r["spec"]["edo"], r["spec"]["horizon"], _condition_rank(r["spec"]["condition"]),
+                       r["spec"].get("sectioning", "single_pass"), r["spec"]["seed"]),
     ):
         spec = r["spec"]
         flag = "" if r["status"] == STATUS_OK else f" [{r['status'].upper()}]"
-        out.append((f"{spec['condition']} | {spec['horizon']}b | {spec['edo']}-EDO | seed {spec['seed']}{flag}", r["run_id"]))
+        mode = "" if spec.get("sectioning", "single_pass") == "single_pass" else f" | {spec['sectioning']}"
+        out.append((f"{spec['condition']} | {spec['horizon']}b | {spec['edo']}-EDO{mode} | seed {spec['seed']}{flag}", r["run_id"]))
     return out
 
 
@@ -1082,6 +1119,7 @@ def render_run_details(result: Optional[Mapping[str, Any]]) -> str:
             ("EDO", spec.get("edo")), ("path mode", spec.get("path_mode")), ("bridge", spec.get("bridge_mode")),
             ("generation method", spec.get("generation_method")),
             ("endpoint mode", spec.get("endpoint_mode", "singleton")),
+            ("sectioning mode", result.get("sectioning_mode") or spec.get("sectioning", "single_pass")),
             ("prior", (result.get("prior") or {}).get("mode", spec.get("prior_mode"))),
             ("prior status", (result.get("prior") or {}).get("status")),
             ("lambda_data / lambda_gttm", f"{spec.get('lambda_data')} / {spec.get('lambda_gttm')}"),
@@ -1103,7 +1141,10 @@ def render_run_details(result: Optional[Mapping[str, Any]]) -> str:
         rows = _scalar_rows(section)
         parts += ["", f"#### {titles[key]}"]
         parts.append(_kv_table(rows) if rows else "_not available_")
+    from aimusic.evaluation import ui_sections
+
     parts += ["", "#### Endpoint distribution", render_endpoint_run_details(result)]
+    parts += ["", "#### Section-wise (MUS-16)", ui_sections.render_section_wise_run(result)]
     artifacts = result.get("artifacts") or {}
     parts += ["", "#### Generated artifacts", _kv_table(list(artifacts.items())) if artifacts else "_none recorded_"]
     parts.append(
@@ -1220,7 +1261,8 @@ def endpoint_cells(dataset: EvaluationDataset) -> List[Tuple[str, Dict[str, Any]
 
 
 def _ep_label(cell: Mapping[str, Any]) -> str:
-    return f"{cell['condition']} / {_cell_label(cell, True, False)}"
+    mode = "" if cell.get("sectioning", "single_pass") == "single_pass" else f" / {cell['sectioning']}"
+    return f"{cell['condition']} / {_cell_label(cell, True, False)}{mode}"
 
 
 def _cell_ep_metric(cell: Mapping[str, Any], name: str) -> Optional[Point]:
@@ -1365,6 +1407,10 @@ TERM_HELP: Dict[str, str] = {
         "singleton = the plan starts and ends in one chosen state each (M1 behaviour); distribution = "
         "Method A bridges a start distribution to a terminal distribution (MUS-15)."
     ),
+    "Sectioning": (
+        "single_pass = one monolithic Method A bridge over the whole song; section_wise = MUS-16, one bridge per "
+        "named section over shared boundary distributions, joined by soft stitching. Reported as separate cells, never pooled."
+    ),
     "Seed": "Random starting value used to reproduce a run or compare repeated runs.",
     "Condition": "A system variant used to measure the contribution of a component.",
     "Workers": (
@@ -1460,6 +1506,10 @@ class ConfigMetadata:
     endpoint_policy: str = ""
     endpoint_marginal_tolerance: float = 0.0
     calibration_samples: int = 0
+    sectioning: Tuple[str, ...] = ("single_pass",)
+    section_names: Tuple[str, ...] = ()
+    stitch_max_cost: Optional[float] = None
+    allowed_meters: Tuple[str, ...] = ()
 
 
 def _unique(values: Sequence[Any]) -> Tuple[Any, ...]:
@@ -1503,6 +1553,10 @@ def config_metadata(config: BenchmarkConfig, file_name: str = "") -> ConfigMetad
             config.endpoint_marginal_tolerance if config.endpoint_mode == "distribution" else 0.0
         ),
         calibration_samples=config.calibration_samples,
+        sectioning=tuple(config.sectioning),
+        section_names=tuple(config.section_names),
+        stitch_max_cost=config.stitch_max_cost,
+        allowed_meters=tuple(config.allowed_meters),
     )
 
 
@@ -1640,6 +1694,17 @@ def _endpoint_mode_text(meta: ConfigMetadata) -> str:
     )
 
 
+def _sectioning_text(meta: ConfigMetadata) -> str:
+    text = ", ".join(meta.sectioning)
+    if "section_wise" in meta.sectioning:
+        tol = "planner default" if meta.stitch_max_cost is None else f"{meta.stitch_max_cost:g}"
+        style = f"; meters {', '.join(meta.allowed_meters)}" if meta.allowed_meters else ""
+        text += f" (sections: {', '.join(meta.section_names)}; stitching max_cost {tol}{style}). Compared pairwise by seed, never pooled."
+    elif meta.sectioning == ("single_pass",):
+        text += " (monolithic Method A; section-wise metrics are not produced)"
+    return text
+
+
 def render_config_panel(meta: Optional[ConfigMetadata], error: str = "") -> str:
     """HTML for the "Benchmark Configuration" panel.  Theme-agnostic, like the overview cards."""
     css = (
@@ -1674,6 +1739,7 @@ def render_config_panel(meta: Optional[ConfigMetadata], error: str = "") -> str:
         (_term("Conditions", "Condition"), f"<ul>{conds}</ul>"),
         ("Path modes", vals(meta.path_modes)),
         (_term("Endpoint mode", "Endpoint mode"), html.escape(_endpoint_mode_text(meta))),
+        (_term("Sectioning mode", "Sectioning"), html.escape(_sectioning_text(meta))),
         (_term("K_max", "K_max"), vals(meta.k_max)),
         (_term("D_max", "D_max"), vals(meta.d_max)),
         (_term("Proposal budget", "Proposal budget"), vals(meta.proposal_budget)),
@@ -2170,6 +2236,8 @@ def build_evaluation_page(demo: Any = None) -> None:
     """Create the Evaluation components.  Call inside ``with demo.route("Evaluation"):`` (or any Blocks)."""
     import gradio as gr
 
+    from aimusic.evaluation import ui_sections
+
     configs = discover_benchmark_configs()
     default_config = "m1_smoke.json" if "m1_smoke.json" in configs else (configs[0] if configs else None)
     try:
@@ -2257,10 +2325,26 @@ def build_evaluation_page(demo: Any = None) -> None:
     with gr.Tab("Endpoint distribution"):
         endpoint_plot = gr.Plot(label="Endpoint mass accounting")
         endpoint_md = gr.Markdown(f"_{SINGLETON_UNAVAILABLE}_")
+    with gr.Tab("Section-wise"):
+        sw_note_md = gr.Markdown(f"_{ui_sections.NO_SECTION_WISE_RUNS}_")
+        sw_metric = gr.Dropdown(
+            label="Compare metric", choices=[(metric_label(m), m) for m in ui_sections.COMPARISON_METRICS],
+            value="runtime.wall_s",
+        )
+        sw_compare_plot = gr.Plot(label="Monolithic vs section-wise")
+        sw_compare_md = gr.Markdown()
+        sw_runtime_plot = gr.Plot(label="Per-section runtime")
+        sw_status_plot = gr.Plot(label="Section status")
+        sw_stitch_plot = gr.Plot(label="Stitching continuity")
+        with gr.Accordion("Join detail", open=True):
+            sw_join_md = gr.Markdown()
     with gr.Tab("Run details"):
         run_dd = gr.Dropdown(label="Run", choices=[], value=None, filterable=True)
         run_plot = gr.Plot(label="Selected run")
         run_md = gr.Markdown("_Select a run to inspect it._")
+        section_dd = gr.Dropdown(label="Section (section-wise runs)", choices=[], value=None)
+        section_plot = gr.Plot(label="Selected section tension")
+        section_md = gr.Markdown(f"_{ui_sections.SECTION_WISE_UNAVAILABLE}_")
     with gr.Tab("Report"):
         with gr.Accordion("report.md (reference view)", open=False):
             report_md = gr.Markdown("_No report loaded._")
@@ -2279,7 +2363,24 @@ def build_evaluation_page(demo: Any = None) -> None:
     dash_outputs = [
         cards, notes_md, runtime_plot, status_plot, ablation_cell, ablation_plot, tension_cell, tension_plot, tension_note,
         scaling_plot, edo_horizon, edo_plot, run_dd, report_md, endpoint_plot, endpoint_md,
+        sw_note_md, sw_compare_plot, sw_compare_md, sw_runtime_plot, sw_status_plot, sw_stitch_plot, sw_join_md,
     ]
+
+    def _section_wise_views(ds: Optional[EvaluationDataset], metric: str = "runtime.wall_s"):
+        if ds is None:
+            empty = _empty_figure("No results loaded.")
+            return "_No results loaded._", empty, "", empty, empty, empty, ""
+        has = bool(ui_sections.section_wise_cells(ds))
+        note = (
+            "Monolithic Method A (`single_pass`) vs section-wise Method A with soft stitching (`section_wise`). "
+            "Cells are matched on seed, horizon, EDO, endpoint mode, graph limits, prior, path mode, style and section plan."
+            if has else f"_{ui_sections.NO_SECTION_WISE_RUNS}_"
+        )
+        return (
+            note, ui_sections.make_comparison_chart(ds, metric), ui_sections.render_comparison_markdown(ds),
+            ui_sections.make_section_runtime_chart(ds), ui_sections.make_section_status_chart(ds),
+            ui_sections.make_stitch_chart(ds), ui_sections.render_join_table(ds),
+        )
 
     def _cell_value(h: Optional[int], e: Optional[int]) -> Optional[str]:
         return None if h is None or e is None else f"{h}|{e}"
@@ -2302,7 +2403,7 @@ def build_evaluation_page(demo: Any = None) -> None:
                 render_overview_cards(None), gr.update(value=f"**{exc}**", visible=True), empty, empty,
                 gr.update(choices=[], value=None), empty, gr.update(choices=[], value=None), empty, "",
                 empty, gr.update(choices=[], value=None), empty, gr.update(choices=[], value=None), "_No report loaded._",
-                empty, "_No results loaded._",
+                empty, "_No results loaded._", *_section_wise_views(None),
             )
         summary = summarize_results(ds)
         warn = list(ds.warnings)
@@ -2327,7 +2428,7 @@ def build_evaluation_page(demo: Any = None) -> None:
             gr.update(choices=horizons, value=horizons[-1] if horizons else None), make_edo_chart(ds, horizons[-1] if horizons else None),
             gr.update(choices=run_choices(ds), value=None),
             ds.report_text or "_No report.md in this directory yet (it is written when a run finishes or via Generate Report)._",
-            make_endpoint_chart(ds), render_endpoint_overview(ds),
+            make_endpoint_chart(ds), render_endpoint_overview(ds), *_section_wise_views(ds),
         )
 
     def on_load(out_dir, metric):
@@ -2434,9 +2535,25 @@ def build_evaluation_page(demo: Any = None) -> None:
     def on_run(out, run_id):
         ds = load_dataset_cached(resolve_out_dir(out))
         res = find_run(ds, run_id)
-        return run_tension_figure(res), render_run_details(res)
+        sections = ui_sections.section_choices(res)
+        first_section = sections[0] if sections else None
+        return (
+            run_tension_figure(res), render_run_details(res),
+            gr.update(choices=sections, value=first_section),
+            ui_sections.section_tension_figure(res, first_section), ui_sections.render_section_details(res, first_section),
+        )
 
-    run_dd.change(on_run, [out_dir_tb, run_dd], [run_plot, run_md])
+    run_dd.change(on_run, [out_dir_tb, run_dd], [run_plot, run_md, section_dd, section_plot, section_md])
+
+    def on_section(out, run_id, section):
+        res = find_run(load_dataset_cached(resolve_out_dir(out)), run_id)
+        return ui_sections.section_tension_figure(res, section), ui_sections.render_section_details(res, section)
+
+    section_dd.change(on_section, [out_dir_tb, run_dd, section_dd], [section_plot, section_md])
+    sw_metric.change(
+        lambda out, m: ui_sections.make_comparison_chart(load_dataset_cached(resolve_out_dir(out)), m),
+        [out_dir_tb, sw_metric], [sw_compare_plot],
+    )
 
     # Keep the output directory in step with the chosen config unless the user typed their own.
     def on_config(config: Optional[str], current: str, conditions, horizons, edos, seeds):
