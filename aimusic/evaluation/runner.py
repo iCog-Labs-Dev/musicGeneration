@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from aimusic.evaluation import endpoint_metrics as ep
 from aimusic.evaluation.schema import (
+    SECTIONING_SECTION_WISE,
     STATUS_FAILED,
     STATUS_OK,
     RunSpec,
@@ -287,6 +288,115 @@ def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(value)
 
 
+def _single_pass_metrics(
+    result: Dict[str, Any], plan: Any, spec: RunSpec, path: Sequence[Any], edge_diags: Sequence[Any],
+    authored: Sequence[Any],
+) -> None:
+    """Metrics of a monolithic (single_pass) run."""
+    from aimusic.evaluation import section_wise as sw
+
+    metrics = result["metrics"]
+    if spec.endpoint_mode == "distribution":
+        from aimusic.core.rng import RNGKey, derive_named_key
+
+        ep.require_distribution_diagnostics(plan, "distribution")
+        metrics["endpoint"] = ep.endpoint_metrics(plan, marginal_tolerance=spec.endpoint_marginal_tolerance)
+        if spec.calibration_samples > 0:
+            starts, terminals = ep.draw_endpoint_samples(
+                plan, derive_named_key(RNGKey(seed=spec.seed), "eval.calibration"), spec.calibration_samples
+            )
+            calibration = ep.calibration_from_samples(plan, starts, terminals)
+        else:
+            calibration = ep.calibration_unavailable(ep.CAL_NO_SAMPLES, 0)
+        ep.apply_calibration(metrics["endpoint"], calibration)
+    else:
+        metrics["endpoint"] = ep.singleton_endpoint_info(plan)
+    metrics["graph"] = graph_metrics(plan.graph)
+    metrics["sb"] = sb_metrics(plan.sb_solution, used=spec.bridge_mode == "sb")
+    metrics["path"] = path_metrics(path, plan, spec.horizon)
+    if spec.path_mode == "map" and spec.bridge_mode == "sb":
+        score = plan.path_score
+        metrics["path"]["map_path_score"] = score
+        metrics["path"]["map_path_score_finite"] = _finite(score)
+    metrics["tension"] = tension_metrics(path, plan, spec.edo)
+    if authored:
+        # Same authored per-section targets a section-wise run plans for.
+        metrics["tension_section_plan"] = sw.tension_on_section_plan(path, plan.vocabularies, spec.edo, authored)
+    metrics["gttm"] = gttm_path_metrics(edge_diags)
+
+
+def _section_wise_metrics(
+    result: Dict[str, Any], plan: Any, spec: RunSpec, planned: Sequence[Any], authored: Sequence[Any],
+    timers: Any, gen_wall: float,
+) -> None:
+    """Whole-song, per-section and join metrics of a successful section-wise run."""
+    from aimusic.evaluation import section_wise as sw
+
+    metrics = result["metrics"]
+    mode = spec.endpoint_mode
+    if mode == "distribution":
+        sw.require_section_diagnostics(plan, "distribution")
+    view = sw.whole_song_view(plan)
+    result.update(sw.sectioning_record([r.section for r in plan.section_results]))
+    tension_plan = sw.tension_on_section_plan(plan.path, plan.vocabularies, spec.edo, authored or planned)
+    blocks = sw.section_blocks(
+        plan, planned, timers, tension_plan,
+        marginal_tolerance=spec.endpoint_marginal_tolerance, mode=mode,
+        graph_fn=graph_metrics, sb_fn=sb_metrics, path_fn=path_metrics, sha_fn=_path_sha256,
+    )
+    joins = sw.build_join_metrics(plan)
+    result.update(blocks)
+    result["join_metrics"] = joins
+    result["section_wise_status"] = sw.success_status(joins)
+    # Whole-song metrics keep the monolithic schema so the two modes line up in reports.
+    metrics["endpoint"] = sw.whole_song_endpoint_metrics(
+        plan, view, marginal_tolerance=spec.endpoint_marginal_tolerance, mode=mode
+    )
+    metrics["graph"] = sw.combine_graph_metrics(plan, blocks["per_section_graph_metrics"])
+    metrics["sb"] = sw.whole_song_sb_metrics(plan, blocks["per_section_sb_metrics"])
+    metrics["path"] = path_metrics(plan.path, view, spec.horizon)
+    if spec.path_mode == "map":
+        metrics["path"]["map_path_score"] = plan.path_score
+        metrics["path"]["map_path_score_finite"] = _finite(plan.path_score)
+    metrics["tension"] = tension_metrics(plan.path, plan, spec.edo)
+    metrics["tension_section_plan"] = tension_plan
+    metrics["gttm"] = gttm_path_metrics(plan.path_edge_diagnostics)
+    attributed = timers.total_graph_s + timers.total_solve_s
+    result["runtime"]["sections_graph_s"] = timers.total_graph_s
+    result["runtime"]["sections_solve_s"] = timers.total_solve_s
+    # Boundary planning, joint path extraction, join validation and decoding of the combined path.
+    result["runtime"]["section_wise_overhead_s"] = max(0.0, gen_wall - attributed)
+
+
+def _section_wise_failure(
+    result: Dict[str, Any], exc: BaseException, failure: Dict[str, Any], planned: Sequence[Any],
+    timers: Any, spec: RunSpec, classified: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Fill the structured section/join failure of a failed section-wise run."""
+    from aimusic.evaluation import section_wise as sw
+
+    if not planned:
+        return classified  # failed before the section plan existed; nothing section-level to say
+    state = sw.section_failure_state(exc, planned, timers)
+    for name in ("per_section_results", "per_section_status", "per_section_runtime"):
+        result[name] = state[name]
+    result["section_wise_status"] = state["status"]
+    failure["kind"] = sw.failure_kind(state["failure_class"])
+    failure["failure_class"] = state["failure_class"]
+    failure["planner_stage"] = state["planner_stage"]
+    failure["section_index"] = state["section_index"]
+    failure["section_name"] = state["section_name"]
+    failure["cause_kind"] = state["cause_kind"]
+    cause = exc.__cause__
+    if state["failure_class"] == sw.CLASS_SECTION_SOLVE and cause is not None:
+        # A MUS-15 endpoint infeasibility inside a section is still an endpoint outcome worth classifying.
+        classified = ep.failure_endpoint_info(cause, spec.endpoint_mode)
+        if classified is not None:
+            classified["section_index"] = state["section_index"]
+            classified["section_name"] = state["section_name"]
+    return classified
+
+
 def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[str, Any]:
     """Evaluate one run.  Never raises for run-level problems; returns a result dict."""
     logging.disable(logging.CRITICAL)  # generation logs are per-edge noise at benchmark scale
@@ -300,16 +410,28 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
         import tracemalloc
 
         tracemalloc.start()
+    section_wise = spec.sectioning == SECTIONING_SECTION_WISE
+    planned: Sequence[Any] = ()
+    timers: Any = None
     try:
-        from aimusic.core.config import PriorWeights, SBConfig
+        from aimusic.core.config import (
+            PlanConfig,
+            PriorWeights,
+            SBConfig,
+            SectioningStrategy,
+            StitchingConfig,
+            StyleConfig,
+        )
         from aimusic.core.rng import RNGKey, derive_named_key
         from aimusic.planning.endpoint_feasibility import EndpointFallbackPolicy, EndpointMode
-        from aimusic.planning.plans import MethodARunConfig, SectionWisePlanResult, run_method_a
+        from aimusic.planning.plans import (
+            MethodARunConfig,
+            SectionWisePlanResult,
+            build_section_plan,
+            run_method_a,
+        )
+        from aimusic.evaluation import section_wise as sw
         from aimusic.evaluation.baselines import reachable_uniform_walk
-
-        stage = "prior"
-        prior, prior_info = build_prior(spec)
-        result["prior"] = prior_info
 
         stage = "generate"
         sb_config = SBConfig(
@@ -322,12 +444,29 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
             proposal_budget=spec.proposal_budget,
             prior_guided_proposals=spec.prior_guided_proposals,
         )
+        if section_wise:
+            stitching = StitchingConfig() if spec.stitch_max_cost is None else StitchingConfig(max_cost=spec.stitch_max_cost)
+            plan_config = PlanConfig(
+                sectioning_strategy=SectioningStrategy.SECTION_WISE,
+                section_names=spec.section_names,
+                stitching=stitching,
+            )
+        else:
+            # The monolithic run does not see the section plan; it is only used to score its tension.
+            plan_config = PlanConfig()
+        style_kwargs: Dict[str, Any] = {}
+        if spec.allowed_meters:
+            style_kwargs["allowed_meters"] = spec.allowed_meters
+        if spec.groove_families:
+            style_kwargs["groove_families"] = spec.groove_families
         run_config = MethodARunConfig(
             total_beats=spec.horizon,
             seed=spec.seed,
             use_sampling=spec.path_mode == "sample",
+            style_config=StyleConfig(**style_kwargs),
             prior_weights=PriorWeights(lambda_data=spec.lambda_data, lambda_gttm=spec.lambda_gttm),
             sb_config=sb_config,
+            plan_config=plan_config,
             edo=spec.edo,
             # Always explicit: the MUS-15 library default is DISTRIBUTION, so a singleton (M1) run
             # must say so, and a distribution run must never be collapsed to singleton.
@@ -335,17 +474,32 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
             unreachable_policy=EndpointFallbackPolicy(spec.endpoint_policy),
             endpoint_marginal_tolerance=spec.endpoint_marginal_tolerance,
         )
-        plan, _ = run_method_a(run_config, key=RNGKey(seed=spec.seed), prior=prior)
-        if isinstance(plan, SectionWisePlanResult):
-            raise ep.EndpointDiagnosticsUnavailable(
-                "The Milestone 1 evaluator does not yet aggregate section-wise plan results."
+        # The section structure is recorded for every run (also failed ones) from the public plan.
+        planned = tuple(build_section_plan(run_config))
+        result.update(sw.sectioning_record(planned))
+        authored = tuple(sw.authored_section_plan(run_config, spec.section_names)) if spec.section_names else ()
+
+        stage = "prior"
+        prior, prior_info = build_prior(spec)
+        result["prior"] = prior_info
+
+        stage = "generate"
+        if section_wise:
+            with sw.SectionTimers() as timers:
+                plan, _ = run_method_a(run_config, key=RNGKey(seed=spec.seed), prior=prior)
+        else:
+            plan, _ = run_method_a(run_config, key=RNGKey(seed=spec.seed), prior=prior)
+        if isinstance(plan, SectionWisePlanResult) != section_wise:
+            raise RuntimeError(
+                f"sectioning='{spec.sectioning}' was requested but the planner returned a "
+                f"{type(plan).__name__}; refusing to evaluate under a different mode."
             )
         gen_wall = time.perf_counter() - start_wall
 
         stage = "path"
         path = plan.path
         edge_diags = plan.path_edge_diagnostics
-        if spec.bridge_mode == "uniform":
+        if spec.bridge_mode == "uniform" and not isinstance(plan, SectionWisePlanResult):
             # no-SB ablation: identical graph, but a uniform end-reachable random walk
             # replaces the Schrodinger-bridge solution (edge weights are ignored).
             key = derive_named_key(RNGKey(seed=spec.seed), "eval.no_sb_walk")
@@ -353,31 +507,10 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
             edge_diags = plan.graph.diagnostics_for_path(path)
 
         stage = "metrics"
-        metrics = result["metrics"]
-        if spec.endpoint_mode == "distribution":
-            ep.require_distribution_diagnostics(plan, "distribution")
-            metrics["endpoint"] = ep.endpoint_metrics(plan, marginal_tolerance=spec.endpoint_marginal_tolerance)
-            stage = "calibration"
-            if spec.calibration_samples > 0:
-                starts, terminals = ep.draw_endpoint_samples(
-                    plan, derive_named_key(RNGKey(seed=spec.seed), "eval.calibration"), spec.calibration_samples
-                )
-                calibration = ep.calibration_from_samples(plan, starts, terminals)
-            else:
-                calibration = ep.calibration_unavailable(ep.CAL_NO_SAMPLES, 0)
-            ep.apply_calibration(metrics["endpoint"], calibration)
-            stage = "metrics"
+        if section_wise:
+            _section_wise_metrics(result, plan, spec, planned, authored, timers, gen_wall)
         else:
-            metrics["endpoint"] = ep.singleton_endpoint_info(plan)
-        metrics["graph"] = graph_metrics(plan.graph)
-        metrics["sb"] = sb_metrics(plan.sb_solution, used=spec.bridge_mode == "sb")
-        metrics["path"] = path_metrics(path, plan, spec.horizon)
-        if spec.path_mode == "map" and spec.bridge_mode == "sb":
-            score = plan.path_score
-            metrics["path"]["map_path_score"] = score
-            metrics["path"]["map_path_score_finite"] = _finite(score)
-        metrics["tension"] = tension_metrics(path, plan, spec.edo)
-        metrics["gttm"] = gttm_path_metrics(edge_diags)
+            _single_pass_metrics(result, plan, spec, path, edge_diags, authored)
         result["artifacts"]["path_sha256"] = _path_sha256(path)
         result["runtime"]["generate_wall_s"] = gen_wall
         result["status"] = STATUS_OK
@@ -389,9 +522,11 @@ def evaluate_run(spec: RunSpec, *, trace_python_memory: bool = False) -> Dict[st
         failure = _failure(exc, stage)
         if isinstance(exc, ep.EndpointDiagnosticsUnavailable):
             failure["kind"] = "endpoint_diagnostics_unavailable"
+        classified = ep.failure_endpoint_info(exc, spec.endpoint_mode)
+        if section_wise:
+            classified = _section_wise_failure(result, exc, failure, planned, timers, spec, classified)
         result["failure"] = failure
         result["status"] = STATUS_FAILED
-        classified = ep.failure_endpoint_info(exc, spec.endpoint_mode)
         if classified is not None:
             result["metrics"]["endpoint"] = classified
     finally:
