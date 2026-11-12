@@ -192,6 +192,83 @@ Controlled tests: `python -m unittest tests.test_evaluation_method_a_distributio
 `solve_endpoint_bridge`: feasible multi-state, singleton compatibility, strict vs drop/renormalize vs trim,
 determinism, repeated sampling, dashboard views).
 
+## Section-wise SB evaluation (MUS-16)
+
+`m2_section_wise_sb` compares **monolithic Method A** (`sectioning: single_pass`) with **section-wise Method A with
+soft stitching** (`sectioning: section_wise`): one bridge per named section over shared boundary distributions
+(MUS-16). The evaluator only *consumes* the public MUS-16 results (`SectionWisePlanResult`, `SectionRunResult`,
+`SectionJoinDiagnostics`, `SBDiagnostics.from_plan`, `build_section_plan`); it never re-plans sections or re-implements
+stitching, and the planner is unchanged.
+
+**Configuration.** `sectioning` is a list (`["single_pass", "section_wise"]`; a plain string or an absent key means
+`single_pass`, so every Milestone 1 config keeps its hash and every M1 run id is unchanged). Other keys:
+`section_names` (unique, at least two for `section_wise`, each section needs at least one beat),
+`stitching: {"max_cost": x}` (overrides the planner's stitching tolerance; section-wise runs only) and
+`style: {"allowed_meters": [...], "groove_families": [...]}` (applied to both modes). `no_sb` and `calibration_samples`
+are rejected with `section_wise`. Runs of the two modes differ **only** in `sectioning`: same seed, horizon, EDO,
+endpoint mode, graph limits, prior, path mode, style and authored section plan. Cell keys of section-wise cells end in
+`|sec=section_wise`; single-pass keys are unchanged. CLI: `--sectioning single_pass section_wise`.
+
+**Result schema.** Every result records `sectioning_mode`, `section_names`, `section_count`, `section_horizons`
+(`None` until known, never a fake value). Section-wise results also carry `section_wise_status`,
+`per_section_results`, `per_section_status`, `per_section_runtime`, `per_section_graph_metrics`,
+`per_section_sb_metrics`, `per_section_endpoint_metrics`, `per_section_path_metrics` and `join_metrics`
+(`None` for single-pass runs). The whole-song `metrics.*` keep the monolithic schema so modes line up; they are
+aggregates of independent section solves (graph counts summed, SB via `SBDiagnostics.from_plan`, outer endpoints
+only) and a section-wise run is never presented as one SB solve. `metrics.tension_section_plan` scores *both* modes
+against the same authored per-section targets (the monolithic planner itself targets one whole-song arc).
+
+**Three success levels** are kept apart: `sections_solved`, `joins_valid` (within the stitching tolerance) and
+`path_assembled`. `run_section_wise` raises on the first failing section or join and returns no partial result, so a
+failed run records `failure_class` (`boundary_planning`, `section_solve`, `join`, `path_assembly`), the failing section
+and planner stage, and per-section status `ok` / `failed` / `not_reached`; sections that never produced a result have no
+metrics. `failure.kind` is `<failure_class>_failed`.
+
+**Join metrics** (per join and aggregated): key and chord jump, meter / groove / role / head / boundary continuity
+(`1 - mismatch`, worst of the incoming and outgoing edge), incoming / outgoing / worst stitching cost, tolerance, margin,
+`within_tolerance` (recomputed by the evaluator) and `shared_endpoint_consistent` (the shared state appears once, at the
+join beat).
+
+**Timing.** The planner does not time sections, so `SectionTimers` wraps the two public per-section calls
+(`build_sparse_graph`, `solve_endpoint_bridge`) for one run and restores them afterwards; boundary planning, joint path
+extraction and join validation are `runtime.section_wise_overhead_s`. Peak memory is a whole-run figure only.
+
+**Comparison.** `aggregate.json` gains `sectioning_comparison`: per matched cell pair, paired differences
+`section_wise - single_pass` over seeds where both runs succeeded, plus `status_pairs` (both ok / only one ok / both
+failed). `ci_level` is `paired_ci` only with at least 5 matched seeds; otherwise `descriptive`, and the report shows mean
+and range, not an interval. The report gains `## Section-wise SB evaluation`; the dashboard gains the sectioning mode in
+the config panel, a *Section-wise* tab (comparison chart, per-section runtime, per-section status and success levels,
+stitching continuity, join detail) and a section selector in *Run details*. Single-pass runs show
+"Section-wise metrics unavailable: this run used single-pass planning."
+
+Run it (about 6 min; results in `docs/benchmarks/m2_section_wise_sb/`):
+
+```bash
+python -m aimusic.evaluation run --config config/benchmarks/m2_section_wise_sb.json \
+  --out outputs/benchmarks/m2_section_wise_sb --workers 1
+python -m aimusic.evaluation report --out outputs/benchmarks/m2_section_wise_sb
+```
+
+**Observations (descriptive, 3 seeds, placeholder prior, 12-EDO, 4/4 only, distribution endpoints).**
+
+* *Success.* 16 beats: 3/3 for both modes. 32 beats: single-pass 3/3, section-wise 1/3; the two failures are
+  `section_solve` failures in the `bridge` (seed 1) and `return` (seed 0) sections: "Shared start-boundary
+  distribution would be modified by section ...". A shared boundary may not be trimmed or dropped, and a section
+  that cannot reach every state of it fails, rather than silently altering the neighbour's boundary.
+* *Style limit.* With the default mixed 4/4-5/4-7/4 style every section-wise run (16 beats, 4 sections, 3 seeds, both
+  endpoint modes) failed in the second section for the same reason, so the benchmark config restricts to 4/4
+  (`style.allowed_meters`). That is a MUS-16 limitation, not an evaluator effect.
+* *Runtime / memory.* 16 beats: section-wise about 3.7 s faster per run (7.8 s vs 11.5 s) with similar peak RSS;
+  at 32 beats the single successful section-wise run (22.1 s) is close to single-pass (24.0 s). Graph construction
+  dominates (about 97% of section time); bridge solves take tens of milliseconds.
+* *Tension / path.* On the shared section plan, tension error and shape correlation are similar between modes and
+  vary more across seeds than between modes; section-wise had a lower mean GTTM score per edge at 16 beats and more
+  role changes. Joins always sat inside the tolerance (cost about 2.7-3.2 of 7.0), role continuity at joins was 0
+  and head continuity low: soft stitching constrains key and meter but not roles or heads.
+* None of this ranks the modes: sample sizes are too small for paired intervals (descriptive only), a lower
+  tension error is not a listening result, and the section-wise success rate is lower where it matters (longer
+  songs).
+
 ## Not measured / deferred
 
 * Distribution-to-distribution Method A (MUS-15) is evaluated only by `m2_distribution_method_a` (8/16 beats,
@@ -200,8 +277,10 @@ determinism, repeated sampling, dashboard views).
   metrics. Not covered for MUS-15: other policies (trim, conditional) on the real pipeline, 19-EDO, long
   horizons, ablations in distribution mode (no `no_sb`), and calibration of the terminal marginal beyond what
   one solved bridge shows (the sampler is checked against that bridge, not against an independent oracle).
-* Method B (MUS-18) and section-wise SB with soft stitching (MUS-16): the config enums exist but
-  `plans.py` does not branch on them, so no A/B or monolithic/section-wise comparison.
+* Method B (MUS-18): the config enum exists but `plans.py` does not branch on it, so no A/B comparison.
+  Section-wise Method A (MUS-16) is evaluated only by `m2_section_wise_sb` (16/32 beats, 3 seeds, 12-EDO, 4/4,
+  distribution endpoints, sampled paths): no 19-EDO, longer horizons, singleton endpoints, the default mixed-meter
+  style (which fails), per-section peak memory, or paired confidence intervals (needs at least 5 matched seeds).
 * NGramPrior (MUS-26) and trained neural prior (MUS-27): the `trained_prior` condition reports an
   explicit failure rather than substituting another prior.
 * Proposal recall (needs an exhaustive-search reference; see `scripts/benchmark_proposal_budget.py`),
