@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Hashable, Mapping, Optional, Sequence, Tuple, TypeVar
 
 _logger = logging.getLogger(__name__)
 
@@ -540,6 +540,44 @@ def _candidate_result_for_target_layer(
     )
 
 
+_S = TypeVar("_S", bound=Hashable)
+
+
+def _keep_every_start_lineage(
+    ranked: Sequence[_S],
+    k_max: int,
+    lineage: Mapping[_S, frozenset[int]],
+) -> Tuple[_S, ...]:
+    """Top-``k_max`` of ``ranked``, swapping in states so no start lineage is lost.
+
+    A start lineage missing from the top ``k_max`` gets its best-ranked state;
+    the evicted state is the lowest-ranked one whose removal uncovers no
+    lineage.  Such a state always exists while the start layer has at most
+    ``k_max`` states (pigeonhole), which ``build_sparse_graph`` enforces.
+    """
+    chosen = list(ranked[:k_max])
+    counts: dict[int, int] = {}
+    for state in chosen:
+        for origin in lineage[state]:
+            counts[origin] = counts.get(origin, 0) + 1
+    for candidate in ranked[k_max:]:
+        missing = [origin for origin in lineage[candidate] if counts.get(origin, 0) == 0]
+        if not missing:
+            continue
+        for position in range(len(chosen) - 1, -1, -1):
+            if all(counts[origin] > 1 for origin in lineage[chosen[position]]):
+                evicted = chosen.pop(position)
+                for origin in lineage[evicted]:
+                    counts[origin] -= 1
+                break
+        else:  # pragma: no cover - excluded by the pigeonhole argument above
+            continue
+        chosen.append(candidate)
+        for origin in lineage[candidate]:
+            counts[origin] = counts.get(origin, 0) + 1
+    return tuple(chosen)
+
+
 def build_sparse_graph(
     start_layer: Layer,
     end_layer: Layer,
@@ -557,8 +595,16 @@ def build_sparse_graph(
     prior_guided_proposals: Optional[bool] = None,
     section_context: Optional[PriorContext] = None,
     stitch_policy: Optional[StitchPolicy] = None,
+    preserve_start_support: bool = False,
 ) -> tuple[SparseGraph, RNGKey]:
     """Build a bounded sparse graph of BeatState transitions.
+
+    ``preserve_start_support`` (default off, so existing graphs are unchanged)
+    makes ``k_max`` pruning lineage-aware: every start-layer state keeps at
+    least one retained descendant in every layer.  Section-wise planning needs
+    this because an interior boundary is one authored distribution shared by
+    two sections; a start state whose descendants were all pruned would have
+    to be dropped, which the shared-boundary contract forbids.
 
     ``d_max`` controls retained outgoing edges only (REQ-13): candidate
     proposal is bounded separately by ``proposal_budget`` (falls back to
@@ -605,6 +651,10 @@ def build_sparse_graph(
         raise ValueError("end_layer size must be <= sb_config.k_max.")
 
     layers = [start_layer]
+    # Start-state lineage of each state in the current layer (guard only).
+    lineage: dict[BeatState, frozenset[int]] = {
+        state: frozenset((index,)) for index, state in enumerate(start_layer.states)
+    }
     edge_layers: list[Tuple[Edge, ...]] = []
     diagnostics: list[LayerBuildDiagnostics] = []
     current_key = key
@@ -723,6 +773,12 @@ def build_sparse_graph(
                 if edge.target not in best_incoming or edge.log_weight > best_incoming[edge.target]:
                     best_incoming[edge.target] = edge.log_weight
 
+        next_lineage: dict[BeatState, frozenset[int]] = {}
+        if preserve_start_support:
+            collected: dict[BeatState, set[int]] = {}
+            for edge in kept_edges:
+                collected.setdefault(edge.target, set()).update(lineage[edge.source])
+            next_lineage = {state: frozenset(ids) for state, ids in collected.items()}
         unique_candidates = tuple(sorted(best_incoming.keys(), key=_state_sort_key))
         pruned_states: list[PrunedState] = []
 
@@ -750,8 +806,14 @@ def build_sparse_graph(
                     ),
                 )
                 kept_states = tuple(ranked_candidates[: resolved_sb.k_max])
+                if preserve_start_support:
+                    kept_states = _keep_every_start_lineage(
+                        ranked_candidates, resolved_sb.k_max, next_lineage
+                    )
                 kept_state_set = set(kept_states)
-                for state in ranked_candidates[resolved_sb.k_max :]:
+                for state in ranked_candidates:
+                    if state in kept_state_set:
+                        continue
                     pruned_states.append(
                         PrunedState(
                             time_index=next_time,
@@ -766,6 +828,8 @@ def build_sparse_graph(
 
         next_layer = Layer(time_index=next_time, states=tuple(sorted(kept_states, key=_state_sort_key)))
         layers.append(next_layer)
+        if preserve_start_support:
+            lineage = {state: next_lineage[state] for state in next_layer.states}
         edge_layers.append(tuple(sorted(kept_edges, key=_edge_sort_key)))
         diagnostics.append(
             LayerBuildDiagnostics(

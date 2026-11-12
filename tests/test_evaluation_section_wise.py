@@ -18,7 +18,8 @@ from aimusic.evaluation.report import render_report
 from aimusic.evaluation.runner import evaluate_run
 from aimusic.evaluation.schema import RunSpec, new_result
 from aimusic.evaluation.stats import MIN_PAIRS_FOR_CI, aggregate, flatten_metrics
-from aimusic.planning.plans import PlanningSection, SectionPlanningError
+from aimusic.planning.graph import _keep_every_start_lineage
+from aimusic.planning.plans import PlanningSection, SectionPlanningError, SectionWisePlanResult
 from aimusic.planning.stitching import SectionJoinDiagnostics, StitchCost
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "benchmarks"
@@ -57,6 +58,91 @@ def _spec(**kw: Any) -> RunSpec:
 
 def _sections(n: int = 3, beats: int = 4) -> List[PlanningSection]:
     return [PlanningSection((NAMES + ['return'])[i], i * beats, (i + 1) * beats, 2) for i in range(n)]
+
+
+class TestStartLineagePruning(unittest.TestCase):
+    """``k_max`` pruning must not strand a start state of a shared boundary."""
+
+    def test_missing_lineage_swaps_in_and_evicts_a_redundant_state(self) -> None:
+        ranked = ["a", "b", "c", "d"]  # best first
+        lineage = {"a": frozenset({0}), "b": frozenset({0}), "c": frozenset({0}), "d": frozenset({1})}
+        self.assertEqual(_keep_every_start_lineage(ranked, 2, lineage), ("a", "d"))
+
+    def test_covered_lineages_keep_the_plain_top_k(self) -> None:
+        ranked = ["a", "b", "c"]
+        lineage = {"a": frozenset({0}), "b": frozenset({1}), "c": frozenset({0, 1})}
+        self.assertEqual(_keep_every_start_lineage(ranked, 2, lineage), ("a", "b"))
+
+    def test_never_evicts_the_only_cover_of_a_lineage(self) -> None:
+        ranked = ["a", "b", "c", "d"]
+        lineage = {"a": frozenset({0}), "b": frozenset({1}), "c": frozenset({2}), "d": frozenset({3})}
+        kept = _keep_every_start_lineage(ranked, 4, lineage)
+        self.assertEqual(sorted(kept), ["a", "b", "c", "d"])
+
+
+class TestSharedBoundaryRegressions(unittest.TestCase):
+    """m2_section_wise_sb 32-beat failures: the next section dropped part of a shared boundary.
+
+    Before the fix, ``k_max`` pruning removed every descendant of one start-boundary state, so MUS-15
+    reported it as unreachable and the section no longer started from the authored shared distribution
+    (seed 1: ``bridge``; seed 0: ``return``).
+    """
+
+    cases = {1: ("bridge", 2), 0: ("return", 3)}
+    runs: Dict[int, Dict[str, Any]] = {}
+    plans: Dict[int, SectionWisePlanResult] = {}
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from aimusic.planning import plans
+        real = plans.run_method_a
+        for seed in cls.cases:
+            specs = select_specs(
+                expand_matrix(load_config(CONFIG_DIR / "m2_section_wise_sb.json")),
+                horizons=[32], seeds=[seed], sectioning=["section_wise"],
+            )
+            assert len(specs) == 1
+            captured: List[Any] = []
+
+            def spy(*args: Any, **kwargs: Any) -> Any:
+                out = real(*args, **kwargs)
+                captured.append(out[0])
+                return out
+
+            with mock.patch.object(plans, "run_method_a", spy):
+                cls.runs[seed] = evaluate_run(specs[0])
+            cls.plans[seed] = captured[0]
+
+    def test_runs_complete_successfully(self) -> None:
+        for seed, (name, _) in self.cases.items():
+            with self.subTest(seed=seed, section=name):
+                run = self.runs[seed]
+                self.assertEqual(run["status"], "ok", run.get("failure"))
+                self.assertIsNone(run.get("failure"))
+                self.assertEqual(run["section_count"], 4)
+                self.assertEqual(set(run["per_section_status"]), {sw.STATUS_SECTION_OK})
+
+    def test_shared_boundaries_are_preserved_exactly(self) -> None:
+        for seed, (name, index) in self.cases.items():
+            plan = self.plans[seed]
+            with self.subTest(seed=seed, section=name):
+                self.assertEqual(plan.section_results[index].section.name, name)
+                for i in range(1, len(plan.section_results)):
+                    left, right = plan.section_results[i - 1], plan.section_results[i]
+                    self.assertFalse(left.end_mass.modified)
+                    self.assertFalse(right.start_mass.modified)
+                    self.assertEqual(left.end_mass.effective.layer.states,
+                                     right.start_mass.effective.layer.states)
+                    self.assertEqual(left.end_mass.effective.probabilities,
+                                     right.start_mass.effective.probabilities)
+                    join = plan.joins[i - 1]
+                    # The authored request itself, not a trimmed or renormalized variant.
+                    self.assertEqual(right.start_mass.requested.layer.states, join.boundary_states)
+                    self.assertIn(join.shared_state, join.boundary_states)
+                    self.assertEqual(right.start_mass.requested.probabilities, join.boundary_probabilities)
+                    self.assertEqual(right.start_mass.effective.probabilities, join.boundary_probabilities)
+                    self.assertEqual(right.start_mass.removed, ())
+                    self.assertEqual(right.start_mass.trims, ())
 
 
 class TestSectioningConfig(unittest.TestCase):
