@@ -245,29 +245,30 @@ Run it (about 6 min; results in `docs/benchmarks/m2_section_wise_sb/`):
 
 ```bash
 python -m aimusic.evaluation run --config config/benchmarks/m2_section_wise_sb.json \
-  --out outputs/benchmarks/m2_section_wise_sb --workers 1
+  --out outputs/benchmarks/m2_section_wise_sb --workers 2
 python -m aimusic.evaluation report --out outputs/benchmarks/m2_section_wise_sb
 ```
 
 **Observations (descriptive, 3 seeds, placeholder prior, 12-EDO, 4/4 only, distribution endpoints).**
 
-* *Success.* 16 beats: 3/3 for both modes. 32 beats: single-pass 3/3, section-wise 1/3; the two failures are
-  `section_solve` failures in the `bridge` (seed 1) and `return` (seed 0) sections: "Shared start-boundary
-  distribution would be modified by section ...". A shared boundary may not be trimmed or dropped, and a section
-  that cannot reach every state of it fails, rather than silently altering the neighbour's boundary.
+* *Success.* 12/12 runs: 3/3 for both modes at 16 and 32 beats. An earlier run had two 32-beat section-wise
+  failures ("Shared start-boundary distribution would be modified"): `k_max` pruning removed every descendant of
+  one start-boundary state, so MUS-15 dropped it as unreachable. `run_section_wise` now builds section graphs with
+  `preserve_start_support=True` (opt-in in `build_sparse_graph`; single-pass graphs are unchanged), which keeps at
+  least one descendant of every boundary state. The shared boundary is still never trimmed, dropped or
+  renormalized, and validation is unchanged: a section that cannot reach every boundary state still fails.
 * *Style limit.* With the default mixed 4/4-5/4-7/4 style every section-wise run (16 beats, 4 sections, 3 seeds, both
   endpoint modes) failed in the second section for the same reason, so the benchmark config restricts to 4/4
   (`style.allowed_meters`). That is a MUS-16 limitation, not an evaluator effect.
-* *Runtime / memory.* 16 beats: section-wise about 3.7 s faster per run (7.8 s vs 11.5 s) with similar peak RSS;
-  at 32 beats the single successful section-wise run (22.1 s) is close to single-pass (24.0 s). Graph construction
-  dominates (about 97% of section time); bridge solves take tens of milliseconds.
+* *Runtime / memory.* Section-wise was faster per run in this benchmark (16 beats: 9.9 s vs 16.0 s; 32 beats:
+  27.3 s vs 32.2 s; two workers), with similar peak RSS. Graph construction dominates section time; bridge solves
+  take tens of milliseconds.
 * *Tension / path.* On the shared section plan, tension error and shape correlation are similar between modes and
   vary more across seeds than between modes; section-wise had a lower mean GTTM score per edge at 16 beats and more
   role changes. Joins always sat inside the tolerance (cost about 2.7-3.2 of 7.0), role continuity at joins was 0
   and head continuity low: soft stitching constrains key and meter but not roles or heads.
-* None of this ranks the modes: sample sizes are too small for paired intervals (descriptive only), a lower
-  tension error is not a listening result, and the section-wise success rate is lower where it matters (longer
-  songs).
+* None of this ranks the modes: sample sizes are too small for paired intervals (descriptive only) and a lower
+  tension error is not a listening result.
 
 ## Not measured / deferred
 
