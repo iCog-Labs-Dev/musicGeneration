@@ -33,6 +33,9 @@ from aimusic.evaluation.schema import (
     ENDPOINT_MODES,
     ENDPOINT_POLICIES,
     PATH_MODES,
+    SECTIONING_MODES,
+    SECTIONING_SECTION_WISE,
+    SECTIONING_SINGLE_PASS,
     RunSpec,
     canonical_hash,
 )
@@ -91,6 +94,13 @@ class BenchmarkConfig:
     endpoint_policy: str = DEFAULT_ENDPOINT_POLICY
     endpoint_marginal_tolerance: float = DEFAULT_ENDPOINT_MARGINAL_TOLERANCE
     calibration_samples: int = 0
+    # MUS-16 sectioning axis.  Optional in the file (absent => ("single_pass",), the M1 behaviour), so
+    # shipped M1 configs keep their config_hash.  The raw file is what is hashed.
+    sectioning: Tuple[str, ...] = (SECTIONING_SINGLE_PASS,)
+    section_names: Tuple[str, ...] = ()
+    stitch_max_cost: Optional[float] = None
+    allowed_meters: Tuple[str, ...] = ()
+    groove_families: Tuple[str, ...] = ()
 
     @property
     def config_hash(self) -> str:
@@ -150,6 +160,8 @@ def parse_config(raw: Mapping[str, Any]) -> BenchmarkConfig:
             "condition 'no_sb' cannot be evaluated with endpoint_mode='distribution': the "
             "uniform baseline has no endpoint-marginal bridge.  Use a separate singleton config."
         )
+    sectioning, section_names, stitch_max_cost = _parse_sectioning(raw, horizons, conditions, calibration_samples)
+    allowed_meters, groove_families = _parse_style(raw.get("style"))
     return BenchmarkConfig(
         name=str(_require(raw, "name")),
         config_version=str(_require(raw, "config_version")),
@@ -171,7 +183,95 @@ def parse_config(raw: Mapping[str, Any]) -> BenchmarkConfig:
         endpoint_policy=endpoint_policy,
         endpoint_marginal_tolerance=marginal_tol,
         calibration_samples=calibration_samples,
+        sectioning=sectioning,
+        section_names=section_names,
+        stitch_max_cost=stitch_max_cost,
+        allowed_meters=allowed_meters,
+        groove_families=groove_families,
     )
+
+
+def _parse_style(style: Any) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Optional ``style`` block restricting meters / groove families (validated by ``StyleConfig``)."""
+    if style is None:
+        return (), ()
+    if not isinstance(style, Mapping) or set(style) - {"allowed_meters", "groove_families"}:
+        raise ValueError("style only supports the keys 'allowed_meters' and 'groove_families'.")
+    out: List[Tuple[str, ...]] = []
+    for key in ("allowed_meters", "groove_families"):
+        value = style.get(key, ())
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise ValueError(f"style.{key} must be a list of non-empty strings.")
+        if not all(isinstance(v, str) and v.strip() for v in value):
+            raise ValueError(f"style.{key} entries must be non-empty strings.")
+        out.append(tuple(str(v) for v in value))
+    from aimusic.core.config import StyleConfig
+
+    # Raises ValueError for an unusable style, at parse time rather than inside a worker.
+    StyleConfig(
+        **({"allowed_meters": out[0]} if out[0] else {}),  # type: ignore[arg-type]
+        **({"groove_families": out[1]} if out[1] else {}),  # type: ignore[arg-type]
+    )
+    return out[0], out[1]
+
+
+def _parse_sectioning(
+    raw: Mapping[str, Any],
+    horizons: Sequence[int],
+    conditions: Sequence[str],
+    calibration_samples: int,
+) -> Tuple[Tuple[str, ...], Tuple[str, ...], Optional[float]]:
+    """Validate the MUS-16 sectioning axis, section plan and stitching tolerance."""
+    value = raw.get("sectioning", SECTIONING_SINGLE_PASS)
+    modes = (value,) if isinstance(value, str) else tuple(value) if isinstance(value, (list, tuple)) else None
+    if not modes or not all(isinstance(m, str) for m in modes):
+        raise ValueError(
+            f"sectioning must be one of {SECTIONING_MODES} or a non-empty list of them, got {value!r}."
+        )
+    for mode in modes:
+        if mode not in SECTIONING_MODES:
+            raise ValueError(f"unknown sectioning '{mode}'; known: {list(SECTIONING_MODES)}.")
+    if len(set(modes)) != len(modes):
+        raise ValueError("sectioning must not repeat a mode.")
+
+    names_raw = raw.get("section_names", ())
+    if isinstance(names_raw, str) or not isinstance(names_raw, (list, tuple)):
+        raise ValueError("section_names must be a list of non-empty strings.")
+    if not all(isinstance(n, str) and n.strip() for n in names_raw):
+        raise ValueError("section_names entries must be non-empty strings.")
+    names = tuple(str(n) for n in names_raw)
+    if len(set(names)) != len(names):
+        raise ValueError(f"section_names must be unique, got {list(names)}.")
+
+    stitching = raw.get("stitching")
+    max_cost: Optional[float] = None
+    if stitching is not None:
+        if not isinstance(stitching, Mapping) or set(stitching) - {"max_cost"}:
+            raise ValueError("stitching only supports the key 'max_cost'.")
+        if "max_cost" in stitching:
+            max_cost = float(stitching["max_cost"])
+            if not max_cost >= 0:
+                raise ValueError("stitching.max_cost must be >= 0.")
+        if SECTIONING_SECTION_WISE not in modes:
+            raise ValueError("'stitching' only applies when sectioning includes 'section_wise'.")
+
+    if SECTIONING_SECTION_WISE in modes:
+        if len(names) < 2:
+            raise ValueError("sectioning 'section_wise' requires section_names with at least two sections.")
+        too_short = [h for h in horizons if h < len(names)]
+        if too_short:
+            raise ValueError(
+                f"horizons {too_short} are shorter than the {len(names)} section_names {list(names)}; "
+                "every section needs at least one beat."
+            )
+        if "no_sb" in conditions:
+            raise ValueError(
+                "condition 'no_sb' cannot be evaluated with sectioning 'section_wise': the uniform "
+                "baseline has no per-section bridge.  Use a separate single_pass config."
+            )
+        if calibration_samples:
+            raise ValueError("calibration_samples is not supported with sectioning 'section_wise'.")
+    return modes, names, max_cost
 
 
 def load_config(path: Path | str) -> BenchmarkConfig:
@@ -195,34 +295,42 @@ def expand_matrix(config: BenchmarkConfig) -> List[RunSpec]:
                         cdef = CONDITIONS[condition]
                         if cdef.bridge_mode == "uniform" and path_mode != "sample":
                             continue
-                        for seed in config.seeds:
-                            specs.append(
-                                RunSpec(
-                                    condition=condition,
-                                    horizon=horizon,
-                                    seed=seed,
-                                    edo=edo,
-                                    path_mode=path_mode,
-                                    prior_mode=cdef.prior_mode,
-                                    lambda_data=cdef.lambda_data,
-                                    lambda_gttm=cdef.lambda_gttm,
-                                    bridge_mode=cdef.bridge_mode,
-                                    k_max=point.k_max,
-                                    d_max=point.d_max,
-                                    proposal_budget=point.proposal_budget,
-                                    prior_guided_proposals=config.prior_guided_proposals,
-                                    max_iterations=config.max_iterations,
-                                    tolerance=config.tolerance,
-                                    temperature=config.temperature,
-                                    prior_bundle=config.prior_bundle,
-                                    endpoint_mode=config.endpoint_mode,
-                                    endpoint_policy=config.endpoint_policy,
-                                    endpoint_marginal_tolerance=config.endpoint_marginal_tolerance,
-                                    calibration_samples=config.calibration_samples,
-                                    config_name=config.name,
-                                    config_hash=config_hash,
+                        for sectioning in config.sectioning:
+                            section_wise = sectioning == SECTIONING_SECTION_WISE
+                            for seed in config.seeds:
+                                specs.append(
+                                    RunSpec(
+                                        condition=condition,
+                                        horizon=horizon,
+                                        seed=seed,
+                                        edo=edo,
+                                        path_mode=path_mode,
+                                        prior_mode=cdef.prior_mode,
+                                        lambda_data=cdef.lambda_data,
+                                        lambda_gttm=cdef.lambda_gttm,
+                                        bridge_mode=cdef.bridge_mode,
+                                        k_max=point.k_max,
+                                        d_max=point.d_max,
+                                        proposal_budget=point.proposal_budget,
+                                        prior_guided_proposals=config.prior_guided_proposals,
+                                        max_iterations=config.max_iterations,
+                                        tolerance=config.tolerance,
+                                        temperature=config.temperature,
+                                        prior_bundle=config.prior_bundle,
+                                        endpoint_mode=config.endpoint_mode,
+                                        endpoint_policy=config.endpoint_policy,
+                                        endpoint_marginal_tolerance=config.endpoint_marginal_tolerance,
+                                        calibration_samples=config.calibration_samples,
+                                        sectioning=sectioning,
+                                        # Matched pairs: both modes carry the same authored section plan.
+                                        section_names=config.section_names,
+                                        stitch_max_cost=config.stitch_max_cost if section_wise else None,
+                                        allowed_meters=config.allowed_meters,
+                                        groove_families=config.groove_families,
+                                        config_name=config.name,
+                                        config_hash=config_hash,
+                                    )
                                 )
-                            )
     ids = [s.run_id for s in specs]
     if len(set(ids)) != len(ids):
         raise ValueError("benchmark config expands to duplicate run ids.")
@@ -236,6 +344,7 @@ def select_specs(
     horizons: Optional[Sequence[int]] = None,
     edos: Optional[Sequence[int]] = None,
     seeds: Optional[Sequence[int]] = None,
+    sectioning: Optional[Sequence[str]] = None,
 ) -> List[RunSpec]:
     """Subset of the matrix; the manifest still lists every expected run."""
     out = []
@@ -247,6 +356,8 @@ def select_specs(
         if edos and s.edo not in edos:
             continue
         if seeds and s.seed not in seeds:
+            continue
+        if sectioning and s.sectioning not in sectioning:
             continue
         out.append(s)
     return out

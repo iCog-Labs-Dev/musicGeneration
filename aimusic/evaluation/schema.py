@@ -14,7 +14,7 @@ import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 CONFIG_SCHEMA_VERSION = "mus28-config/1"
 RESULT_SCHEMA_VERSION = "mus28-result/1"
@@ -31,7 +31,12 @@ GENERATION_METHODS = {
     "distribution": "method_a_distribution_endpoints",
 }
 GENERATION_METHOD = GENERATION_METHODS["singleton"]  # M1 default, kept for compatibility
-SECTIONING = "single_pass"
+SECTIONING = "single_pass"  # M1 default, kept for compatibility
+# How the song is planned.  ``single_pass`` is the monolithic Method A; ``section_wise`` is the MUS-16
+# per-section Schrodinger-bridge planner with shared boundary marginals and soft stitching.
+SECTIONING_SINGLE_PASS = "single_pass"
+SECTIONING_SECTION_WISE = "section_wise"
+SECTIONING_MODES = (SECTIONING_SINGLE_PASS, SECTIONING_SECTION_WISE)
 
 # Mirrors ``EndpointFallbackPolicy`` values (MUS-15); validated by the runner against the enum.
 ENDPOINT_POLICIES = (
@@ -93,8 +98,44 @@ class RunSpec:
     endpoint_marginal_tolerance: float = DEFAULT_ENDPOINT_MARGINAL_TOLERANCE
     # Extra sampled paths drawn from the one solved bridge to measure calibration (0 = none).
     calibration_samples: int = 0
+    # MUS-16 section plan.  ``section_names`` is the authored section plan (required for
+    # ``section_wise``); a ``single_pass`` run may carry the same plan so its tension can be scored
+    # against the identical per-section targets.  ``stitch_max_cost`` overrides the planner's
+    # ``StitchingConfig.max_cost`` (None = planner default) and only applies to ``section_wise``.
+    section_names: Tuple[str, ...] = ()
+    stitch_max_cost: Optional[float] = None
+    # Optional style restriction (empty = the planner's default ``StyleConfig``).  Applied identically
+    # to both sectioning modes.  MUS-16 needs it in practice: with the default mixed 4/4-5/4-7/4 style,
+    # short sections cannot preserve the shared boundary distribution (see docs/evaluation-suite.md).
+    allowed_meters: Tuple[str, ...] = ()
+    groove_families: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.sectioning not in SECTIONING_MODES:
+            raise ValueError(f"sectioning must be one of {SECTIONING_MODES}, got '{self.sectioning}'.")
+        object.__setattr__(self, "section_names", tuple(str(n) for n in self.section_names))
+        object.__setattr__(self, "allowed_meters", tuple(str(n) for n in self.allowed_meters))
+        object.__setattr__(self, "groove_families", tuple(str(n) for n in self.groove_families))
+        if any(not n.strip() for n in self.section_names):
+            raise ValueError("section_names entries must be non-empty strings.")
+        if len(set(self.section_names)) != len(self.section_names):
+            raise ValueError("section_names must be unique.")
+        if self.sectioning == SECTIONING_SECTION_WISE:
+            if len(self.section_names) < 2:
+                raise ValueError("sectioning='section_wise' requires at least two section_names.")
+            if self.horizon < len(self.section_names):
+                raise ValueError(
+                    f"horizon {self.horizon} is shorter than the {len(self.section_names)} sections "
+                    f"{list(self.section_names)}; every section needs at least one beat."
+                )
+            if self.bridge_mode == "uniform":
+                raise ValueError("The no-SB baseline has no section-wise form; use sectioning='single_pass'.")
+            if self.calibration_samples:
+                raise ValueError("calibration_samples is not supported with sectioning='section_wise'.")
+        elif self.stitch_max_cost is not None:
+            raise ValueError("stitch_max_cost only applies to sectioning='section_wise'.")
+        if self.stitch_max_cost is not None and not self.stitch_max_cost >= 0:
+            raise ValueError("stitch_max_cost must be >= 0.")
         if self.endpoint_mode not in ENDPOINT_MODES:
             raise ValueError(f"endpoint_mode must be one of {ENDPOINT_MODES}.")
         if self.endpoint_policy not in ENDPOINT_POLICIES:
@@ -135,7 +176,7 @@ class RunSpec:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RunSpec":
         known = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        return cls(**{k: v for k, v in data.items() if k in known})  # lists (JSON) become tuples in __post_init__
 
     @property
     def run_id(self) -> str:
@@ -149,6 +190,15 @@ class RunSpec:
             # Legacy (M1) runs never had the endpoint knobs; dropping them keeps old run ids valid.
             for key in ("endpoint_mode", "endpoint_policy", "endpoint_marginal_tolerance", "calibration_samples"):
                 knobs.pop(key)
+        # Likewise the MUS-16 section knobs: a plain single-pass run without a section plan keeps
+        # exactly its M1 id.
+        if not self.section_names:
+            knobs.pop("section_names")
+        if self.stitch_max_cost is None:
+            knobs.pop("stitch_max_cost")
+        for key in ("allowed_meters", "groove_families"):
+            if not getattr(self, key):
+                knobs.pop(key)
         digest = canonical_hash(knobs)[:8]
         return (
             f"{self.condition}-h{self.horizon}-e{self.edo}-s{self.seed}-{self.path_mode}"
@@ -158,11 +208,13 @@ class RunSpec:
     @property
     def group_key(self) -> str:
         """Key identifying a condition cell; seeds are replicates *within* a cell."""
-        return (
+        key = (
             f"{self.condition}|h={self.horizon}|edo={self.edo}|{self.path_mode}"
             f"|k={self.k_max}|d={self.d_max}|pb={self.proposal_budget}"
             f"|ep={self.endpoint_mode}"
         )
+        # Single-pass keys are unchanged from M1; a section-wise cell is never merged with them.
+        return key if self.sectioning == SECTIONING_SINGLE_PASS else f"{key}|sec={self.sectioning}"
 
 
 def canonical_json(value: Any) -> str:
@@ -184,6 +236,23 @@ def new_result(spec: RunSpec) -> Dict[str, Any]:
         "prior": {},
         "runtime": {},
         "failure": None,
+        # MUS-16 sectioning record.  Always present; the values are filled as soon as the section plan is
+        # known and stay ``None`` (never a fake zero) while it is not.
+        "sectioning_mode": spec.sectioning,
+        "section_names": None,
+        "section_count": None,
+        "section_horizons": None,
+        # Section-wise only (``None`` for single_pass): per-section records, per-join metrics and the
+        # three distinct success levels (sections solved / joins valid / whole-song path assembled).
+        "section_wise_status": None,
+        "per_section_results": None,
+        "per_section_status": None,
+        "per_section_runtime": None,
+        "per_section_graph_metrics": None,
+        "per_section_sb_metrics": None,
+        "per_section_endpoint_metrics": None,
+        "per_section_path_metrics": None,
+        "join_metrics": None,
         "metrics": {
             "graph": {},
             "sb": {},
@@ -193,6 +262,9 @@ def new_result(spec: RunSpec) -> Dict[str, Any]:
             # MUS-15 endpoint metrics; filled only in distribution mode.  A singleton run
             # records an explicit "not_applicable" marker instead of zeros.
             "endpoint": {},
+            # Tension scored against the *authored section plan* (same target for both sectioning
+            # modes); filled only when a section plan is configured.
+            "tension_section_plan": {},
         },
         "artifacts": {"path_sha256": None},
     }

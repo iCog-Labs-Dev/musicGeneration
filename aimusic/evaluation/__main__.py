@@ -22,6 +22,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--horizons", nargs="*", type=int, help="Subset of horizons.")
     run.add_argument("--edos", nargs="*", type=int, help="Subset of EDOs.")
     run.add_argument("--seeds", nargs="*", type=int, help="Subset of seeds.")
+    run.add_argument("--sectioning", nargs="*", help="Subset of sectioning modes (single_pass, section_wise).")
     run.add_argument("--retry-failed", action="store_true", help="Re-run runs that previously failed.")
     run.add_argument("--dry-run", action="store_true", help="List the selected runs and exit.")
 
@@ -49,7 +50,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     selected = select_specs(
-        specs, conditions=args.conditions, horizons=args.horizons, edos=args.edos, seeds=args.seeds
+        specs, conditions=args.conditions, horizons=args.horizons, edos=args.edos, seeds=args.seeds,
+        sectioning=args.sectioning,
     )
     if args.dry_run:
         for spec in selected:
