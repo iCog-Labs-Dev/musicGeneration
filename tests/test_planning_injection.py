@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import copy
+import math
 import unittest
+from unittest.mock import Mock
+from typing import Callable
 
 from aimusic.core.component_types import CandidateGenerationResult, CandidateRejection
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
@@ -13,6 +17,8 @@ from aimusic.planning.candidates import get_valid_next_states
 from aimusic.planning.plans import MethodAPlanResult, MethodARunConfig, render_exact_bridge_demo, run_method_a
 from aimusic.scoring.priors import Prior, PriorContext
 from tests.test_graph import state
+from tests.test_section_planning import section_config
+from aimusic.theory.tonal import basic_space_distance, tonal_distance
 
 
 class ControlledCandidates:
@@ -59,8 +65,9 @@ class FixedMetric:
 class TracedCandidates:
     marker = "controlled_rejected_source_proposal"
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, on_call: Callable[[PriorContext | None], None] | None = None) -> None:
         self.fail = fail
+        self.on_call = on_call
         self.calls: list[int] = []
 
     def __call__(
@@ -72,6 +79,8 @@ class TracedCandidates:
         prior_guided_proposals: bool = False,
     ) -> tuple[CandidateGenerationResult, RNGKey]:
         self.calls.append(t)
+        if self.on_call is not None:
+            self.on_call(context)
         if self.fail:
             raise RuntimeError("candidate replacement failed")
         result, next_key = get_valid_next_states(
@@ -94,12 +103,87 @@ class PreferGMetric(FixedMetric):
         return 0.0 if a_root == 7 else 100.0
 
 
+class RecordingMetric:
+    def __init__(self) -> None:
+        self.root_calls = 0
+
+    def tonal_distance(self, a_root: int, b_root: int, edo: int = 12) -> float:
+        self.root_calls += 1
+        return tonal_distance(a_root, b_root, edo)
+
+    def basic_space_distance(self, a_root: int, a_quality: str, b_root: int, b_quality: str, edo: int = 12) -> float:
+        return basic_space_distance(a_root, a_quality, b_root, b_quality, edo)
+
+
 class TestPlanningInjection(unittest.TestCase):
+    def test_selected_metric_and_candidates_reach_every_section_in_both_tunings(self) -> None:
+        for edo in (12, 19):
+            with self.subTest(edo=edo):
+                metric = RecordingMetric()
+                starts: list[tuple[str, int]] = []
+
+                def observe(context: PriorContext | None) -> None:
+                    assert context is not None and context.section_name is not None
+                    if not starts or starts[-1][0] != context.section_name:
+                        starts.append((context.section_name, metric.root_calls))
+
+                generator = TracedCandidates(on_call=observe)
+                result, _ = run_method_a(
+                    section_config(edo), key=RNGKey(11), tonal_metric=metric, candidate_generator=generator,
+                )
+                self.assertEqual([name for name, _ in starts], ["intro", "theme", "bridge", "return"])
+                counts = [count for _, count in starts] + [metric.root_calls]
+                for start, end in zip(counts, counts[1:]):
+                    self.assertGreater(end, start, "a section ignored the supplied metric")
+                self.assertEqual(len(result.path), 17)
     def setUp(self) -> None:
         self.start = state(beat=0)
         self.middle = state(beat=1, head="third")
         self.end = state(beat=2)
         self.key = RNGKey(seed=113)
+
+    def test_inconsistent_retention_limits_fail_before_candidate_generation(self) -> None:
+        generator = ControlledCandidates(self.middle)
+        with self.assertRaisesRegex(ValueError, "d_max"):
+            build_sparse_graph(
+                Layer(0, (self.start,)), Layer(2, (self.end,)), 2,
+                sb_config=SBConfig(d_max=2), d_max=1, key=self.key,
+                candidate_generator=generator,
+            )
+        self.assertEqual(generator.calls, [])
+
+    def test_graph_rejects_malformed_external_results_and_rng_values(self) -> None:
+        valid = CandidateGenerationResult(0, self.start, (self.middle,), proposed_count=1, unique_count=1)
+        for changes in (
+            {"proposed_count": 0}, {"unique_count": 2},
+            {"states": (self.middle, self.middle), "unique_count": 2, "proposed_count": 2},
+            {"scores": (math.nan,)}, {"scores": (math.inf,)}, {"scores": (-math.inf,)},
+            {"rejections": (CandidateRejection(1, self.start, self.start, "wrong time"),)},
+            {"rejections": (CandidateRejection(0, self.end, self.start, "wrong source"),)},
+        ):
+            # External objects can bypass constructors; the graph rechecks its boundary.
+            result = copy(valid)
+            for field, value in changes.items():
+                object.__setattr__(result, field, value)
+            with self.subTest(changes=changes), self.assertRaises((TypeError, ValueError)):
+                build_sparse_graph(
+                    Layer(0, (self.start,)), Layer(2, (self.end,)), 2,
+                    key=self.key, d_max=4, candidate_generator=Mock(return_value=(result, self.key)),
+                )
+        for invalid_key in (None, "not a random key", 12):
+            with self.subTest(key=invalid_key), self.assertRaises(TypeError):
+                build_sparse_graph(
+                    Layer(0, (self.start,)), Layer(2, (self.end,)), 2,
+                    key=self.key, d_max=4, candidate_generator=Mock(return_value=(valid, invalid_key)),
+                )
+
+    def test_terminal_checks_do_not_inflate_raw_generator_proposal_counts(self) -> None:
+        graph, _ = build_sparse_graph(
+            Layer(0, (self.start,)), Layer(1, (self.middle,)), 1,
+            key=self.key, d_max=2,
+        )
+        self.assertEqual(graph.diagnostics.layer_diagnostics[0].raw_candidate_count, 0)
+        self.assertEqual(graph.diagnostics.layer_diagnostics[0].legal_candidate_count, 1)
 
     def test_run_method_a_consumes_supplied_candidate_results(self) -> None:
         generator = TracedCandidates()

@@ -1,17 +1,15 @@
 """Four deliberately invalid implementations. This file is mypy input only."""
 
-from typing import Mapping, Sequence
+from typing import Sequence
 
-from aimusic.core.component_types import CandidateGenerationResult, SymbolicNote, TrackInstrumentConfig
+from aimusic.core.component_types import CandidateGenerationResult, RenderRequest
 from aimusic.core.config import DecodeConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Score
-from aimusic.core.protocols import ReportingScoreRenderer, ScoreDecoder, ScoreRenderer, TonalMetric
-from aimusic.render.midi_render import render_midi
+from aimusic.core.protocols import ScoreDecoder, ScoreRenderer, TonalMetric
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import Vocabularies
 from aimusic.planning.protocols import CandidateGenerator
 from aimusic.scoring.priors import Prior, PriorContext
-from aimusic.theory.edo import EDO
 
 
 class WrongMetric:
@@ -54,19 +52,11 @@ def wrong_decoder(
     return Score(), key
 
 
-def wrong_renderer(
-    notes: Sequence[SymbolicNote] | Score,
-    edo: EDO,
-    output_path: str,
-    ticks_per_beat: int = 480,
-    *,
-    track_instruments: Mapping[str, TrackInstrumentConfig] | None = None,
-) -> str:
-    return output_path
+def wrong_renderer(score: Score, request: RenderRequest) -> str:
+    return request.output_path
 
 
-metric: TonalMetric = WrongMetric()
-candidate: CandidateGenerator = wrong_candidates
-decoder: ScoreDecoder = wrong_decoder
-renderer: ScoreRenderer = wrong_renderer
-reporting_renderer: ReportingScoreRenderer = render_midi
+metric: TonalMetric = WrongMetric()  # invalid: metric
+candidate: CandidateGenerator = wrong_candidates  # invalid: candidate
+decoder: ScoreDecoder = wrong_decoder  # invalid: decoder
+renderer: ScoreRenderer = wrong_renderer  # invalid: renderer

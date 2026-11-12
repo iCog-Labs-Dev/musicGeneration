@@ -8,24 +8,23 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Sequence
 from unittest.mock import patch
 
 import mido
 
 from aimusic.app.cli import handle_export, handle_generate
-from aimusic.core.component_types import CandidateGenerationResult, SymbolicNote, TrackInstrumentConfig
-from aimusic.core.config import DecodeConfig, StyleConfig
+from aimusic.core.component_types import CandidateGenerationResult, RenderRequest, RenderResult
+from aimusic.core.config import DecodeConfig, EDOConfig, StyleConfig
 from aimusic.core.core_types import BeatState, NoteEvent, Score
-from aimusic.core.protocols import ScoreDecoder, ScoreRenderer
+from aimusic.core.protocols import ScoreDecoder, ScoreRenderer, TonalMetric
 from aimusic.core.render_package import load_render_package
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import Vocabularies
-from aimusic.render.midi_render import render_midi
+from aimusic.render.midi_adapter import MidiRenderer, MidiRenderSettings
 from aimusic.render.adapters import RenderResultAdapter
 from aimusic.planning.candidates import MetricBoundCandidates
 from aimusic.scoring.priors import Prior, PriorContext
-from aimusic.theory.edo import EDO
 from tests.test_metric_injection import FixedMetric
 from tests.test_planning_injection import TracedCandidates
 
@@ -66,23 +65,16 @@ class KnownScoreDecoder:
 
 
 class RecordingRenderer:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, edo: int = 12) -> None:
         self.fail = fail
-        self.calls: list[tuple[Sequence[SymbolicNote] | Score, int, str]] = []
+        self.settings = MidiRenderSettings(EDOConfig(n=edo, base_tuning=0, pitch_bend_range=2))
+        self.calls: list[tuple[Score, RenderRequest]] = []
 
-    def __call__(
-        self, notes: Sequence[SymbolicNote] | Score, edo: EDO,
-        output_path: str, ticks_per_beat: int = 480, *,
-        track_instruments: Mapping[str, TrackInstrumentConfig] | None = None,
-    ) -> None:
-        self.calls.append((notes, edo.config.n, output_path))
+    def __call__(self, score: Score, request: RenderRequest) -> RenderResult:
+        self.calls.append((score, request))
         if self.fail:
             raise RuntimeError("renderer replacement failed")
-        # Packaging needs real MIDI, so the double writes the captured request.
-        render_midi(
-            notes, edo, output_path, ticks_per_beat,
-            track_instruments=track_instruments,
-        )
+        return MidiRenderer(self.settings)(score, request)
 
 
 checked_decoder: ScoreDecoder = KnownScoreDecoder()
@@ -90,7 +82,7 @@ checked_renderer: ScoreRenderer = RecordingRenderer()
 
 
 class ThirdHeadCandidates:
-    def __init__(self, metric: FixedMetric) -> None:
+    def __init__(self, metric: TonalMetric) -> None:
         self.generate = MetricBoundCandidates(metric)
         self.transitions: set[tuple[int, BeatState, BeatState]] = set()
 
@@ -128,7 +120,7 @@ class TestArtifactInjection(unittest.TestCase):
                     metric = FixedMetric(root_value=7.0, chord_value=3.0)
                     candidates = ThirdHeadCandidates(metric)
                     decoder = KnownScoreDecoder()
-                    renderer = RecordingRenderer()
+                    renderer = RecordingRenderer(edo=edo)
                     reporting_renderer = RenderResultAdapter(renderer)
                     if workflow == "cli":
                         with contextlib.redirect_stdout(io.StringIO()):
@@ -170,7 +162,7 @@ class TestArtifactInjection(unittest.TestCase):
 
                     self.assertEqual(len(renderer.calls), 1)
                     self.assertIs(renderer.calls[0][0], decoder.score)
-                    self.assertEqual(renderer.calls[0][1], edo)
+                    self.assertEqual(renderer.settings.edo_config.n, edo)
                     score_path = next(directory.glob("*_score.json"))
                     midi_path = next(directory.glob("*.mid"))
                     self.assertEqual(Score.from_dict(json.loads(score_path.read_text(encoding="utf-8"))), decoder.score)
@@ -212,14 +204,14 @@ class TestArtifactInjection(unittest.TestCase):
             with self.subTest(edo=edo), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 decoder = KnownScoreDecoder()
-                renderer = RecordingRenderer()
+                renderer = RecordingRenderer(edo=edo)
                 with contextlib.redirect_stdout(io.StringIO()):
                     handle_generate(generate_args(directory, edo), decoder=decoder, renderer=renderer)
                 self.assertEqual(len(decoder.calls), 1)
                 self.assertEqual(decoder.calls[0][:3], (5, edo, 105.0))
                 self.assertEqual(len(renderer.calls), 1)
                 self.assertIs(renderer.calls[0][0], decoder.score)
-                self.assertEqual(renderer.calls[0][1], edo)
+                self.assertEqual(renderer.settings.edo_config.n, edo)
                 score_path = next(directory.glob("*_score.json"))
                 self.assertEqual(
                     Score.from_dict(json.loads(score_path.read_text(encoding="utf-8"))),
@@ -270,9 +262,10 @@ class TestArtifactInjection(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 handle_export(args, renderer=renderer)
             self.assertEqual(len(renderer.calls), 1)
-            self.assertEqual(renderer.calls[0][:2], (score, 12))
-            self.assertEqual(Path(renderer.calls[0][2]).name, Path(args.out).name)
-            self.assertFalse(Path(renderer.calls[0][2]).exists())
+            self.assertEqual(renderer.calls[0][0], score)
+            self.assertEqual(renderer.settings.edo_config.n, 12)
+            self.assertEqual(Path(renderer.calls[0][1].output_path).name, Path(args.out).name)
+            self.assertFalse(Path(renderer.calls[0][1].output_path).exists())
             self.assertEqual(len(mido.MidiFile(args.out).tracks), 2)
 
     def test_ui_helper_uses_supplied_decoder_and_renderer(self) -> None:
@@ -288,7 +281,7 @@ class TestArtifactInjection(unittest.TestCase):
                 comping_program=5, lead_program=88, drum_track=["drums"], section_wise=False,
             )
             decoder = KnownScoreDecoder()
-            renderer = RecordingRenderer()
+            renderer = RecordingRenderer(edo=19)
             with patch.object(ui, "OUTPUT_DIR", directory):
                 with self.assertRaisesRegex(RuntimeError, "candidate replacement failed"):
                     ui._generate_artifacts(
@@ -299,9 +292,9 @@ class TestArtifactInjection(unittest.TestCase):
                 self.assertEqual(list(directory.iterdir()), [])
                 artifacts = ui._generate_artifacts(params, decoder=decoder, renderer=renderer)
             self.assertIs(renderer.calls[0][0], decoder.score)
-            self.assertEqual(renderer.calls[0][1], 19)
-            self.assertEqual(Path(renderer.calls[0][2]).name, artifacts.midi_path.name)
-            self.assertFalse(Path(renderer.calls[0][2]).exists())
+            self.assertEqual(renderer.settings.edo_config.n, 19)
+            self.assertEqual(Path(renderer.calls[0][1].output_path).name, artifacts.midi_path.name)
+            self.assertFalse(Path(renderer.calls[0][1].output_path).exists())
             self.assertEqual(
                 Score.from_dict(json.loads(artifacts.score_path.read_text(encoding="utf-8"))),
                 decoder.score,

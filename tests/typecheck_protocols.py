@@ -2,25 +2,24 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Sequence
 
 from aimusic.core.component_types import (
     CandidateGenerationResult,
-    SymbolicNote,
-    TrackInstrumentConfig,
+    RenderRequest,
+    RenderResult,
 )
-from aimusic.core.config import DecodeConfig, StyleConfig
+from aimusic.core.config import DecodeConfig, EDOConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Score
-from aimusic.core.protocols import ReportingScoreRenderer, ScoreDecoder, ScoreRenderer, TonalMetric
+from aimusic.core.protocols import ScoreDecoder, ScoreRenderer, TonalMetric
 from aimusic.render.adapters import RenderResultAdapter
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import Vocabularies
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.candidates import MetricBoundCandidates, get_valid_next_states
 from aimusic.planning.protocols import CandidateGenerator
-from aimusic.render.midi_render import render_midi
+from aimusic.render.midi_adapter import MidiRenderer, MidiRenderSettings
 from aimusic.scoring.priors import Prior, PriorContext
-from aimusic.theory.edo import EDO
 from aimusic.theory.tonal import ExistingTonalMetric
 
 
@@ -77,21 +76,14 @@ class RecordingRenderer:
     def __init__(self) -> None:
         self.destinations: list[str] = []
 
-    def __call__(
-        self,
-        notes: Sequence[SymbolicNote] | Score,
-        edo: EDO,
-        output_path: str,
-        ticks_per_beat: int = 480,
-        *,
-        track_instruments: Mapping[str, TrackInstrumentConfig] | None = None,
-    ) -> None:
-        self.destinations.append(output_path)
+    def __call__(self, score: Score, request: RenderRequest) -> RenderResult:
+        self.destinations.append(request.output_path)
+        return RenderResult(request.output_path, request.format, 0)
 
 
 candidate: CandidateGenerator = get_valid_next_states
 decoder: ScoreDecoder = decode_path_to_score
-renderer: ScoreRenderer = render_midi
+renderer: ScoreRenderer = MidiRenderer(MidiRenderSettings(EDOConfig(n=12)))
 metric: TonalMetric = ExistingTonalMetric()
 metric_bound_candidate: CandidateGenerator = MetricBoundCandidates(metric)
 
@@ -100,5 +92,5 @@ decoder_double: ScoreDecoder = EmptyScoreDecoder()
 renderer_double: ScoreRenderer = RecordingRenderer()
 metric_double: TonalMetric = FixedMetric()
 
-reporting_renderer: ReportingScoreRenderer = RenderResultAdapter(render_midi)
-reporting_double: ReportingScoreRenderer = RenderResultAdapter(RecordingRenderer())
+atomic_renderer: ScoreRenderer = RenderResultAdapter(renderer)
+atomic_double: ScoreRenderer = RenderResultAdapter(RecordingRenderer())

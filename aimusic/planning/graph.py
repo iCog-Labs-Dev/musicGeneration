@@ -546,6 +546,8 @@ def _candidate_result_for_target_layer(
         source_state=prev_state,
         states=tuple(accepted),
         rejections=tuple(rejections),
+        proposed_count=len(target_layer.states),
+        unique_count=len(target_layer.states),
     )
 
 
@@ -561,18 +563,10 @@ def _validate_supplied_candidates(
         raise TypeError("candidate_generator must return a CandidateGenerationResult.")
     if not isinstance(key, RNGKey):
         raise TypeError("candidate_generator must return an RNGKey.")
+    result.validate()
     if result.source_state != source or result.time_index != time_index:
         raise ValueError("candidate_generator result must match the requested source and time.")
-    if not isinstance(result.states, tuple):
-        raise TypeError("candidate_generator states must be a tuple of BeatState values.")
-    for count in (result.proposed_count, result.unique_count):
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError("candidate_generator counts must be nonnegative integers.")
-    if result.scores and len(result.scores) != len(result.states):
-        raise ValueError("candidate_generator scores must align with its states.")
     for candidate in result.states:
-        if not isinstance(candidate, BeatState):
-            raise TypeError("candidate_generator states must contain BeatState values.")
         identifiers = (
             (vocabularies.meters, candidate.meter_id),
             (vocabularies.keys, candidate.key_id),
@@ -587,13 +581,6 @@ def _validate_supplied_candidates(
         legal, reason = is_legal_transition(source, candidate, style, vocabularies)
         if not legal:
             raise ValueError(f"candidate_generator returned an illegal transition: {reason}")
-    if len(set(result.states)) != len(result.states):
-        raise ValueError("candidate_generator states must be deduplicated.")
-    for rejection in result.rejections:
-        if not isinstance(rejection, CandidateRejection):
-            raise TypeError("candidate_generator rejections must contain CandidateRejection values.")
-        if rejection.source_state != source or rejection.time_index != time_index:
-            raise ValueError("candidate_generator rejection must match the requested source and time.")
 
 
 def build_sparse_graph(
@@ -634,7 +621,11 @@ def build_sparse_graph(
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
 
-    resolved_sb = SBConfig() if sb_config is None else sb_config
+    if isinstance(d_max, bool) or not isinstance(d_max, int) or d_max < 1:
+        raise ValueError("d_max must be a positive integer.")
+    resolved_sb = SBConfig(d_max=d_max) if sb_config is None else sb_config
+    if d_max != resolved_sb.d_max:
+        raise ValueError("d_max must equal sb_config.d_max; proposal_budget controls proposals separately.")
     if resolved_sb.max_horizon_per_solve is not None and total_beats > resolved_sb.max_horizon_per_solve:
         raise ValueError(
             f"Graph horizon {total_beats} exceeds max_horizon_per_solve="
@@ -719,7 +710,7 @@ def build_sparse_graph(
                     context=_build_prior_context(source_state, end_layer, current_time, section_context),
                     edo=resolved_edo,
                     key=current_key,
-                    d_max=d_max,
+                    d_max=resolved_sb.d_max,
                     proposal_budget=resolved_proposal_budget,
                     prior_guided_proposals=resolved_prior_guided_proposals,
                 )
@@ -729,7 +720,8 @@ def build_sparse_graph(
                         resolved_style, resolved_vocabs,
                     )
 
-            raw_candidate_count += candidate_result.proposed_count
+            if not final_step:
+                raw_candidate_count += candidate_result.proposed_count
             legal_candidate_count += candidate_result.legal_count
             scored_candidate_count += candidate_result.scored_count
             rejected.extend(candidate_result.rejections)

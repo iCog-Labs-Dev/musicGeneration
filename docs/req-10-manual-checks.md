@@ -2,13 +2,15 @@
 
 Automated tests cover component substitution and successful CLI/UI-helper runs with all four replacements selected together in 12-EDO and 19-EDO. They inspect the selected path, metric-derived diagnostics, known decoder output, actual MIDI, and CLI RenderPackage. The combined test deliberately uses a one-note decoder double; it verifies plumbing, not musical quality.
 
-The browser-generation/download check is complete using the user's six downloaded files and settings screenshots. The user also confirmed playing both examples. The requested manual acceptance checks are complete; this is basic playback confirmation, not a musical-quality or synthesizer-tuning certification.
+Historical browser-generation/download acceptance is complete using the user's six downloaded files and settings screenshots. The user confirmed playing both examples. These files came from the original submission, before the later upstream planner changes. They establish basic playback, not musical quality or synthesizer tuning for every future run.
+
+The mentor-review revision adds JSON-based selection and a shared CLI/UI factory. Automated checks exercise all four configured replacements in both tunings. The final verification record in [the implementation report](req-10-implementation.md) identifies the current revision's evidence. No extra manual component-substitution test is needed. Before a live presentation, generate and listen to the particular examples you will present.
 
 ## Check the browser controls and downloads
 
 1. Activate the project's Python environment and run `python ui.py` from the repository root.
 2. Open `http://localhost:7860` if the browser does not open automatically.
-3. Select seed 11, four beats, and 12-EDO. Generate a piece.
+3. Select seed 11, four beats, and 12-EDO. Turn off section-wise planning for this short example, then generate. Current upstream enables section-wise planning by default; use a longer piece to demonstrate multiple sections.
 4. Confirm generation completes, the summary appears, and MIDI, score JSON, and manifest downloads work.
 5. Repeat with 19-EDO using MPE rendering.
 
@@ -36,4 +38,10 @@ You do not need to repeat every replacement combination by hand. To rerun the co
 python -m unittest tests.test_artifact_injection.TestArtifactInjection.test_all_four_replacements_complete_cli_and_ui_workflows -v
 ```
 
-Long-piece performance, optional trained models, external audio synthesis, and a deployed-service security audit remain separate validation scopes. If your presentation uses a longer piece, generate that specific example in advance. Remote CI still needs to run when a PR is opened.
+To check selection through the actual command-line parser and UI helper, also run:
+
+```bash
+python -m unittest tests.test_component_selection_workflows -v
+```
+
+Long-piece performance, optional trained models, external audio synthesis and a deployed-service security audit remain separate validation scopes. Remote CI must be checked on the updated PR; a local test pass is not a remote CI pass.

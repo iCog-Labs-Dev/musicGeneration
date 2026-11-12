@@ -1,147 +1,167 @@
 # Replace a music-generation component
 
-Use the existing pipeline with a different distance formula, candidate generator, whole-score decoder, or renderer. Supply the replacement as a Python argument. The normal command-line options and UI controls continue to use the existing implementations.
+Choose a tonal metric, candidate generator, whole-score decoder, or renderer through the shared application factory. CLI generation/export and UI generation use the same resolver. Missing selections keep the existing implementations. Method A and section-wise planning receive the selected metric and generator.
 
-For the change history and verification, see [REQ-10 implementation](req-10-implementation.md).
+## Select components from a JSON file
+
+```json
+{
+  "tonal_metric": {
+    "factory": "my_music.components:make_metric",
+    "options": {"scale": 0.75},
+    "public_options": ["scale"]
+  },
+  "candidate_generator": {"factory": "my_music.components:make_candidates"},
+  "decoder": {"factory": "my_music.components:make_decoder"},
+  "renderer": {"factory": "my_music.components:make_renderer"}
+}
+```
+
+The named module must be installed or on Python's import path. Each reference is `module:export`, where the export is a constructor function or class. The server operator controls the file: importing a factory executes trusted Python code. Do not accept arbitrary factory files or names from browser clients. There is no plugin download service, package discovery or mutable global registry.
+
+```powershell
+python -m aimusic.app.cli generate --seed 11 --beats 4 --components components.json --out outputs
+python -m aimusic.app.cli export score.json --components components.json --out score.mid
+python ui.py --components components.json
+```
+
+The UI reads the operator's configuration at startup and binds it to its callback. Each generation resolves fresh objects; browser fields continue controlling the ordinary music settings. The CLI remains single-pass by default; the UI retains the upstream section-wise default. Set `section_wise=False` when calling the UI helper for a single-pass experiment.
+
+Unknown roles or fields, malformed factory references, non-JSON/non-finite options, missing constructors and incompatible call shapes fail before planning. Configuration accepts the four keys shown above. Options are JSON keyword arguments. The resolver copies nested values before construction and keeps a separate provenance snapshot, so a factory cannot accidentally consume a saved list and change the next UI run.
+
+Manifests and RenderPackages are shareable output. Constructor options stay private by default. `public_options` explicitly names the option values safe to copy into those artifacts; omit it to publish none. Only list shareable settings such as `scale`. Never list credentials, access tokens, signed URLs or an object containing secrets. Providers can also read credentials from their environment. Provenance records the number of unpublished options without their values, so omitted settings are not mistaken for a fully reproducible configuration.
+
+## Follow constructor conventions
+
+| Role | Constructor inputs | Required component |
+|---|---|---|
+| `tonal_metric` | Configured keyword options | `TonalMetric` |
+| `candidate_generator` | Configured options plus reserved `tonal_metric` | `CandidateGenerator` |
+| `decoder` | Configured keyword options | `ScoreDecoder` |
+| `renderer` | Configured options plus reserved `midi_settings` | `ScoreRenderer` |
+
+A candidate constructor receives the already selected metric. A renderer constructor receives the effective `MidiRenderSettings` for the current CLI/UI MIDI workflow, including tuning and instruments. Bind those settings in the implementation, not in the general renderer protocol. Options cannot replace reserved injected dependencies. Constructors own their validation and can reject incompatible settings. Construction failures are reported with the role and original cause.
+
+A supplied or configured built-in `MidiRenderer` must match the run's tuning, rendering method and instruments. The factory checks this even through its own artifact wrappers, before planning. `MidiRenderSettings` copies its instrument mapping into a read-only mapping; constructors cannot change the run by editing it in place. Use `dataclasses.replace` to create deliberately different settings, or `to_dict()` for public metadata. Custom opaque renderers remain responsible for honoring their supplied backend settings.
 
 ## Run a complete example
 
-Run this example with the repository installed, including its development dependencies. It changes the distance formula and supplies decoder and renderer wrappers. The wrappers delegate to the existing algorithms, so you can add your own behavior inside the same signatures.
+Save the following as `extension_example.py`. The example selects all four constructors, writes real 19-EDO MIDI and checks the returned file details. Default decoder and MIDI algorithms remain unchanged; the metric changes their structural context.
 
 ```python
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Mapping, Sequence
 
-from aimusic.core.component_types import RenderResult, SymbolicNote, TrackInstrumentConfig
-from aimusic.core.config import DecodeConfig
-from aimusic.core.core_types import BeatState, Score
-from aimusic.core.protocols import ReportingScoreRenderer, ScoreDecoder, TonalMetric
-from aimusic.render.adapters import RenderResultAdapter
-from aimusic.core.rng import RNGKey
-from aimusic.core.vocab import Vocabularies
+from aimusic.app.components import ComponentConfig, ComponentSpec
+from aimusic.app.demos import render_exact_bridge_demo
+from aimusic.core.protocols import ScoreDecoder, ScoreRenderer, TonalMetric
 from aimusic.decode import decode_path_to_score
-from aimusic.planning.plans import render_exact_bridge_demo
-from aimusic.render.midi_render import render_midi
-from aimusic.theory.edo import EDO
+from aimusic.planning.candidates import MetricBoundCandidates
+from aimusic.planning.protocols import CandidateGenerator
+from aimusic.render.midi_adapter import MidiRenderer, MidiRenderSettings
 from aimusic.theory.tonal import basic_space_distance, tonal_distance
 
 
 @dataclass(frozen=True)
 class ScaledMetric:
+    scale: float
 
-	factor: float = 0.5
+    def tonal_distance(self, a_root: int, b_root: int, edo: int = 12) -> float:
+        return self.scale * tonal_distance(a_root, b_root, edo)
 
-	def tonal_distance(self, a_root: int, b_root: int, edo: int = 12) -> float:
-		return self.factor * tonal_distance(a_root, b_root, edo)
-
-	def basic_space_distance(
-		self, a_root: int, a_quality: str,
-		b_root: int, b_quality: str, edo: int = 12,
-	) -> float:
-		return self.factor * basic_space_distance(
-			a_root, a_quality, b_root, b_quality, edo,
-		)
+    def basic_space_distance(
+        self, a_root: int, a_quality: str,
+        b_root: int, b_quality: str, edo: int = 12,
+    ) -> float:
+        return self.scale * basic_space_distance(a_root, a_quality, b_root, b_quality, edo)
 
 
-def custom_decoder(
-	path: Sequence[BeatState], *, key: RNGKey,
-	decode_config: DecodeConfig | None = None,
-	vocabularies: Vocabularies, edo: int = 12,
-	ticks_per_beat: int = 480, tempo_bpm: float = 120.0,
-	include_terminal_state: bool = False,
-) -> tuple[Score, RNGKey]:
-	return decode_path_to_score(
-		path, key=key, decode_config=decode_config,
-		vocabularies=vocabularies, edo=edo,
-		ticks_per_beat=ticks_per_beat, tempo_bpm=tempo_bpm,
-		include_terminal_state=include_terminal_state,
-	)
+def make_metric(*, scale: float) -> TonalMetric:
+    if not 0 < scale <= 1:
+        raise ValueError("scale must be greater than zero and at most one")
+    return ScaledMetric(scale)
 
 
-def custom_renderer(
-	notes: Sequence[SymbolicNote] | Score, edo: EDO,
-	output_path: str, ticks_per_beat: int = 480, *,
-	track_instruments: Mapping[str, TrackInstrumentConfig] | None = None,
-) -> RenderResult:
-	return RenderResultAdapter(render_midi)(
-		notes, edo, output_path, ticks_per_beat,
-		track_instruments=track_instruments,
-	)
+def make_candidates(*, tonal_metric: TonalMetric) -> CandidateGenerator:
+    return MetricBoundCandidates(tonal_metric)
 
 
-metric: TonalMetric = ScaledMetric()
-decoder: ScoreDecoder = custom_decoder
-renderer: ReportingScoreRenderer = custom_renderer
+def make_decoder() -> ScoreDecoder:
+    return decode_path_to_score
 
-with TemporaryDirectory() as temporary:
-	destination = Path(temporary) / "example.mid"
-	result = render_exact_bridge_demo(
-		start_chord="C:maj", end_chord="G:maj", output_path=str(destination),
-		total_beats=4, seed=11, edo=19,
-		tonal_metric=metric, decoder=decoder, renderer=renderer,
-	)
-	assert result.score.note_events
-	assert destination.read_bytes().startswith(b"MThd")
-	assert result.render_result is not None
-	assert result.render_result.output_path == str(destination)
-	assert result.render_result.size_bytes == destination.stat().st_size
+
+def make_renderer(*, midi_settings: MidiRenderSettings) -> ScoreRenderer:
+    return MidiRenderer(midi_settings)
+
+
+def main() -> None:
+    config = ComponentConfig(
+        tonal_metric=ComponentSpec("extension_example:make_metric", {"scale": 0.75}, public_options=("scale",)),
+        candidate_generator=ComponentSpec("extension_example:make_candidates"),
+        decoder=ComponentSpec("extension_example:make_decoder"),
+        renderer=ComponentSpec("extension_example:make_renderer"),
+    )
+    with TemporaryDirectory() as folder:
+        destination = Path(folder) / "example.mid"
+        result = render_exact_bridge_demo(
+            start_chord="C:maj", end_chord="G:maj", total_beats=4,
+            output_path=str(destination), seed=11, edo=19, component_config=config,
+        )
+        assert destination.read_bytes().startswith(b"MThd")
+        assert result.render_result is not None
+        assert result.render_result.output_path == str(destination)
+        assert result.render_result.size_bytes == destination.stat().st_size
+        assert result.render_result.format == "midi"
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-The temporary directory removes the example output when the block ends. For a file you can keep, pass your own destination to `render_exact_bridge_demo`.
+The demo retains the legacy start/end chord, meter and groove arguments, but Method A selects its own endpoints as before. Its application implementation lives in `aimusic.app.demos`. The old `aimusic.planning.plans.render_exact_bridge_demo` delegates there for compatibility and does not construct decoder or renderer defaults.
 
-The demo retains the legacy `start_chord` and `end_chord` arguments for existing scripts. Method A currently selects endpoints itself, as it did before this change.
+## Understand the contracts
 
-## Select components in other workflows
+The protocol specifies callable inputs and outputs. The contract also defines the behavior required by the caller.
 
-| Entry point | Accepted replacements |
+| Component | Input/output and required behavior |
 |---|---|
-| `build_sparse_graph` | `tonal_metric`, `candidate_generator` |
-| `run_method_a` | `tonal_metric`, `candidate_generator` |
-| `render_exact_bridge_demo` | All four |
-| `aimusic.app.cli.handle_generate` | All four |
-| `ui._generate_artifacts` | All four, through the existing internal UI helper |
-| `aimusic.app.cli.handle_export` | `renderer` |
+| `TonalMetric` | Two root/chord distance methods with integer EDO. Return finite, nonnegative real distances. Selected distances reach proposals, pruning, harmonic scoring, cadence and tension reports. |
+| `CandidateGenerator` | Existing source/time/configuration/vocabulary/prior arguments plus explicit random key. Return `(CandidateGenerationResult, RNGKey)` with legal successors and consistent diagnostics. |
+| `ScoreDecoder` | Existing whole-path callable and keyword settings. Return `(Score, RNGKey)`, preserving timing and terminal-state conventions. |
+| `ScoreRenderer` | `(score: Score, request: RenderRequest) -> RenderResult`. This is the only renderer protocol. No MIDI objects, tuning or instrument arguments appear here. |
 
-Pass `None`, or omit a replacement, to select the existing implementation. The default candidate generator uses the supplied metric automatically. A custom candidate generator owns its own proposal logic. If it needs the same metric, give it that object when constructing it.
+`RenderRequest` contains a nonblank string `output_path` and `format`. `RenderResult` contains their corresponding values and a nonnegative integer `size_bytes`. It has no EDO field. A valid empty artifact can have size zero.
 
-For a candidate generator, copy the full signature from `aimusic.planning.protocols.CandidateGenerator`. Return `(CandidateGenerationResult, RNGKey)`. For a typed minimal double, see `EmptyCandidates` in `tests/typecheck_protocols.py`. For actual graph substitution, see `ControlledCandidates` in `tests/test_planning_injection.py`.
+`RenderResultAdapter(renderer)` is format-neutral. It supplies a fresh temporary path in the destination parent with the same filename, requires a regular file at that path, checks the returned type/path/format/actual size, then atomically replaces the final destination and returns its path. The parent directory must exist. Errors remove staged output and preserve any existing final artifact. Directories and symbolic links are not accepted as completed files. This is file publication, not an output-quality or sandbox guarantee.
 
-An empty candidate result means that the generator found no allowed successors. The graph does not fall back to another generator. The graph still scores edges, enforces retained-edge limits, and restricts the final step to the requested endpoints.
+`MidiRenderer(MidiRenderSettings(...))` owns MIDI tuning and instrument data and accepts the `midi` format. It delegates to the unchanged `render_midi` function. Existing direct `render_midi(Score | Sequence[SymbolicNote], EDO, path, ...) -> None` calls still work. The earlier PR-only `ReportingScoreRenderer` and renderer union have been removed. Update experimental renderer objects to the single neutral signature.
 
-## Follow the contracts
+A custom text/JSON/music-notation renderer can implement the same neutral protocol and use the general adapter directly. Current CLI packages and UI preview still require valid MIDI. They do not automatically turn arbitrary formats into playable MIDI or audio.
 
-The protocol defines the callable shape. The contract also defines the behavior the caller relies on.
+## Keep candidate diagnostics consistent
 
-| Component | Required behavior |
-|---|---|
-| `TonalMetric` | Return a finite, nonnegative real distance from both methods. Honor the supplied EDO. Distances affect candidates, pruning, harmonic scoring, cadence checks, and tension reports. |
-| `CandidateGenerator` | Return deduplicated legal `BeatState` successors for the supplied source and time. Preserve tuple fields, source/time diagnostics, count types, and score alignment. Return the next explicit random key. |
-| `ScoreDecoder` | Accept a sequence of states and all declared keyword arguments. Return the generated `Score` and next `RNGKey`. Preserve timing and terminal-state conventions. |
-| `ScoreRenderer` | Legacy signature: accept both `Score` and symbolic-note sequences, write to the supplied path, honor tuning/instrument settings, close resources, and return `None`. |
-| `ReportingScoreRenderer` | The same inputs, returning `RenderResult(output_path, format, size_bytes, edo)` after writing the file. Current workflows require MIDI. |
+Shared classes validate their fields when constructed. `CandidateRejection` requires domain states, nonnegative integer time and a nonblank reason. A candidate result requires tuple fields, unique accepted states, distinct accepted/rejected outcomes, matching rejection source/time, and these counters:
 
-All renderer entry points accept either signature (`Renderer` is their union). They use `RenderResultAdapter` to obtain a completed result. The adapter calls the supplied implementation once with a fresh temporary destination in the final destination's parent directory. The filename stays the same. It checks that this new file exists, reads its actual byte size, and returns a frozen `RenderResult` with the requested path, `format="midi"`, size, and EDO. If a reporting implementation supplies inconsistent details, the adapter raises `ValueError`. After checking the report, it atomically replaces the final destination and reports that final path. A no-op cannot claim an existing file as a new result. File and renderer errors propagate; temporary output is removed and any existing final file is preserved. The demo and UI artifact result expose this as `.render_result`; existing constructors retain a default of `None`. CLI handlers keep their existing return types and use the reported path for output handling. Manifests do not gain new fields.
+- `proposed_count >= unique_count`.
+- `unique_count == legal_count + rejected_count`.
+- Scores are empty or align with accepted states; every supplied score is finite and nonboolean.
 
-Use `RenderResultAdapter()` directly to render with defaults and receive these details. Wrap a legacy renderer with `RenderResultAdapter(legacy_renderer)` to keep its inputs and `None` return unchanged. A missing output raises `FileNotFoundError`; no success result is returned.
+The graph revalidates external results and checks the requested source/time, returned random key, known vocabulary IDs and transition legality. Empty results stay empty; there is no fallback generator. The internal endpoint check now records how many endpoint states it evaluated while retaining the existing zero raw-generator-proposal diagnostic at the final step.
 
-The renderer uses the existing project-owned `EDO` helper. It does not take a `mido.MidiFile`. The CLI packages MIDI output, and the UI helper writes score/MIDI/manifest files for preview and download. Both need a valid MIDI file at the supplied path. A double that only records a call cannot complete those workflows.
+`proposal_budget` bounds raw proposals. `d_max` bounds retained scored edges. If a graph call supplies both `d_max` and an SB configuration, they must agree. Without an SB configuration, the supplied retained limit is used to construct one.
 
-Custom metric distances bypass the default shared caches. The component can own a cache if needed. Avoid mutable behavior during a run. Cadence scoring retains its existing comparison with a root distance of exactly `1`, so changing the scale can change cadence decisions. This is part of the experiment, not an automatic rescaling step.
+`SymbolicNote` permits signed integer pitch heights, finite nonnegative starts and later ends, and MIDI-range integer controls. `TrackInstrumentConfig` validates optional programs and boolean drum flags. Existing imports from the candidate and MIDI modules remain aliases of the shared definitions.
 
-Keep settings such as tempo, densities, proposal budgets, and instrument programs in existing configuration values. Supply executable component objects separately. The pipeline does not serialize those objects into a manifest or store a process-wide active component. Record a custom experiment's implementation version and settings separately if you need to reproduce it later.
+## Record what actually ran
 
-Create components before calling the workflow. The caller owns expensive setup and cleanup. Default components need no startup or shutdown hooks. Randomness remains explicit through `RNGKey`; do not introduce a hidden global random generator.
+CLI and UI manifests add `config.components`, containing each role's selection source, factory reference, actual implementation identity, explicitly public option values and an unpublished-option count. Renderer provenance includes the supplied MIDI construction settings and atomic wrapper identity. Existing top-level manifest fields and score/MIDI formats remain unchanged.
 
-Component exceptions propagate. The pipeline does not retry with a default component. Invalid custom distances or candidate results raise `TypeError` or `ValueError`. A renderer failure can leave a score JSON file. The adapter removes staged output and preserves any existing final MIDI file; the CLI does not write a success manifest or package afterward. Other output artifacts are not rolled back.
+Programmatic callers can pass objects to the existing injection arguments or supply parsed `ComponentConfig`. Selecting a factory and an object for the same role is an error. Runtime-object provenance says `runtime_override`, records its actual identity, and marks unknown constructor options as null. Opaque objects are not fully reproducible merely because their class name is recorded. Keep their setup/version information separately.
 
-## Check a replacement
+Create expensive resources in the provider's constructor and manage cleanup in the embedding application. No process-wide active component or startup/shutdown plugin framework was added. Keep random state explicit through `RNGKey`; do not introduce hidden global randomness. Custom metric distances bypass the default shared caches. Cadence retains its existing comparison with root distance exactly one, so rescaling can change cadence decisions.
 
-Assign the implementation to its protocol type, as the example does, then run mypy on that file. Check behavior with fixed inputs and known outputs. Finally run a complete workflow to verify integration.
+Component exceptions propagate. A renderer failure can leave the already-written score JSON, but the CLI does not emit a new success manifest or package afterward. Other output artifacts are not rolled back. Python annotations and runtime structural/signature checks do not prove behavior or return annotations. Positive/negative mypy fixtures check tested implementations, and behavior/integration tests verify real outputs and errors.
 
-Python annotations do not enforce these promises while the program runs. Mypy checks compatible signatures and declared types before execution. Tests verify results. Runtime checks cover custom distances and candidate outputs where they enter the graph.
-
-Existing imports of `CandidateGenerationResult`, `CandidateRejection`, `SymbolicNote`, and `TrackInstrumentConfig` still work. Their shared definitions now live in `aimusic.core.component_types`. Use that module for new contract-facing code.
-
-The combined CLI/UI test in `tests/test_artifact_injection.py` selects all four replacements together in both supported tunings. It checks changed candidate support, metric-derived diagnostics, decoder output, MIDI, and CLI packaging. See [manual checks before presenting](req-10-manual-checks.md) for the browser and listening checks that automation has not performed.
+For the verification record and review coverage, see [REQ-10 implementation](req-10-implementation.md). Existing browser/playback acceptance is recorded in [manual checks](req-10-manual-checks.md).

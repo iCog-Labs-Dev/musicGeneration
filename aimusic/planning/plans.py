@@ -10,7 +10,6 @@ _logger = logging.getLogger(__name__)
 
 from aimusic.core.config import (
     DecodeConfig,
-    EDOConfig,
     NeuralPriorConfig,
     PlanConfig,
     PlanMethod,
@@ -21,12 +20,10 @@ from aimusic.core.config import (
 )
 from aimusic.core.core_types import BeatState, EndpointDistribution, Layer, Score
 from aimusic.core.rng import RNGKey, allocate_named_keys, random_unit
-from aimusic.core.protocols import Renderer, ScoreDecoder, TonalMetric
+from aimusic.core.protocols import ScoreRenderer, ScoreDecoder, TonalMetric
 from aimusic.core.component_types import RenderResult
-from aimusic.render.adapters import RenderResultAdapter
 from aimusic.planning.protocols import CandidateGenerator
 from aimusic.core.vocab import TonalContext, Vocabularies, build_tonal_context
-from aimusic.decode import decode_path_to_score
 from aimusic.planning.graph import EdgeScoreDiagnostics, SparseGraph, build_sparse_graph
 from aimusic.planning.endpoint_feasibility import (  # noqa: F401  (re-exported)
     EndpointFallbackPolicy,
@@ -48,7 +45,6 @@ from aimusic.planning.endpoint_feasibility import (  # noqa: F401  (re-exported)
     solve_endpoint_bridge,
     validate_solution_marginals,
 )
-from aimusic.render import render_midi
 from aimusic.planning.sb import (
     SBProblem,
     SBSolution,
@@ -62,7 +58,6 @@ from aimusic.planning.stitching import (
     SectionJoinDiagnostics, StitchPolicy, concatenate_section_paths, stitch_cost,
     map_section_paths, section_path_score, shared_boundary_distribution,
 )
-from aimusic.theory.edo import EDO
 from aimusic.theory.tonal import get_fifth_steps
 
 
@@ -1135,46 +1130,15 @@ def render_exact_bridge_demo(
     tonal_metric: TonalMetric | None = None,
     candidate_generator: CandidateGenerator | None = None,
     decoder: ScoreDecoder | None = None,
-    renderer: Renderer | None = None,
+    renderer: ScoreRenderer | None = None,
 ) -> ExactBridgeDemoResult:
-    """Render a short bridge example using the current Method A pipeline.
+    """Compatibility entry point; application composition lives in app.demos."""
+    from aimusic.app.demos import render_exact_bridge_demo as render_demo
 
-    `start_chord`, `end_chord`, `meter`, and `groove` are accepted for compatibility with
-    legacy scripts. The current implementation delegates endpoint selection to Method A.
-    """
-    del start_chord, end_chord, meter, groove
-
-    resolved_style = StyleConfig() if style_config is None else style_config
-    resolved_decode = DecodeConfig() if decode_config is None else decode_config
-    run_config = MethodARunConfig(
-        total_beats=total_beats,
-        seed=seed,
-        style_config=resolved_style,
-        decode_config=resolved_decode,
-        edo=edo,
-    )
-    plan_result, next_key = run_method_a(
-        run_config, key=RNGKey(seed=seed),
+    return render_demo(
+        start_chord=start_chord, end_chord=end_chord, output_path=output_path,
+        total_beats=total_beats, seed=seed, meter=meter, groove=groove,
+        style_config=style_config, decode_config=decode_config, tempo_bpm=tempo_bpm, edo=edo,
         tonal_metric=tonal_metric, candidate_generator=candidate_generator,
-    )
-    selected_decoder: ScoreDecoder = decode_path_to_score if decoder is None else decoder
-    selected_renderer = RenderResultAdapter(render_midi if renderer is None else renderer)
-    score, _ = selected_decoder(
-        plan_result.path,
-        decode_config=resolved_decode,
-        vocabularies=plan_result.vocabularies,
-        edo=plan_result.tonal_context.n,
-        tempo_bpm=tempo_bpm,
-        key=next_key,
-    )
-    render_result = selected_renderer(
-        score,
-        EDO(EDOConfig(n=plan_result.tonal_context.n, base_tuning=0)),
-        output_path,
-    )
-    return ExactBridgeDemoResult(
-        plan_result=plan_result,
-        score=score,
-        output_path=output_path,
-        render_result=render_result,
+        decoder=decoder, renderer=renderer,
     )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from aimusic.core.component_types import CandidateGenerationResult
 from aimusic.core.config import StyleConfig
@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from aimusic.scoring.priors import Prior, PriorContext
 
 
+@runtime_checkable
 class CandidateGenerator(Protocol):
     """Return legal successors and diagnostics, or an empty valid result."""
 

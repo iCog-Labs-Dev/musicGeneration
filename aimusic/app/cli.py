@@ -23,14 +23,15 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.core.core_types import Score, ScoreValidationError
-from aimusic.core.protocols import Renderer, ScoreDecoder, TonalMetric
-from aimusic.render.adapters import RenderResultAdapter
+from aimusic.core.protocols import ScoreRenderer, ScoreDecoder, TonalMetric
+from aimusic.core.component_types import RenderRequest
+from aimusic.app.components import ComponentConfig, create_components, load_component_config
+from aimusic.render.midi_adapter import MidiRenderSettings
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
-from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, PlanningSection, run_method_a
 from aimusic.planning.protocols import CandidateGenerator
-from aimusic.render import TrackInstrumentConfig, render_midi
+from aimusic.render import TrackInstrumentConfig
 from aimusic.scoring.priors import NullPrior, Prior
 from aimusic.render.package import write_render_package
 from aimusic.scoring.tension import (
@@ -153,7 +154,8 @@ def handle_generate(
     tonal_metric: TonalMetric | None = None,
     candidate_generator: CandidateGenerator | None = None,
     decoder: ScoreDecoder | None = None,
-    renderer: Renderer | None = None,
+    renderer: ScoreRenderer | None = None,
+    component_config: ComponentConfig | None = None,
 ) -> None:
     """Run the current Method A pipeline and export score, MIDI, and manifest artifacts."""
     style_config = StyleConfig(
@@ -201,13 +203,18 @@ def handle_generate(
             )
             sys.exit(1)
         prior = load_trained_neural_prior(prior_bundle)
-    selected_decoder: ScoreDecoder = decode_path_to_score if decoder is None else decoder
-    selected_renderer = RenderResultAdapter(render_midi if renderer is None else renderer)
+    if component_config is not None and getattr(args, "components", None) is not None:
+        raise ValueError("supply one component configuration, not both an object and a file.")
+    components = create_components(
+        component_config if component_config is not None else load_component_config(getattr(args, "components", None)),
+        midi_settings=MidiRenderSettings(_build_edo(args).config, _build_track_instruments(args)),
+        tonal_metric=tonal_metric, candidate_generator=candidate_generator, decoder=decoder, renderer=renderer,
+    )
     plan_result, next_key = run_method_a(
         run_config, key=RNGKey(seed=args.seed), prior=prior,
-        tonal_metric=tonal_metric, candidate_generator=candidate_generator,
+        tonal_metric=components.tonal_metric, candidate_generator=components.candidate_generator,
     )
-    score, _ = selected_decoder(
+    score, _ = components.decoder(
         plan_result.path,
         decode_config=decode_config,
         vocabularies=plan_result.vocabularies,
@@ -220,7 +227,7 @@ def handle_generate(
         plan_result.vocabularies,
         edo=args.edo,
         sections=plan_result.endpoints.sections,
-        tonal_metric=tonal_metric,
+        tonal_metric=components.tonal_metric,
     )
     manifest = RunManifest(
         seed=args.seed,
@@ -233,6 +240,7 @@ def handle_generate(
                 "output_dir": args.out,
                 "track_instruments": _build_track_instruments(args),
                 "prior_type": "null" if isinstance(prior, NullPrior) else "configured",
+                "components": components.provenance,
             }
         ),
         structural_stats=structural_stats,
@@ -249,12 +257,7 @@ def handle_generate(
     with score_path.open("w", encoding="utf-8") as f:
         json.dump(score.to_dict(), f, indent=2)
 
-    render_result = selected_renderer(
-        score,
-        _build_edo(args),
-        str(midi_path),
-        track_instruments=track_instruments,
-    )
+    render_result = components.renderer(score, RenderRequest(str(midi_path), "midi"))
 
     midi_path = Path(render_result.output_path)
 
@@ -417,7 +420,8 @@ def handle_inspect(args: argparse.Namespace) -> None:
 def handle_export(
     args: argparse.Namespace,
     *,
-    renderer: Renderer | None = None,
+    renderer: ScoreRenderer | None = None,
+    component_config: ComponentConfig | None = None,
 ) -> None:
     """Handle the export command by rendering a serialized Score to MIDI."""
     score_path = Path(args.file)
@@ -432,13 +436,13 @@ def handle_export(
     edo = _build_edo(args)
     output_path = Path(args.out) if args.out else score_path.with_suffix(".mid")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    selected_renderer = RenderResultAdapter(render_midi if renderer is None else renderer)
-    render_result = selected_renderer(
-        score,
-        edo,
-        str(output_path),
-        track_instruments=_build_track_instruments(args),
+    if component_config is not None and getattr(args, "components", None) is not None:
+        raise ValueError("supply one component configuration, not both an object and a file.")
+    components = create_components(
+        component_config if component_config is not None else load_component_config(getattr(args, "components", None)),
+        midi_settings=MidiRenderSettings(edo.config, _build_track_instruments(args)), renderer=renderer,
     )
+    render_result = components.renderer(score, RenderRequest(str(output_path), "midi"))
     print(f"Exported multitrack MIDI to: {render_result.output_path}")
 
 
@@ -512,6 +516,7 @@ def main() -> None:
         default=None,
         help="Path to a trained prior artifact bundle (requires optional [ml] extra).",
     )
+    gen_parser.add_argument("--components", type=str, default=None, help="JSON configuration selecting trusted installed component factories.")
     gen_parser.set_defaults(func=handle_generate)
 
     ins_parser = subparsers.add_parser("inspect", help="Inspect diagnostics")
@@ -554,6 +559,7 @@ def main() -> None:
         default=[],
         help="Treat the named symbolic track as percussion; repeatable.",
     )
+    exp_parser.add_argument("--components", type=str, default=None, help="JSON component configuration.")
     exp_parser.set_defaults(func=handle_export)
 
     render_parser = subparsers.add_parser(

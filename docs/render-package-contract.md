@@ -54,19 +54,13 @@ Violations raise `ContractViolation` and abort the run.
 
 ### Supplied renderer requirement
 
-REQ-10 lets the CLI and UI artifact helpers accept a legacy `ScoreRenderer` or a
-`ReportingScoreRenderer`. Both must write valid MIDI at the requested destination.
-Legacy renderers return `None`; reporting renderers return a `RenderResult`.
-`RenderResultAdapter` provides the actual path, format, file size and tuning
-without changing the legacy function. Inconsistent reports and missing files
-raise an error before success-manifest or package creation. The adapter passes
-a fresh temporary output path to the renderer, then atomically replaces the
-final destination after validation. Failure removes temporary output and
-preserves any previous final MIDI file. The CLI still owns score JSON, manifest, structure,
-tuning, and package emission. The UI helper writes flat score/MIDI/manifest
-files for preview and download; it does not emit a RenderPackage.
-A double that only records a call does not satisfy CLI packaging. See the
-[component extension guide](extending-components.md) for the renderer contract.
+REQ-10 workflows receive a single `ScoreRenderer(Score, RenderRequest) -> RenderResult` selected by the shared application factory. The request and result are format-neutral. The concrete MIDI adapter owns tuning and instrument settings and delegates to the established `render_midi` function, whose direct signature and None return are unchanged.
+
+CLI packaging and UI preview still request valid MIDI. The neutral adapter supplies a fresh sibling temporary path, requires a regular completed file and matching path/format/byte-size report, then atomically replaces the final destination. Missing files, non-regular files, incorrect reports and renderer exceptions prevent a new success manifest/package and preserve any previous final MIDI. Already-written score JSON and unrelated artifacts are not rolled back.
+
+CLI and UI manifests add `config.components` with effective factory selections, implementation identities, explicitly public options and known MIDI construction settings. Constructor options are private by default; `public_options` names shareable values and the rest contribute only an unpublished-option count. Runtime overrides have honest unknown-options markers. Built-in MIDI renderers must match the run's settings, including through our artifact wrappers. The top-level manifest/package layout is unchanged.
+
+The CLI owns score JSON, manifest, structure, tuning and package emission. The UI helper emits flat score/MIDI/manifest files for preview/download and does not create a RenderPackage. See the [component extension guide](extending-components.md).
 
 ### Product output
 

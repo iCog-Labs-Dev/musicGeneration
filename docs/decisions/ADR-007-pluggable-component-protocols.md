@@ -1,8 +1,8 @@
-# ADR-007: Pluggable component protocols with existing types (REQ-10)
+# ADR-007: Pluggable component protocols (REQ-10)
 
 ## Status
 
-Accepted
+Implemented for PR #51 review. The mentor revision supersedes the original two-renderer-protocol and Python-only selection decisions.
 
 ## Date
 
@@ -10,71 +10,32 @@ Accepted
 
 ## Context
 
-Priors already had a substantial typed replacement boundary. Tonal metrics,
-candidate generation, whole-score decoding, and rendering still depended on
-directly selected implementations. Experiments needed changes to their callers.
-The issue requires substitution, small contracts, default compatibility,
-checked conformance, test doubles, and extension documentation. The mentor
-also requires the new types to match the existing implementations.
+The original issue requires replaceable tonal metrics, candidate generation, whole-score decoding and rendering, with independent typed contracts, default compatibility and proof of substitution. The original implementation retained the existing callable shapes, including a None-returning renderer. A presentation follow-up added a second reporting protocol. The mentor's review then required one neutral renderer protocol, application-owned construction, configuration-based selection and recorded implementations, together with stronger data and test validation.
+
+The current upstream also includes section-wise planning and a section-wise UI default. Both planning strategies must receive the selected components. Existing direct MIDI/decoder APIs and default musical algorithms remain intact.
 
 ## Decision
 
-- Define `TonalMetric`, `ScoreDecoder`, and `ScoreRenderer` in
-  `aimusic.core.protocols`. Define `CandidateGenerator` in
-  `aimusic.planning.protocols`, with type-only imports for prior/context types.
-- Preserve the existing candidate, decoder, and renderer callable shapes.
-  Decoder output remains `(Score, RNGKey)`. Rendering accepts both `Score`
-  and symbolic-note sequences, takes the project `EDO`, and returns `None`.
-  Add a separate `ReportingScoreRenderer` with identical inputs and a
-  `RenderResult` return. Both are accepted at workflow entry points.
-- Move candidate result/rejection and symbolic note/instrument dataclasses
-  to `aimusic.core.component_types`. Old module imports alias the same classes.
-- Supply runtime components through optional workflow arguments, separately
-  from serializable configuration. Use existing implementations when omitted.
-  Bind default candidate proposals to the selected metric with
-  `MetricBoundCandidates`; expose existing tonal functions with
-  `ExistingTonalMetric`. The decoder function conforms directly.
-  `RenderResultAdapter` wraps legacy or reporting renderers and returns verified
-  artifact details without changing `render_midi` or `ScoreRenderer`.
-- Route the selected metric through proposals, pruning, structural scoring,
-  retained-edge diagnostics, cadence, and tension reports. Preserve default
-  caches and bypass them for custom implementations.
-- Validate supplied candidate results where they enter the graph. Keep final
-  endpoint restrictions, legality, edge scoring, and retained-edge limits in
-  the graph. Empty results stay empty; component failures propagate.
+- Define `TonalMetric`, `ScoreDecoder` and a single `ScoreRenderer` in `core.protocols`, with the existing candidate callable in `planning.protocols`.
+- The renderer accepts `Score` and `RenderRequest(output_path, format)` and returns `RenderResult(output_path, format, size_bytes)`. Neither request nor result exposes MIDI/EDO settings. Remove the earlier reporting protocol and renderer union.
+- Bind EDO and instrument configuration in the concrete `MidiRenderer`, using `MidiRenderSettings`. It delegates to the unchanged `render_midi` function, whose existing direct signature and None return remain available.
+- Make `RenderResultAdapter` generic: render to a fresh sibling temporary path, validate a regular new file and its exact report, then atomically replace the destination. Reject missing, inconsistent and non-regular outputs. Failure preserves previous final bytes.
+- Resolve defaults, configured constructors and supplied runtime objects in `app.components.create_components`. CLI and UI share this factory. Local JSON names trusted installed `module:export` constructors and JSON keyword options. Candidate constructors receive the selected metric; renderer constructors receive effective MIDI settings as construction inputs, outside the neutral protocol.
+- Construct fresh objects per run, copy nested options before constructor calls, snapshot provenance independently, and check required positional/keyword call shapes without executing placeholder calls. These checks complement static fixtures; they cannot prove semantics or return annotations.
+- Record effective role sources, factories, implementation identities, explicitly public options and known renderer settings under manifest `config.components`. Constructor options are private by default; `public_options` selects shareable values. Record only an omitted-option count for the rest. Explicit runtime objects have honest unknown-options markers. Reject simultaneous file and object selection for one role.
+- Reject a built-in MIDI renderer whose bound settings differ from the run, including through our artifact wrappers. This prevents actual tuning/programs from disagreeing with package metadata. Opaque custom implementations must honor their supplied backend settings.
+- Move executable demo composition to `app.demos`; retain the old planning entry as a lazy delegator. Planning does not import or select concrete decoder/rendering defaults. Carry metric/candidate choices through every section as well as single-pass planning.
+- Validate all shared data classes and recheck candidate objects at the graph boundary. Require coherent unique outcomes/counters, finite aligned scores, correct RNG/source/time, legal vocabulary IDs and transitions. Give endpoint checks accurate internal counters without inflating raw-generator diagnostics. Validate graph `d_max` agreement with SB configuration, leaving proposal budgets separate.
+- Negative typing fixtures mark each invalid assignment. Match errors to its exact file/line, rather than accepting an error total alone.
 
-## Alternatives considered
+## Alternatives and consequences
 
-New request wrappers would shorten signatures but require conversions
-and change the existing input shapes. The original design omitted a renderer
-result. The mentor required all presented features, including slide 7, so that
-decision is superseded: a separate reporting adapter now returns the saved
-path, format, actual size and tuning. Legacy signatures stay unchanged.
-A configuration adapter is unnecessary because `EDO` is a project type, not
-a MIDI-library class. Global registries or a process-wide active component would hide
-selection state. These options were rejected for this issue.
+A named constructor registry is easier to enumerate for a browser catalog but requires host registration before the stock CLI can select an installed alternative. Trusted local factory references meet configuration-only selection without coordinator edits. We do not add package discovery, a browser-supplied Python loader or a mutable global registry. The operator controls startup configuration; selected factories execute in process and are not sandboxed.
 
-## Consequences
+Keeping two new renderer protocols would preserve a PR-internal intermediate API but contradict the requested single boundary. Only the established direct `render_midi` function is retained for compatibility. New request/result wrappers are limited to the renderer; candidate and decoder callable types remain established project types.
 
-Components can be substituted without editing orchestration. Static positive
-and negative fixtures check signatures; behavior and integration tests check
-returned results, errors, defaults, and actual artifacts. Existing per-beat
-`TrackGenerator` behavior and prior protocols remain separate.
+A simple filesystem-timestamp check cannot reliably distinguish fresh identical writes on every platform. Fresh staging avoids stale-file success and preserves valid overwrites. The adapter validates artifact facts, not file-format correctness or music quality; product workflows still require valid MIDI.
 
-The reporting adapter renders into a fresh temporary path beside the final
-destination. It checks that the new file exists and that supplied metadata
-matches the actual file size, temporary destination, MIDI format and tuning.
-It then atomically replaces the final destination and reports the final path.
-Failures discard staged output and preserve an existing final file. A simple
-timestamp comparison was rejected because valid overwrites can retain the
-same observed filesystem timestamps. The adapter does not
-parse MIDI or guarantee arbitrary plugin correctness. CLI/UI output still
-requires valid MIDI at the requested destination.
-Python components are trusted in-process code, not sandboxed plugins.
-Existing manifests do not serialize component objects or their provenance;
-custom experiments must record their implementation version and settings.
-No CLI registry or UI plugin selector is added.
+Existing manifests gain a component-provenance config member. Score and MIDI output remain subject to fixed-seed comparison against the current unmodified upstream, whose unrelated changes may differ from the earlier October snapshot. Custom runtime-object construction cannot be reconstructed from identity alone.
 
-See the [extension guide](../extending-components.md) for contracts and a
-checked example, and the [implementation record](../req-10-implementation.md)
-for file changes, compatibility evidence, and verification limits.
+See the [extension guide](../extending-components.md) for constructors and contracts and the [implementation record](../req-10-implementation.md) for exact verification and review-comment coverage.

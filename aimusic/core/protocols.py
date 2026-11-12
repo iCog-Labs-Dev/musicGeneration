@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Mapping, Protocol, Sequence
+from typing import Protocol, Sequence, runtime_checkable
 
-from aimusic.core.component_types import RenderResult, SymbolicNote, TrackInstrumentConfig
+from aimusic.core.component_types import RenderRequest, RenderResult
 from aimusic.core.config import DecodeConfig
 from aimusic.core.core_types import BeatState, Score
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import Vocabularies
 
-if TYPE_CHECKING:
-    from aimusic.theory.edo import EDO
-
-
+@runtime_checkable
 class TonalMetric(Protocol):
     """Finite nonnegative root/chord distances in the selected EDO."""
 
@@ -29,6 +26,7 @@ class TonalMetric(Protocol):
     ) -> float: ...
 
 
+@runtime_checkable
 class ScoreDecoder(Protocol):
     """A whole-path decoder returning a score and explicit next random key."""
 
@@ -46,32 +44,8 @@ class ScoreDecoder(Protocol):
     ) -> tuple[Score, RNGKey]: ...
 
 
+@runtime_checkable
 class ScoreRenderer(Protocol):
-    """Legacy renderer callable, retaining the existing None return type."""
+    """Write a score in the requested format and report the completed artifact."""
 
-    def __call__(
-        self,
-        notes: Sequence[SymbolicNote] | Score,
-        edo: EDO,
-        output_path: str,
-        ticks_per_beat: int = 480,
-        *,
-        track_instruments: Mapping[str, TrackInstrumentConfig] | None = None,
-    ) -> None: ...
-
-
-class ReportingScoreRenderer(Protocol):
-    """Write the requested artifact and report its location and details."""
-
-    def __call__(
-        self,
-        notes: Sequence[SymbolicNote] | Score,
-        edo: EDO,
-        output_path: str,
-        ticks_per_beat: int = 480,
-        *,
-        track_instruments: Mapping[str, TrackInstrumentConfig] | None = None,
-    ) -> RenderResult: ...
-
-
-Renderer = ScoreRenderer | ReportingScoreRenderer
+    def __call__(self, score: Score, request: RenderRequest) -> RenderResult: ...

@@ -80,19 +80,18 @@ The initial backend is **NumPy**, but the design should preserve the possibility
 
 ### 2.3 Replaceable music-generation components
 
-You can supply a different distance formula, candidate generator, whole-score decoder, or renderer through Python arguments. Omitting a replacement keeps the existing implementation. Runtime components are separate from saved configuration values.
+Use the shared application factory to select a distance formula, candidate generator, whole-score decoder, or renderer. Omitted selections keep the existing implementations. Select trusted installed factories with `--components components.json` in CLI generation/export or at UI startup (`python ui.py --components components.json`). CLI and UI record effective implementations, explicitly public options and known MIDI settings under manifest `config.components`. Constructor options stay private unless named in `public_options`; unpublished options contribute only a count. Python object injection remains available for embedding.
 
 | Interface | Location | Default implementation |
 | --- | --- | --- |
 | `TonalMetric` | `aimusic.core.protocols` | Existing tonal functions, exposed through `ExistingTonalMetric` |
 | `CandidateGenerator` | `aimusic.planning.protocols` | `MetricBoundCandidates`, which calls `get_valid_next_states` with the selected metric |
 | `ScoreDecoder` | `aimusic.core.protocols` | `decode_path_to_score` |
-| `ScoreRenderer` (legacy) | `aimusic.core.protocols` | `render_midi`, unchanged `None` return |
-| `ReportingScoreRenderer` | `aimusic.core.protocols` | `RenderResultAdapter`, returns saved path, format, size and tuning |
+| `ScoreRenderer` | `aimusic.core.protocols` | `MidiRenderer`, behind a format-neutral `RenderResultAdapter` |
 
-`run_method_a` accepts `tonal_metric` and `candidate_generator`. The CLI's Python generation handler, the UI artifact helper, and `render_exact_bridge_demo` also accept `decoder` and `renderer`. A `RenderResultAdapter` handles legacy and reporting renderers, with results exposed on demo/UI artifact objects. The shell commands and UI controls use the defaults; these arguments do not add a plugin selector to either interface.
+`run_method_a` accepts `tonal_metric` and `candidate_generator` in both single-pass and section-wise planning. CLI/UI resolve all four components through `aimusic.app.components.create_components`. The single renderer protocol accepts a `Score` and `RenderRequest`, returning `RenderResult` with path, format and file size. MIDI tuning/program settings are bound in the concrete adapter. Direct legacy `render_midi` calls keep their existing signature and `None` return. The demo is composed in `aimusic.app.demos`, with the old planning entry point retained as a compatibility delegate.
 
-The whole-score decoder differs from the existing per-beat `TrackGenerator`. Both keep explicit random keys. Rendering preserves the existing project `EDO` input and `None` return, and CLI/UI packaging requires valid MIDI output.
+The whole-score decoder differs from the existing per-beat `TrackGenerator`. Both keep explicit random keys. The neutral renderer returns `RenderResult`; direct legacy `render_midi` calls retain the project `EDO` input and `None` return. CLI/UI packaging requires valid MIDI output.
 
 Start with the [component extension guide](docs/extending-components.md) for a checked example and contracts. See the [REQ-10 implementation record](docs/req-10-implementation.md) for changes and verification, or [ADR-007](docs/decisions/ADR-007-pluggable-component-protocols.md) for the design decision.
 
@@ -355,7 +354,7 @@ Where:
 ---
 ## 8. Repository Organization
 
-The project is organized around the main `aimusic/` package, with tests kept separately under `tests/`. The codebase is grouped by responsibility so that core data structures, theory utilities, scoring logic, planning logic, rendering, and application entrypoints remain independent and easier to maintain.
+The project is organized around the main `aimusic/` package, with tests kept separately under `tests/`. The selected modules below show the main responsibilities and component extension points.
 
 ```text
 musicGeneration/
@@ -363,6 +362,9 @@ musicGeneration/
 │   ├── __init__.py
 │   ├── app/
 │   │   ├── __init__.py
+│   │   ├── cli.py
+│   │   ├── components.py
+│   │   ├── demos.py
 │   │   └── main.py
 │   ├── core/
 │   │   ├── __init__.py
@@ -390,10 +392,12 @@ musicGeneration/
 │   │   └── tonal.py
 │   └── render/
 │       ├── __init__.py
+│       ├── adapters.py
+│       ├── midi_adapter.py
 │       └── midi_render.py
 ├── tests/
 ├── requirements.txt
-└── README.md
+└── readme.md
 ```
 
 | Package / Module  | Responsibility |
@@ -403,7 +407,11 @@ musicGeneration/
 | `aimusic.app.main` | Application and demo entrypoint for running generation workflows. |
 | `aimusic.core.config` | Immutable configuration dataclasses for generation, EDO settings, scoring, and planning. |
 | `aimusic.core.core_types` | Canonical shared data types such as `BeatState`, `Layer`, `Edge`, `Score`, and related structures. |
-| `aimusic.core.component_types` | Shared candidate result/rejection and symbolic note/instrument data; old implementation-module imports remain aliases. |
+| `aimusic.core.component_types` | Validated candidate/note/instrument values and neutral rendering request/result; old implementation-module imports remain aliases. |
+| `aimusic.app.components` | Shared component configuration, construction, call-shape checks and manifest provenance. |
+| `aimusic.app.demos` | Application-owned composition of the compatibility bridge demo. |
+| `aimusic.render.midi_adapter` | Bound MIDI settings and the neutral score renderer implementation. |
+| `aimusic.render.adapters` | Format-neutral artifact validation and atomic publication. |
 | `aimusic.core.protocols` | Typed tonal-metric, whole-score decoder, and renderer interfaces. |
 | `aimusic.core.vocab` | Token vocabularies for meters, grooves, chords, keys, roles, and other symbolic categories. |
 | `aimusic.core.diagnostics` | Run manifests, SB diagnostics, tension curves, and structural diagnostics. |
