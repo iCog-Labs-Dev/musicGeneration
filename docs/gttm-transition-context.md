@@ -13,6 +13,16 @@ For a scoring call `prev_state=A, next_state=B`, `TransitionWindow.right_state=C
 represents the musical triple `A -> B -> C`. `TransitionWindow.left_state` is
 reserved for future features and is not consumed by the current registry.
 
+## Selected tonal metric
+
+Scoring helpers accept a keyword-only `tonal_metric`. The existing seven positional arguments of registered feature functions remain valid. The metric is an executable dependency; `TransitionWindow` continues to describe neighboring states only.
+
+`run_method_a` passes the selected metric to graph construction. The same choice reaches default candidate root proposals, endpoint-distance pruning, initial edge scoring, retained-edge rescoring, raw feature values, and weighted contributions. Application tension diagnostics receive it separately. `Prior.logp_next` keeps its existing signature; surrounding structural-scoring functions carry the metric.
+
+Omitting the metric uses the existing formulas and caches. Custom metrics bypass shared default distance caches and need not be hashable. Nearest-root ties remain deterministic. Cadence scoring still tests root distance against exactly `1`, so changing the metric's scale can change cadence decisions.
+
+See the [component extension guide](extending-components.md) for the metric contract and selection points, and [ADR-007](decisions/ADR-007-pluggable-component-protocols.md) for ownership and compatibility decisions.
+
 ## Chosen strategy: bounded two-pass rescoring
 
 Sparse expansion first constructs legal graph support using the existing

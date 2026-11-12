@@ -23,11 +23,15 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.core.core_types import Score, ScoreValidationError
+from aimusic.core.protocols import ScoreRenderer, ScoreDecoder, TonalMetric
+from aimusic.core.component_types import RenderRequest
+from aimusic.app.components import ComponentConfig, create_components, load_component_config
+from aimusic.render.midi_adapter import MidiRenderSettings
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
-from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, PlanningSection, run_method_a
-from aimusic.render import TrackInstrumentConfig, render_midi
+from aimusic.planning.protocols import CandidateGenerator
+from aimusic.render import TrackInstrumentConfig
 from aimusic.scoring.priors import NullPrior, Prior
 from aimusic.render.package import write_render_package
 from aimusic.scoring.tension import (
@@ -74,6 +78,8 @@ def _build_structural_diagnostics(
     vocabularies: Any,
     edo: int,
     sections: tuple[PlanningSection, ...] = (),
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> StructuralDiagnostics:
     decoded_states = path[:-1] if len(path) > 1 else path
     key_labels = [vocabularies.keys.token_for_id(state.key_id).label for state in decoded_states]
@@ -82,7 +88,9 @@ def _build_structural_diagnostics(
     groove_labels = [vocabularies.grooves.token_for_id(state.groove_id).label for state in decoded_states]
     boundaries = [float(index) for index, state in enumerate(decoded_states) if state.boundary_lvl > 0]
 
-    tension_curve = realized_tension_curve(decoded_states, vocabularies, edo)
+    tension_curve = realized_tension_curve(
+        decoded_states, vocabularies, edo, tonal_metric=tonal_metric,
+    )
     tension_target_curve = target_tension_curve(sections) if sections else []
     deviation = (
         compare_tension_curves(tension_target_curve, tension_curve, sections)
@@ -140,7 +148,15 @@ def _build_track_instruments(args: argparse.Namespace) -> dict[str, TrackInstrum
     return instruments
 
 
-def handle_generate(args: argparse.Namespace) -> None:
+def handle_generate(
+    args: argparse.Namespace,
+    *,
+    tonal_metric: TonalMetric | None = None,
+    candidate_generator: CandidateGenerator | None = None,
+    decoder: ScoreDecoder | None = None,
+    renderer: ScoreRenderer | None = None,
+    component_config: ComponentConfig | None = None,
+) -> None:
     """Run the current Method A pipeline and export score, MIDI, and manifest artifacts."""
     style_config = StyleConfig(
         allowed_meters=(args.meter,),
@@ -187,8 +203,18 @@ def handle_generate(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
         prior = load_trained_neural_prior(prior_bundle)
-    plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=args.seed), prior=prior)
-    score, _ = decode_path_to_score(
+    if component_config is not None and getattr(args, "components", None) is not None:
+        raise ValueError("supply one component configuration, not both an object and a file.")
+    components = create_components(
+        component_config if component_config is not None else load_component_config(getattr(args, "components", None)),
+        midi_settings=MidiRenderSettings(_build_edo(args).config, _build_track_instruments(args)),
+        tonal_metric=tonal_metric, candidate_generator=candidate_generator, decoder=decoder, renderer=renderer,
+    )
+    plan_result, next_key = run_method_a(
+        run_config, key=RNGKey(seed=args.seed), prior=prior,
+        tonal_metric=components.tonal_metric, candidate_generator=components.candidate_generator,
+    )
+    score, _ = components.decoder(
         plan_result.path,
         decode_config=decode_config,
         vocabularies=plan_result.vocabularies,
@@ -201,6 +227,7 @@ def handle_generate(args: argparse.Namespace) -> None:
         plan_result.vocabularies,
         edo=args.edo,
         sections=plan_result.endpoints.sections,
+        tonal_metric=components.tonal_metric,
     )
     manifest = RunManifest(
         seed=args.seed,
@@ -213,6 +240,7 @@ def handle_generate(args: argparse.Namespace) -> None:
                 "output_dir": args.out,
                 "track_instruments": _build_track_instruments(args),
                 "prior_type": "null" if isinstance(prior, NullPrior) else "configured",
+                "components": components.provenance,
             }
         ),
         structural_stats=structural_stats,
@@ -229,12 +257,9 @@ def handle_generate(args: argparse.Namespace) -> None:
     with score_path.open("w", encoding="utf-8") as f:
         json.dump(score.to_dict(), f, indent=2)
 
-    render_midi(
-        score,
-        _build_edo(args),
-        str(midi_path),
-        track_instruments=track_instruments,
-    )
+    render_result = components.renderer(score, RenderRequest(str(midi_path), "midi"))
+
+    midi_path = Path(render_result.output_path)
 
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest.to_dict(), f, indent=2)
@@ -392,7 +417,12 @@ def handle_inspect(args: argparse.Namespace) -> None:
     print("=========================================================\n")
 
 
-def handle_export(args: argparse.Namespace) -> None:
+def handle_export(
+    args: argparse.Namespace,
+    *,
+    renderer: ScoreRenderer | None = None,
+    component_config: ComponentConfig | None = None,
+) -> None:
     """Handle the export command by rendering a serialized Score to MIDI."""
     score_path = Path(args.file)
     data = _load_json_file(score_path, kind="score file")
@@ -406,13 +436,14 @@ def handle_export(args: argparse.Namespace) -> None:
     edo = _build_edo(args)
     output_path = Path(args.out) if args.out else score_path.with_suffix(".mid")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    render_midi(
-        score,
-        edo,
-        str(output_path),
-        track_instruments=_build_track_instruments(args),
+    if component_config is not None and getattr(args, "components", None) is not None:
+        raise ValueError("supply one component configuration, not both an object and a file.")
+    components = create_components(
+        component_config if component_config is not None else load_component_config(getattr(args, "components", None)),
+        midi_settings=MidiRenderSettings(edo.config, _build_track_instruments(args)), renderer=renderer,
     )
-    print(f"Exported multitrack MIDI to: {output_path}")
+    render_result = components.renderer(score, RenderRequest(str(output_path), "midi"))
+    print(f"Exported multitrack MIDI to: {render_result.output_path}")
 
 
 def handle_render_audio(args: argparse.Namespace) -> None:
@@ -485,6 +516,7 @@ def main() -> None:
         default=None,
         help="Path to a trained prior artifact bundle (requires optional [ml] extra).",
     )
+    gen_parser.add_argument("--components", type=str, default=None, help="JSON configuration selecting trusted installed component factories.")
     gen_parser.set_defaults(func=handle_generate)
 
     ins_parser = subparsers.add_parser("inspect", help="Inspect diagnostics")
@@ -527,6 +559,7 @@ def main() -> None:
         default=[],
         help="Treat the named symbolic track as percussion; repeatable.",
     )
+    exp_parser.add_argument("--components", type=str, default=None, help="JSON component configuration.")
     exp_parser.set_defaults(func=handle_export)
 
     render_parser = subparsers.add_parser(

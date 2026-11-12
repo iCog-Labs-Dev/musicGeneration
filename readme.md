@@ -78,6 +78,25 @@ Core algorithms should be written against a small backend interface.
 
 The initial backend is **NumPy**, but the design should preserve the possibility of using **JAX** later.
 
+### 2.3 Replaceable music-generation components
+
+Use the shared application factory to select a distance formula, candidate generator, whole-score decoder, or renderer. Omitted selections keep the existing implementations. Select trusted installed factories with `--components components.json` in CLI generation/export or at UI startup (`python ui.py --components components.json`). CLI and UI record effective implementations, explicitly public options and known MIDI settings under manifest `config.components`. Constructor options stay private unless named in `public_options`; unpublished options contribute only a count. Python object injection remains available for embedding.
+
+| Interface | Location | Default implementation |
+| --- | --- | --- |
+| `TonalMetric` | `aimusic.core.protocols` | Existing tonal functions, exposed through `ExistingTonalMetric` |
+| `CandidateGenerator` | `aimusic.planning.protocols` | `MetricBoundCandidates`, which calls `get_valid_next_states` with the selected metric |
+| `ScoreDecoder` | `aimusic.core.protocols` | `decode_path_to_score` |
+| `ScoreRenderer` | `aimusic.core.protocols` | `MidiRenderer`, behind a format-neutral `RenderResultAdapter` |
+
+`run_method_a` accepts `tonal_metric` and `candidate_generator` in both single-pass and section-wise planning. CLI/UI resolve all four components through `aimusic.app.components.create_components`. The single renderer protocol accepts a `Score` and `RenderRequest`, returning `RenderResult` with path, format and file size. MIDI tuning/program settings are bound in the concrete adapter. Direct legacy `render_midi` calls keep their existing signature and `None` return. The demo is composed in `aimusic.app.demos`, with the old planning entry point retained as a compatibility delegate.
+
+The whole-score decoder differs from the existing per-beat `TrackGenerator`. Both keep explicit random keys. The neutral renderer returns `RenderResult`; direct legacy `render_midi` calls retain the project `EDO` input and `None` return. CLI/UI packaging requires valid MIDI output.
+
+Start with the [component extension guide](docs/extending-components.md) for a checked example and contracts. See the [REQ-10 implementation record](docs/req-10-implementation.md) for changes and verification, or [ADR-007](docs/decisions/ADR-007-pluggable-component-protocols.md) for the design decision.
+
+Before presenting, follow the [manual browser and playback checks](docs/req-10-manual-checks.md). Automated replacement tests do not assess the browser experience or how the music sounds.
+
 ---
 
 ## 3. Setup and Installation
@@ -133,6 +152,12 @@ pip install -r requirements.txt
 
 This installs the required packages, including dependencies such as `mido` and `pytest`.
 
+For development checks, also install the editable package and its development extras:
+
+```bash
+pip install -e ".[dev]"
+```
+
 ---
 
 ## 4. Running Tests
@@ -151,6 +176,15 @@ This verifies that:
 - Functional math utilities behave as expected.
 - Planning and routing logic works correctly.
 - MIDI exports remain deterministic.
+
+The repository also requires lint and static type checks:
+
+```bash
+python -m flake8 aimusic tests ui.py
+python -m mypy aimusic tests ui.py
+```
+
+`tests/test_protocol_typing.py` checks the real component implementations against their protocols and verifies that incompatible examples are rejected. Type annotations describe callable shapes; behavior tests check actual results.
 
 ---
 
@@ -320,7 +354,7 @@ Where:
 ---
 ## 8. Repository Organization
 
-The project is organized around the main `aimusic/` package, with tests kept separately under `tests/`. The codebase is grouped by responsibility so that core data structures, theory utilities, scoring logic, planning logic, rendering, and application entrypoints remain independent and easier to maintain.
+The project is organized around the main `aimusic/` package, with tests kept separately under `tests/`. The selected modules below show the main responsibilities and component extension points.
 
 ```text
 musicGeneration/
@@ -328,11 +362,16 @@ musicGeneration/
 │   ├── __init__.py
 │   ├── app/
 │   │   ├── __init__.py
+│   │   ├── cli.py
+│   │   ├── components.py
+│   │   ├── demos.py
 │   │   └── main.py
 │   ├── core/
 │   │   ├── __init__.py
+│   │   ├── component_types.py
 │   │   ├── config.py
 │   │   ├── core_types.py
+│   │   ├── protocols.py
 │   │   ├── rng.py
 │   │   └── vocab.py
 │   ├── planning/
@@ -340,6 +379,7 @@ musicGeneration/
 │   │   ├── candidates.py
 │   │   ├── graph.py
 │   │   ├── plans.py
+│   │   ├── protocols.py
 │   │   └── sb.py
 │   ├── scoring/
 │   │   ├── __init__.py
@@ -352,10 +392,12 @@ musicGeneration/
 │   │   └── tonal.py
 │   └── render/
 │       ├── __init__.py
+│       ├── adapters.py
+│       ├── midi_adapter.py
 │       └── midi_render.py
 ├── tests/
 ├── requirements.txt
-└── README.md
+└── readme.md
 ```
 
 | Package / Module  | Responsibility |
@@ -365,6 +407,12 @@ musicGeneration/
 | `aimusic.app.main` | Application and demo entrypoint for running generation workflows. |
 | `aimusic.core.config` | Immutable configuration dataclasses for generation, EDO settings, scoring, and planning. |
 | `aimusic.core.core_types` | Canonical shared data types such as `BeatState`, `Layer`, `Edge`, `Score`, and related structures. |
+| `aimusic.core.component_types` | Validated candidate/note/instrument values and neutral rendering request/result; old implementation-module imports remain aliases. |
+| `aimusic.app.components` | Shared component configuration, construction, call-shape checks and manifest provenance. |
+| `aimusic.app.demos` | Application-owned composition of the compatibility bridge demo. |
+| `aimusic.render.midi_adapter` | Bound MIDI settings and the neutral score renderer implementation. |
+| `aimusic.render.adapters` | Format-neutral artifact validation and atomic publication. |
+| `aimusic.core.protocols` | Typed tonal-metric, whole-score decoder, and renderer interfaces. |
 | `aimusic.core.vocab` | Token vocabularies for meters, grooves, chords, keys, roles, and other symbolic categories. |
 | `aimusic.core.diagnostics` | Run manifests, SB diagnostics, tension curves, and structural diagnostics. |
 | `aimusic.core.rng` | Deterministic random-number-generation helpers used by sampling and planning code. |
@@ -374,6 +422,7 @@ musicGeneration/
 | `aimusic.scoring.priors` | Prior model interfaces, including `NullPrior`, placeholder `NeuralPrior`, manifests, and prior scoring utilities. |
 | `aimusic.scoring.rhythm_features` | Rhythm-related scoring helpers and compatibility layer over beat-state scoring. |
 | `aimusic.planning.candidates` | Candidate proposal and hard-gating logic for valid beat-level states. |
+| `aimusic.planning.protocols` | Typed candidate-generator interface with the existing proposal inputs and result/key pair. |
 | `aimusic.planning.graph` | Sparse layered-graph construction, layer expansion, edge building, and pruning. |
 | `aimusic.planning.plans` | Endpoint generation, section metadata, and orchestration for Method A and future Method B workflows. |
 | `aimusic.planning.sb` | Schrödinger Bridge solver, bridge extraction, trajectory sampling, and MAP path extraction. |
@@ -394,8 +443,10 @@ The current implementation progress is tracked below.
 - [x] Implement GTTM feature energies and a simple rule-based tonal distance metric.
 - [x] Implement candidate generation and sparse graph building with pruning.
 - [x] Implement the Schrödinger Bridge solver on sparse edges using the NumPy backend.
-- [ ] Implement Method A plan, then Method B.
-- [ ] Implement decoder components for drums, bass, comping, and lead.
+- [x] Implement the Method A planning workflow.
+- [ ] Implement the Method B workflow.
+- [x] Implement decoder components for drums, bass, comping, and lead.
+- [x] Formalize pluggable tonal metrics, candidate generators, whole-score decoders, and renderers (REQ-10).
 - [x] Implement MIDI rendering.
   - [x] 12-EDO direct mapping implemented.
   - [x] 19-EDO MPE rendering and cent-accuracy validation implemented.

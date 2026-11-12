@@ -6,12 +6,10 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 _logger = logging.getLogger(__name__)
 
-from aimusic.planning.candidates import (
-    CandidateGenerationResult,
-    CandidateRejection,
-    get_valid_next_states,
-    is_legal_transition,
-)
+from aimusic.planning.candidates import MetricBoundCandidates, is_legal_transition
+from aimusic.core.component_types import CandidateGenerationResult, CandidateRejection
+from aimusic.core.protocols import TonalMetric
+from aimusic.planning.protocols import CandidateGenerator
 from aimusic.core.config import PriorWeights, SBConfig, StyleConfig
 from aimusic.core.core_types import BeatState, Edge, Layer
 from aimusic.core.rng import RNGKey
@@ -26,7 +24,7 @@ from aimusic.scoring.priors import (
     calculate_transition_score_breakdowns,
 )
 from aimusic.scoring.gttm_features import FEATURE_REGISTRY, TransitionWindow
-from aimusic.theory.tonal import basic_space_distance, tonal_distance
+from aimusic.theory.tonal import chord_distance, root_distance
 from aimusic.core.vocab import (
     DEFAULT_VOCABULARIES,
     Vocabularies,
@@ -67,6 +65,8 @@ def _estimate_endpoint_distance(
     end_layer: Layer,
     vocabularies: Vocabularies,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Cheap distance-to-go heuristic used for K_max pruning."""
     if len(end_layer) == 0:
@@ -80,14 +80,15 @@ def _estimate_endpoint_distance(
     for target in end_layer:
         target_key = vocabularies.keys.token_for_id(target.key_id)
         target_chord = vocabularies.chords.token_for_id(target.chord_id)
-        harmonic = basic_space_distance(
+        harmonic = chord_distance(
             source_chord.root_pc,
             source_chord.quality,
             target_chord.root_pc,
             target_chord.quality,
             resolved_edo,
+            tonal_metric=tonal_metric,
         )
-        tonal = tonal_distance(source_key.root_pc, target_key.root_pc, resolved_edo)
+        tonal = root_distance(source_key.root_pc, target_key.root_pc, resolved_edo, tonal_metric=tonal_metric)
         structural = (
             abs(state.boundary_lvl - target.boundary_lvl)
             + abs(state.beat_in_bar - target.beat_in_bar) * 0.25
@@ -107,6 +108,8 @@ def _pruning_score(
     vocabularies: Vocabularies,
     style_config: StyleConfig,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     if steps_remaining == 1 and not any(
         is_legal_transition(
@@ -123,6 +126,7 @@ def _pruning_score(
         end_layer,
         vocabularies,
         edo=edo,
+        tonal_metric=tonal_metric,
     )
     horizon_scale = max(1, steps_remaining)
     return float(best_incoming_log_mass - (endpoint_distance / horizon_scale))
@@ -135,6 +139,8 @@ def _edge_priority_score(
     vocabularies: Vocabularies,
     style_config: StyleConfig,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     if steps_remaining == 1 and not any(
         is_legal_transition(
@@ -154,6 +160,7 @@ def _edge_priority_score(
                 end_layer,
                 vocabularies,
                 edo=edo,
+                tonal_metric=tonal_metric,
             )
             / max(1, steps_remaining)
         )
@@ -411,6 +418,7 @@ def _rescore_retained_edges_with_windows(
     weights: Optional[PriorWeights],
     vocabularies: Vocabularies,
     edo: int,
+    tonal_metric: TonalMetric | None = None,
     section_context: Optional[PriorContext] = None,
     stitch_policy: Optional[StitchPolicy] = None,
 ) -> tuple[Tuple[Tuple[Edge, ...], ...], Tuple[Tuple[EdgeScoreDiagnostics, ...], ...]]:
@@ -467,6 +475,7 @@ def _rescore_retained_edges_with_windows(
             weights=weights,
             vocabularies=vocabularies,
             edo=edo,
+            tonal_metric=tonal_metric,
         )
         offset = 0
         rescored_pairs: list[tuple[Edge, EdgeScoreDiagnostics]] = []
@@ -537,7 +546,41 @@ def _candidate_result_for_target_layer(
         source_state=prev_state,
         states=tuple(accepted),
         rejections=tuple(rejections),
+        proposed_count=len(target_layer.states),
+        unique_count=len(target_layer.states),
     )
+
+
+def _validate_supplied_candidates(
+    result: CandidateGenerationResult,
+    key: RNGKey,
+    source: BeatState,
+    time_index: int,
+    style: StyleConfig,
+    vocabularies: Vocabularies,
+) -> None:
+    if not isinstance(result, CandidateGenerationResult):
+        raise TypeError("candidate_generator must return a CandidateGenerationResult.")
+    if not isinstance(key, RNGKey):
+        raise TypeError("candidate_generator must return an RNGKey.")
+    result.validate()
+    if result.source_state != source or result.time_index != time_index:
+        raise ValueError("candidate_generator result must match the requested source and time.")
+    for candidate in result.states:
+        identifiers = (
+            (vocabularies.meters, candidate.meter_id),
+            (vocabularies.keys, candidate.key_id),
+            (vocabularies.chords, candidate.chord_id),
+            (vocabularies.roles, candidate.role_id),
+            (vocabularies.heads, candidate.head_id),
+            (vocabularies.grooves, candidate.groove_id),
+            (vocabularies.boundaries, candidate.boundary_lvl),
+        )
+        if any(not vocabulary.has_id(identifier) for vocabulary, identifier in identifiers):
+            raise ValueError("candidate_generator returned an unknown vocabulary identifier.")
+        legal, reason = is_legal_transition(source, candidate, style, vocabularies)
+        if not legal:
+            raise ValueError(f"candidate_generator returned an illegal transition: {reason}")
 
 
 def build_sparse_graph(
@@ -555,6 +598,8 @@ def build_sparse_graph(
     d_max: int,
     proposal_budget: Optional[int] = None,
     prior_guided_proposals: Optional[bool] = None,
+    tonal_metric: TonalMetric | None = None,
+    candidate_generator: CandidateGenerator | None = None,
     section_context: Optional[PriorContext] = None,
     stitch_policy: Optional[StitchPolicy] = None,
 ) -> tuple[SparseGraph, RNGKey]:
@@ -576,7 +621,11 @@ def build_sparse_graph(
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
 
-    resolved_sb = SBConfig() if sb_config is None else sb_config
+    if isinstance(d_max, bool) or not isinstance(d_max, int) or d_max < 1:
+        raise ValueError("d_max must be a positive integer.")
+    resolved_sb = SBConfig(d_max=d_max) if sb_config is None else sb_config
+    if d_max != resolved_sb.d_max:
+        raise ValueError("d_max must equal sb_config.d_max; proposal_budget controls proposals separately.")
     if resolved_sb.max_horizon_per_solve is not None and total_beats > resolved_sb.max_horizon_per_solve:
         raise ValueError(
             f"Graph horizon {total_beats} exceeds max_horizon_per_solve="
@@ -585,6 +634,9 @@ def build_sparse_graph(
     resolved_style = StyleConfig() if style_config is None else style_config
     resolved_vocabs = _resolved_vocabs(vocabularies)
     resolved_prior = _resolved_prior(prior)
+    resolved_candidates: CandidateGenerator = (
+        MetricBoundCandidates(tonal_metric) if candidate_generator is None else candidate_generator
+    )
     resolved_edo = _edo_size(resolved_vocabs) if edo is None else edo
     validate_vocabulary_compatibility(resolved_vocabs, resolved_edo)
     resolved_proposal_budget = (
@@ -626,7 +678,7 @@ def build_sparse_graph(
             if state not in remaining_costs:
                 remaining_costs[state] = -_pruning_score(
                     state, 0.0, steps_remaining, end_layer, resolved_vocabs,
-                    resolved_style, edo=resolved_edo,
+                    resolved_style, edo=resolved_edo, tonal_metric=tonal_metric,
                 )
             return remaining_costs[state]
 
@@ -649,7 +701,7 @@ def build_sparse_graph(
                     vocabularies=resolved_vocabs,
                 )
             else:
-                candidate_result, current_key = get_valid_next_states(
+                candidate_result, current_key = resolved_candidates(
                     source_state,
                     current_time,
                     style_config=resolved_style,
@@ -658,12 +710,18 @@ def build_sparse_graph(
                     context=_build_prior_context(source_state, end_layer, current_time, section_context),
                     edo=resolved_edo,
                     key=current_key,
-                    d_max=d_max,
+                    d_max=resolved_sb.d_max,
                     proposal_budget=resolved_proposal_budget,
                     prior_guided_proposals=resolved_prior_guided_proposals,
                 )
+                if candidate_generator is not None:
+                    _validate_supplied_candidates(
+                        candidate_result, current_key, source_state, current_time,
+                        resolved_style, resolved_vocabs,
+                    )
 
-            raw_candidate_count += candidate_result.proposed_count
+            if not final_step:
+                raw_candidate_count += candidate_result.proposed_count
             legal_candidate_count += candidate_result.legal_count
             scored_candidate_count += candidate_result.scored_count
             rejected.extend(candidate_result.rejections)
@@ -689,6 +747,7 @@ def build_sparse_graph(
                     weights=weights,
                     vocabularies=resolved_vocabs,
                     edo=resolved_edo,
+                    tonal_metric=tonal_metric,
                 )
                 if queries
                 else ()
@@ -792,6 +851,7 @@ def build_sparse_graph(
         weights=weights,
         vocabularies=resolved_vocabs,
         edo=resolved_edo,
+        tonal_metric=tonal_metric,
         section_context=section_context,
         stitch_policy=stitch_policy,
     )

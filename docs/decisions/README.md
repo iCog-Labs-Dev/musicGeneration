@@ -1,4 +1,4 @@
-# Integration ADRs
+# Architecture decisions
 
 | ID | Title | Status |
 |----|-------|--------|
@@ -8,5 +8,6 @@
 | [ADR-004](ADR-004-defer-host-conditioned-planning.md) | Defer B4 host planning | Accepted (deferred) |
 | [ADR-005](ADR-005-candidate-proposal-budget.md) | Candidate proposal budget separate from D_max | Accepted |
 | [ADR-006](ADR-006-track-generator-pure-functions.md) | Pure state/window/RNG track-generator functions | Accepted |
+| [ADR-007](ADR-007-pluggable-component-protocols.md) | Pluggable component protocols with existing types | Accepted |
 
-Operational notes also accumulate in repo-root [`DECISIONS.md`](../../../DECISIONS.md).
+Operational notes for audio also accumulate in repo-root [`DECISIONS.md`](../../DECISIONS.md).

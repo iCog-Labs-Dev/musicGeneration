@@ -6,13 +6,17 @@ from functools import lru_cache
 from typing import Callable, Dict, List, Mapping, Optional
 
 from aimusic.core.config import PriorWeights
+from aimusic.core.protocols import TonalMetric
 from aimusic.core.core_types import BeatState
 from aimusic.theory.tonal import (
     basic_space_distance,
     is_dominant,
     is_tonic_family,
     nearest_roots,
-    tonal_distance,
+    ExistingTonalMetric,
+    root_distance,
+    chord_distance,
+    nearest_roots_for_metric,
 )
 from aimusic.core.vocab import (
     DEFAULT_VOCABULARIES,
@@ -291,6 +295,17 @@ def _cached_basic_space_distance(
     return basic_space_distance(a_root, a_quality, b_root, b_quality, edo)
 
 
+def _selected_chord_distance(
+    a_root: int, a_quality: str, b_root: int, b_quality: str, edo: int,
+    *, tonal_metric: TonalMetric | None = None,
+) -> float:
+    if tonal_metric is None or type(tonal_metric) is ExistingTonalMetric:
+        return _cached_basic_space_distance(a_root, a_quality, b_root, b_quality, edo)
+    return chord_distance(
+        a_root, a_quality, b_root, b_quality, edo, tonal_metric=tonal_metric,
+    )
+
+
 def harmonic_distance_cache_info():
     """Expose tonal-distance cache info for diagnostics/tests."""
     return _cached_basic_space_distance.cache_info()
@@ -309,6 +324,8 @@ def meter_stability_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters, vocabularies, edo
     return 1.0 if prev_state.meter_id == next_state.meter_id else -1.0
@@ -322,6 +339,8 @@ def beat_position_validity_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del prev_state, t, window, vocabularies, edo
     return beat_position_penalty(next_state, meters)
@@ -335,6 +354,8 @@ def boundary_placement_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del prev_state, t, window, vocabularies, edo
     return boundary_alignment_score(next_state, meters)
@@ -348,6 +369,8 @@ def strong_beat_bias_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del prev_state, t, window, vocabularies, edo
     return strong_beat_alignment(next_state, meters)
@@ -361,6 +384,8 @@ def grouping_onset_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters, vocabularies, edo
     if next_state.boundary_lvl <= 0:
@@ -378,6 +403,8 @@ def grouping_boundary_resolution_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, vocabularies, edo
     if window is None:
@@ -393,6 +420,8 @@ def local_grouping_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Backward-compatible alias for the windowed grouping-resolution feature."""
     return grouping_boundary_resolution_feature(
@@ -414,6 +443,8 @@ def grouping_downbeat_alignment_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del prev_state, t, window, vocabularies, edo
     if next_state.boundary_lvl < 2:
@@ -434,6 +465,8 @@ def harmonic_key_proximity_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -442,7 +475,7 @@ def harmonic_key_proximity_feature(
     if key_a is None or key_b is None:
         return -1.0
     resolved_edo = _resolve_edo(resolved_vocabs, edo)
-    distance = tonal_distance(key_a.root_pc, key_b.root_pc, resolved_edo)
+    distance = root_distance(key_a.root_pc, key_b.root_pc, resolved_edo, tonal_metric=tonal_metric)
     return 1.0 / (1.0 + distance)
 
 
@@ -454,6 +487,8 @@ def harmonic_key_neighbor_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -464,7 +499,7 @@ def harmonic_key_neighbor_feature(
     resolved_edo = _resolve_edo(resolved_vocabs, edo)
     if key_a.root_pc == key_b.root_pc:
         return 0.6
-    neighbors = nearest_roots(key_a.root_pc, resolved_edo, limit=3)
+    neighbors = nearest_roots_for_metric(key_a.root_pc, resolved_edo, limit=3, tonal_metric=tonal_metric)
     return 0.4 if key_b.root_pc in neighbors else -0.35
 
 
@@ -476,6 +511,8 @@ def harmonic_chord_proximity_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -484,12 +521,13 @@ def harmonic_chord_proximity_feature(
     if chord_a is None or chord_b is None:
         return -1.0
     resolved_edo = _resolve_edo(resolved_vocabs, edo)
-    distance = _cached_basic_space_distance(
+    distance = _selected_chord_distance(
         chord_a.root_pc,
         chord_a.quality,
         chord_b.root_pc,
         chord_b.quality,
         resolved_edo,
+        tonal_metric=tonal_metric,
     )
     return 1.0 / (1.0 + distance)
 
@@ -502,6 +540,8 @@ def cadential_harmonic_motion_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -513,7 +553,7 @@ def cadential_harmonic_motion_feature(
 
     resolved_edo = _resolve_edo(resolved_vocabs, edo)
     is_cadential_motion = (
-        tonal_distance(chord_a.root_pc, chord_b.root_pc, resolved_edo) == 1
+        root_distance(chord_a.root_pc, chord_b.root_pc, resolved_edo, tonal_metric=tonal_metric) == 1
         and is_dominant(chord_a.quality)
         and is_tonic_family(chord_b.quality)
     )
@@ -533,6 +573,8 @@ def role_meter_alignment_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del prev_state, t, window, edo
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -559,6 +601,8 @@ def role_transition_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters, edo
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -579,6 +623,8 @@ def head_anchor_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del prev_state, t, window, edo
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -611,6 +657,8 @@ def head_resolution_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters, edo
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -636,6 +684,8 @@ def groove_continuity_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters, edo
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -658,6 +708,8 @@ def groove_boundary_change_feature(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     del t, window, meters, edo
     resolved_vocabs = _resolve_vocabularies(vocabularies)
@@ -760,6 +812,8 @@ def transition_feature_vector(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> Dict[str, float]:
     """Compute the raw BeatState feature vector for one transition."""
     meter_map = _resolve_meters(meters)
@@ -775,6 +829,7 @@ def transition_feature_vector(
             meter_map,
             resolved_vocabs,
             resolved_edo,
+            tonal_metric=tonal_metric,
         )
         for name, spec in FEATURE_REGISTRY.items()
     }
@@ -788,6 +843,8 @@ def transition_family_scores(
     meters: Optional[Mapping[int, MeterSpec]] = None,
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> Dict[str, float]:
     """Aggregate raw feature values by the six recommended feature families."""
     family_scores: Dict[str, float] = {
@@ -806,6 +863,7 @@ def transition_family_scores(
         meters=meters,
         vocabularies=vocabularies,
         edo=edo,
+        tonal_metric=tonal_metric,
     )
     for name, value in raw_features.items():
         family_scores[FEATURE_REGISTRY[name].family] += value
@@ -821,6 +879,8 @@ def weighted_feature_breakdown(
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
     weights: Optional[PriorWeights] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> Dict[str, float]:
     """Return the weighted contribution of every named feature."""
     resolved_weights = PriorWeights() if weights is None else weights
@@ -832,6 +892,7 @@ def weighted_feature_breakdown(
         meters=meters,
         vocabularies=vocabularies,
         edo=edo,
+        tonal_metric=tonal_metric,
     )
     breakdown: Dict[str, float] = {}
     for name, value in raw_features.items():
@@ -849,6 +910,8 @@ def calculate_gttm_score(
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
     weights: Optional[PriorWeights] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Return the weighted structural preference score for a transition."""
     return float(
@@ -862,6 +925,7 @@ def calculate_gttm_score(
                 vocabularies=vocabularies,
                 edo=edo,
                 weights=weights,
+                tonal_metric=tonal_metric,
             ).values()
         )
     )
@@ -876,6 +940,8 @@ def calculate_gttm_energy(
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
     weights: Optional[PriorWeights] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Return a graph-friendly energy, where lower is structurally better."""
     return -calculate_gttm_score(
@@ -887,6 +953,7 @@ def calculate_gttm_energy(
         vocabularies=vocabularies,
         edo=edo,
         weights=weights,
+        tonal_metric=tonal_metric,
     )
 
 
@@ -899,6 +966,8 @@ def transition_energy(
     vocabularies: Optional[Vocabularies] = None,
     edo: Optional[int] = None,
     weights: Optional[PriorWeights] = None,
+    *,
+    tonal_metric: TonalMetric | None = None,
 ) -> float:
     """Backward-compatible alias for the weighted structural score."""
     return calculate_gttm_score(
@@ -910,4 +979,5 @@ def transition_energy(
         vocabularies=vocabularies,
         edo=edo,
         weights=weights,
+        tonal_metric=tonal_metric,
     )

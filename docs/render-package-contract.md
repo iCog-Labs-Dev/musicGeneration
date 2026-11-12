@@ -52,6 +52,18 @@ Violations raise `ContractViolation` and abort the run.
 
 ## Emission policy
 
+### Supplied renderer requirement
+
+REQ-10 workflows receive a single `ScoreRenderer(Score, RenderRequest) -> RenderResult` selected by the shared application factory. The request and result are format-neutral. The concrete MIDI adapter owns tuning and instrument settings and delegates to the established `render_midi` function, whose direct signature and None return are unchanged.
+
+CLI packaging and UI preview still request valid MIDI. The neutral adapter supplies a fresh sibling temporary path, requires a regular completed file and matching path/format/byte-size report, then atomically replaces the final destination. Missing files, non-regular files, incorrect reports and renderer exceptions prevent a new success manifest/package and preserve any previous final MIDI. Already-written score JSON and unrelated artifacts are not rolled back.
+
+CLI and UI manifests add `config.components` with effective factory selections, implementation identities, explicitly public options and known MIDI construction settings. Constructor options are private by default; `public_options` names shareable values and the rest contribute only an unpublished-option count. Runtime overrides have honest unknown-options markers. Built-in MIDI renderers must match the run's settings, including through our artifact wrappers. The top-level manifest/package layout is unchanged.
+
+The CLI owns score JSON, manifest, structure, tuning and package emission. The UI helper emits flat score/MIDI/manifest files for preview/download and does not create a RenderPackage. See the [component extension guide](extending-components.md).
+
+### Product output
+
 **Always** emit a RenderPackage from product `generate` (cheap; every symbolic run
 is audio-ready). Legacy flat artifacts (`{run_id}_score.json`, `.mid`,
 `_manifest.json`) remain for Gradio/UI compatibility.
@@ -64,3 +76,4 @@ Audio may fill `inferred` / `host` only when planner structure is missing; then
 
 - `tests/test_render_package.py` — write/load/invariants + CLI generate emits package
 - `tests/test_architecture.py` — import quarantine
+- `tests/test_artifact_injection.py` — supplied decoder/renderer output reaches real MIDI packaging

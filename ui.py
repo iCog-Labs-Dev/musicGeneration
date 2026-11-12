@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+from functools import partial
 import base64
 import html
 import json
@@ -26,13 +28,15 @@ from aimusic.core.config import (
     StyleConfig,
 )
 from aimusic.core.diagnostics import RunManifest, SBDiagnostics
+from aimusic.core.protocols import ScoreRenderer, ScoreDecoder, TonalMetric
+from aimusic.app.components import ComponentConfig, create_components, load_component_config
+from aimusic.core.component_types import RenderRequest, RenderResult
+from aimusic.render.midi_adapter import MidiRenderSettings
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
-from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, run_method_a
-from aimusic.render import render_midi
+from aimusic.planning.protocols import CandidateGenerator
 from aimusic.render.midi_render import TrackInstrumentConfig
-from aimusic.theory.edo import EDO
 
 
 DEFAULT_SECTION_NAMES = ("intro", "theme", "bridge", "return")
@@ -82,6 +86,7 @@ class GeneratedArtifacts:
     midi_path: Path
     manifest_path: Path
     wav_path: Path
+    render_result: RenderResult | None = None
 
 
 @dataclass(frozen=True)
@@ -223,7 +228,15 @@ def _build_track_instruments(params: GenerationParams) -> dict[str, TrackInstrum
     return instruments
 
 
-def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
+def _generate_artifacts(
+    params: GenerationParams,
+    *,
+    tonal_metric: TonalMetric | None = None,
+    candidate_generator: CandidateGenerator | None = None,
+    decoder: ScoreDecoder | None = None,
+    renderer: ScoreRenderer | None = None,
+    component_config: ComponentConfig | None = None,
+) -> GeneratedArtifacts:
     if params.section_wise and params.beats < len(DEFAULT_SECTION_NAMES):
         raise ValueError(
             "Section-wise planning needs at least 4 beats for intro/theme/bridge/return. "
@@ -253,8 +266,20 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         ),
     )
 
-    plan_result, next_key = run_method_a(run_config, key=RNGKey(seed=params.seed))
-    score, _ = decode_path_to_score(
+    components = create_components(
+        component_config,
+        midi_settings=MidiRenderSettings(
+            EDOConfig(n=params.edo, base_tuning=0, pitch_bend_range=params.pitch_bend_range,
+                      microtonal_rendering_method=MicrotonalRendering[params.rendering_method]),
+            _build_track_instruments(params),
+        ),
+        tonal_metric=tonal_metric, candidate_generator=candidate_generator, decoder=decoder, renderer=renderer,
+    )
+    plan_result, next_key = run_method_a(
+        run_config, key=RNGKey(seed=params.seed),
+        tonal_metric=components.tonal_metric, candidate_generator=components.candidate_generator,
+    )
+    score, _ = components.decoder(
         plan_result.path,
         decode_config=decode_config,
         vocabularies=plan_result.vocabularies,
@@ -267,6 +292,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         plan_result.vocabularies,
         edo=params.edo,
         sections=plan_result.endpoints.sections,
+        tonal_metric=components.tonal_metric,
     )
     track_instruments = _build_track_instruments(params)
     manifest = RunManifest(
@@ -280,6 +306,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
                 "output_dir": str(OUTPUT_DIR),
                 "pitch_bend_range": params.pitch_bend_range,
                 "rendering_method": params.rendering_method,
+                "components": components.provenance,
                 "track_instruments": track_instruments,
             }
         ),
@@ -296,19 +323,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
     with score_path.open("w", encoding="utf-8") as f:
         json.dump(score.to_dict(), f, indent=2)
 
-    render_midi(
-        score,
-        EDO(
-            EDOConfig(
-                n=params.edo,
-                base_tuning=0,
-                pitch_bend_range=params.pitch_bend_range,
-                microtonal_rendering_method=MicrotonalRendering[params.rendering_method],
-            )
-        ),
-        str(midi_path),
-        track_instruments=track_instruments,
-    )
+    render_result = components.renderer(score, RenderRequest(str(midi_path), "midi"))
 
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest.to_dict(), f, indent=2)
@@ -319,6 +334,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         midi_path=midi_path,
         manifest_path=manifest_path,
         wav_path=wav_path,
+        render_result=render_result,
     )
 
 
@@ -865,6 +881,7 @@ def generate_music(
     lead_program: Any,
     drum_track: list[str],
     section_wise: bool = True,
+    *, component_config: ComponentConfig | None = None,
 ) -> tuple[
     str,
     dict[str, Any],
@@ -895,7 +912,7 @@ def generate_music(
             drum_track,
             section_wise,
         )
-        artifacts = _generate_artifacts(params)
+        artifacts = _generate_artifacts(params, component_config=component_config)
         summary = _score_summary(artifacts.score_path, artifacts.manifest_path)
         table = _score_table(artifacts.score_path, artifacts.manifest_path)
     except Exception:
@@ -954,6 +971,17 @@ css = """
     input[type=number] { padding: 1px 4px !important; }
     .drum-check .wrap { display: flex !important; flex-direction: row !important; flex-wrap: wrap !important; gap: 12px !important; }
 """
+
+def _startup_component_config() -> ComponentConfig | None:
+    if __name__ != "__main__":
+        return None
+    parser = argparse.ArgumentParser(description="Music generation UI")
+    parser.add_argument("--components", help="Trusted local JSON component configuration")
+    return load_component_config(parser.parse_args().components)
+
+
+startup_component_config = _startup_component_config()
+
 
 with gr.Blocks(title="MIDI Generator", fill_height=True) as demo:
     gr.Markdown("## MIDI Generator <small style='font-weight:700;color:#9aa4b2;font-size:14px'>  | write configs and click 'generate'</small>")
@@ -1046,7 +1074,7 @@ with gr.Blocks(title="MIDI Generator", fill_height=True) as demo:
                     manifest_download.visible = False
 
     generate_button.click(  # type: ignore[attr-defined]
-        fn=generate_music,
+        fn=partial(generate_music, component_config=startup_component_config),
         inputs=[
             seed,
             beats,
