@@ -137,11 +137,11 @@ Final measured local results on 12 November 2026:
 | Default real 12/19-EDO generation | Score/MIDI byte-identical to upstream 44902dc; manifests, public provenance and packages validate |
 | Actual configured Gradio server | Startup config, real HTTP callbacks and three downloads pass in both tunings; private constructor values absent |
 | Exact extension-guide example | Passes mypy and writes real 19-EDO MIDI |
-| Structured autoreview | Earlier findings fixed; final rerun stopped at the external Codex usage limit and produced no verdict. No final clean result is claimed. |
+| Structured autoreview | Post-reset review of code commit `1bf1a3e` completed cleanly with zero actionable findings. |
 
 The command archive is `../REQ-10-planning/evidence/mentor-revision-closeout`; final normalization checks/artifacts are under `mentor-revision-canonical`. The full run began before the last absent/empty normalization, followed by the 16-method focused suite and fresh final-source type, lint, syntax, guide, default-artifact and live-UI checks. The earlier 447/449-case runs and all review findings remain in their historical evidence folders.
 
-The final external reviewer reached a service usage limit during read-only inspection. Its automatic approval layer rejected that inspection and the process exited without structured findings or a correctness verdict. This is an incomplete review, not a clean review or an outstanding confirmed code defect. Publication must disclose this limit; a new completed external review remains pending when service access resumes.
+An earlier external review attempt reached a service usage limit during read-only inspection. Its automatic approval layer rejected that inspection and the process exited without a verdict. After the reported reset, a new review of code commit `1bf1a3e` completed with zero actionable findings and a "patch is correct" result. Both the failed attempt and successful retry are preserved. The final documentation update records that measured result without changing production code.
 
 Default CLI regression uses seed 11/four beats in 12/19 EDO. Score JSON/MIDI must match current upstream byte for byte, with 28 notes each. Stable manifests must match except run ID, timestamp, output directory and separately validated new component provenance. RenderPackages must load and agree with standalone scores/MIDI and requested tuning.
 
