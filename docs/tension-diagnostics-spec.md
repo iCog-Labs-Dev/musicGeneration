@@ -128,14 +128,16 @@ Walks consecutive pairs in `path`, calling `beat_tension` for each beat index,
 returning `(time, tension)` pairs. This is what replaces `cli.py`'s inline
 `ROLE_TENSION` logic and the dead `compute_tension_curve`.
 
-### 4.5 `target_tension_curve(sections: Sequence[PlanningSection]) -> List[Tuple[float, float]]`
+### 4.5 `target_tension_curve(sections: Union[SectionTimeline, Sequence[PlanningSection]]) -> List[Tuple[float, float]]`
 
-For each section, linearly interpolates its `target_tension_arc` (which may
-have more than 2 control points — see `PlanningSection.__post_init__`,
-minimum length 2) across `[start_time, end_time)`, producing one `(time,
-value)` sample per beat, matching the time indexing used by
-`realized_tension_curve` so the two curves are directly comparable
-point-for-point.
+Delegates directly to `SectionTimeline` (eliminating duplicated interpolation logic).
+The curve index $k$ is the ARRIVAL beat (same as `realized_tension_curve`), producing
+samples across $k \in [0, \text{total\_beats}]$ point-for-point aligned with `realized_tension_curve`.
+Similarly, `target_tension_at_time(sections, t)` delegates to `SectionTimeline.target_tension(t)`.
+
+Target deviation energy is computed by `transition_target_tension_energy(tau_hat, tau_star, sigma)` as:
+$$E_\tau = \frac{(\hat{\tau} - \tau^*)^2}{2\sigma_\tau^2}$$
+where $\sigma_\tau$ is the tolerance parameter in tension units: a deviation of exactly $\sigma_\tau$ costs 0.5 nat before $\lambda_\tau$ scaling (Decision D2).
 
 ### 4.6 `TensionDeviationReport` + `compare_tension_curves(target, realized, sections) -> TensionDeviationReport`
 
@@ -280,3 +282,52 @@ mocks needed — these are plain dataclasses), following the existing style in
   upstream (`build_section_plan` in `plans.py`) — we consume it as-is.
 - Any change to `tonal_distance` / `basic_space_distance` themselves — they're
   correct and tested; we're wiring them in, not modifying them.
+
+---
+
+## 8. Transition Diagnostic Schema & Conventions (Schema v0.2.0)
+
+### 8.1 Arrival-Index Convention
+The repository enforces a strict arrival-index convention across planning, scoring, and diagnostics:
+- State $s_k$ belongs to $\text{section}(k)$ via timeline lookup at index $k$.
+- Edge $t$ connects source state $s_t$ (at $k-1$) to arrival target state $s_{t+1}$ (at $k = t+1$).
+- Edge $t$ scores arrival state $s_{t+1}$: all edge-level section metadata, target-tension, and boundary lookups use $k = t + 1$.
+- Realized arrival tension for edge $t$ is $\text{beat\_tension}(\text{path}[k-1], \text{path}[k]) = \text{beat\_tension}(s_t, s_{t+1})$.
+
+### 8.2 TransitionDiagnostic Field Reference
+
+| Field | Type | Meaning | Units / Interpretation |
+|---|---|---|---|
+| `time_index` | `int` | Transition edge index $t$ | Discrete edge index $0 \le t < T$ |
+| `arrival_time` | `int` | Beat time index $k = t + 1$ of the arrival state | Discrete beat time index $1 \le k \le T$ |
+| `section_name` | `str` | Name of the section governing the arrival beat $k$ | Categorical section identifier (e.g., `"A"`, `"B"`) |
+| `section_index` | `int` | Zero-based index of the governing section in the section plan | Integer index $0, 1, \dots$ |
+| `is_section_start` | `bool` | True if arrival beat $k$ is the first beat of a section | Boolean flag |
+| `source_state` | `BeatState` | Structural state at departure beat $t$ | Frozen `BeatState` tuple |
+| `target_state` | `BeatState` | Structural state at arrival beat $t+1$ | Frozen `BeatState` tuple |
+| `data_logp` | `float` | Log-probability from corpus prior $P(s_{t+1} \mid s_t)$ | Dimensionless log-probability ($\le 0$) |
+| `data_contribution` | `float` | Weighted data prior contribution: $\lambda_{\text{data}} \cdot \text{data\_logp}$ | Log-weight contribution |
+| `gttm_raw_features` | `Mapping[str, float]` | Raw feature values evaluated for this transition | Feature-specific units/ranges |
+| `gttm_weighted_features` | `Mapping[str, float]` | Feature contributions weighted by individual feature weights | Feature weight $\cdot$ raw feature |
+| `gttm_family_breakdown` | `Mapping[str, float]` | Sum of raw feature values aggregated by the 6 GTTM families | Aggregated raw feature sums per family |
+| `gttm_contribution` | `float` | Weighted GTTM prior contribution: $-\lambda_{\text{gttm}} \cdot E_{\text{gttm}} = \lambda_{\text{gttm}} \cdot \text{gttm\_score}$ | Log-weight contribution |
+| `target_tension` | `float` | Author-specified target tension $\tau^*(t+1)$ at arrival beat | Dimensionless tension in $[0, 1]$ |
+| `realized_tension` | `float` | Realized tension $\hat{\tau} = \text{beat\_tension}(s_t, s_{t+1})$ | Dimensionless tension in $[0, 1]$ |
+| `tension_deviation` | `float` | Signed deviation $\hat{\tau} - \tau^*(t+1)$ | Difference in tension units |
+| `target_tension_energy` | `float` | Quadratic tracking penalty $E_\tau = \frac{(\hat{\tau} - \tau^*)^2}{2\sigma_\tau^2}$ | Dimensionless energy ($\ge 0$) |
+| `target_tension_contribution` | `float` | Weighted target tension penalty: $\lambda_{\text{target\_tension}} \cdot E_\tau$ | Log-weight penalty ($\ge 0$) |
+| `section_style_components` | `Mapping[str, float]` | Unweighted style mismatch components (meter, groove, role, key, boundary, start alignment) | Component mismatch penalty in $[0, 1]$ |
+| `section_style_energy` | `float` | Total section-style energy $E_{\text{style}}$ | Dimensionless energy ($\ge 0$) |
+| `section_style_contribution` | `float` | Weighted section-style penalty: $\lambda_{\text{section\_style}} \cdot E_{\text{style}}$ | Log-weight penalty ($\ge 0$) |
+| `stitch_cost` | `float` | Transition stitch penalty under active `StitchPolicy` | Log-weight penalty ($\ge 0$) |
+| `final_log_weight` | `float` | Edge log-weight in planning graph: $\text{data} + \text{gttm} - \text{target\_tension} - \text{section\_style} - \text{stitch\_cost}$ | Total edge log weight in SB bridge |
+| `right_context_states` | `Tuple[BeatState, ...]` | Successor lookahead states used for window averaging | Sequence of `BeatState`s |
+
+### 8.3 Decomposition Invariant
+Every selected transition diagnostic must satisfy:
+$$\text{final\_log\_weight} = \text{data\_contribution} + \text{gttm\_contribution} - \text{target\_tension\_contribution} - \text{section\_style\_contribution} - \text{stitch\_cost}$$
+within tolerance $\le 10^{-9}$.
+
+### 8.4 Tension Tracking Reference Fixture & Tolerance
+A two-section generative planning fixture is tested under Method A (`Section A`: beats 0–4, boundary level 2, target tension arc `(0.1, 0.3)`; `Section B`: beats 4–8, boundary level 3, target tension arc `(0.8, 0.9)`) with `seed=42`, `lambda_target_tension=6.0`, `sigma_tension=0.1`, and `lambda_section_style=0.0`. Under this reference configuration, the realized path achieves a mean absolute error (MAE) of ~0.147 (maximum absolute error ~0.303) relative to the interpolated target tension curve. The regression acceptance threshold is set to $\text{MAE} \le 0.19$, which reflects the empirical baseline plus a 25% tolerance margin rounded up to two decimal places.
+

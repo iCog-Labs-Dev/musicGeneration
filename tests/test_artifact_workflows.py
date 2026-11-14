@@ -14,6 +14,7 @@ from unittest.mock import patch
 import mido
 
 import ui
+
 from aimusic.app.cli import handle_export, handle_generate, handle_inspect
 from aimusic.core.config import EDOConfig, MicrotonalRendering
 from aimusic.planning import plans

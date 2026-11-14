@@ -167,12 +167,12 @@ class TestTargetTensionCurve(unittest.TestCase):
             target_tension_arc=(0.0, 1.0),
         )
         curve = target_tension_curve((section,))
-        self.assertEqual(len(curve), 4)
+        self.assertEqual(len(curve), 5)
         times = [t for t, _ in curve]
-        self.assertEqual(times, [0.0, 1.0, 2.0, 3.0])
+        self.assertEqual(times, [0.0, 1.0, 2.0, 3.0, 4.0])
         values = [v for _, v in curve]
         self.assertAlmostEqual(values[0], 0.0)
-        self.assertAlmostEqual(values[-1], 0.75)  # last sample is before end_time
+        self.assertAlmostEqual(values[-1], 1.0)
         self.assertTrue(all(values[i] <= values[i + 1] for i in range(len(values) - 1)))
 
     def test_target_tension_curve_multi_control_point_arc(self):
@@ -184,11 +184,11 @@ class TestTargetTensionCurve(unittest.TestCase):
             target_tension_arc=(0.2, 0.9, 0.1),
         )
         curve = target_tension_curve((section,))
-        self.assertEqual(len(curve), 6)
+        self.assertEqual(len(curve), 7)
         values = [v for _, v in curve]
         # Should rise toward the middle control point then fall.
-        self.assertLess(values[0], values[2])
-        self.assertGreater(values[2], values[-1])
+        self.assertLess(values[0], values[3])
+        self.assertGreater(values[3], values[-1])
 
 
 class TestRealizedTensionCurve(unittest.TestCase):

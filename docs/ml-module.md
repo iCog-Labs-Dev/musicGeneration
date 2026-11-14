@@ -274,6 +274,24 @@ prior_v1/
 `aimusic.scoring.priors.save_neural_prior_manifest` and matches the
 existing `NeuralPriorManifest` contract used by the planning pipeline.
 
+### 5.1 Manifest versions and migration
+
+- **Version 1 (`manifest_version: 1`)**:
+  Default factorized token streams: 8 structural streams (`meter`, `beat_position`,
+  `boundary`, `key`, `chord`, `role`, `head`, `groove`).
+- **Version 2 (`manifest_version: 2`)**:
+  Adds support for the optional `"section"` token stream in `token_streams`. When
+  present, the prior wrapper provides `TokenizedPriorQuery.section_tokens` with
+  section-level conditioning (`section_index`, `section_name`, `offset_in_section`,
+  `section_length`, `is_section_start`, `target_tension`, `groove_family`,
+  `allowed_meters`, `key_region`).
+
+**Backward compatibility**: Manifests specifying `manifest_version: 1` or omitting
+the field continue to load seamlessly. Bundles trained under v1 remain fully
+operational, and unknown token streams continue to be rejected with `ValueError`.
+Placeholder priors (`NullPrior`, placeholder `NeuralPrior`) do not consume
+`section_tokens`, leaving legacy graph weights invariant.
+
 ---
 
 ## 6. Optional dependencies

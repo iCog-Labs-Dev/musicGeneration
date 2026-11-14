@@ -10,6 +10,7 @@ from typing import (
     Sequence,
     Tuple,
     TypeVar,
+    Union,
 )
 
 _logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ from aimusic.core.vocab import (
     Vocabularies,
     validate_vocabulary_compatibility,
 )
+from aimusic.planning.sections import EdgeSectionView, PlanningSection, SectionTimeline
 from aimusic.theory.tonal import chord_pitch_classes, get_fifth_steps, pc
 
 
@@ -61,7 +63,8 @@ class BeatWindow:
     are the immediate structural neighbors (``None`` at a path boundary);
     `is_first_beat` / `is_last_beat` / `is_phrase_start` / `is_phrase_end`
     summarize section context so a generator never needs the whole path to
-    know where it sits in it.
+    know where it sits in it; `section_view` carries section targets when
+    section conditioning is active.
     """
 
     beat_index: int
@@ -72,6 +75,7 @@ class BeatWindow:
     is_last_beat: bool
     is_phrase_start: bool
     is_phrase_end: bool
+    section_view: Optional[EdgeSectionView] = None
 
 
 @dataclass(frozen=True)
@@ -131,12 +135,16 @@ class TrackGenerator(Protocol[DecoderStateT]):
         ...
 
 
-def _build_windows(states: Sequence[BeatState]) -> Tuple[BeatWindow, ...]:
+def _build_windows(
+    states: Sequence[BeatState],
+    timeline: Optional[SectionTimeline] = None,
+) -> Tuple[BeatWindow, ...]:
     total = len(states)
     windows = []
     for beat_index, state in enumerate(states):
         prev_state = states[beat_index - 1] if beat_index > 0 else None
         next_state = states[beat_index + 1] if beat_index + 1 < total else None
+        sec_view = timeline.state_view(beat_index) if timeline is not None else None
         windows.append(
             BeatWindow(
                 beat_index=beat_index,
@@ -147,6 +155,7 @@ def _build_windows(states: Sequence[BeatState]) -> Tuple[BeatWindow, ...]:
                 is_last_beat=beat_index == total - 1,
                 is_phrase_start=state.boundary_lvl > 0 and prev_state is None,
                 is_phrase_end=state.boundary_lvl > 0 and next_state is None,
+                section_view=sec_view,
             )
         )
     return tuple(windows)
@@ -278,6 +287,62 @@ def _should_emit(
         return False
     activation = track_density + (0.15 * tension) + (0.2 if strong else 0.0)
     return activation_unit < min(1.0, activation)
+
+
+def effective_density(
+    base: float,
+    section_view: Optional[EdgeSectionView],
+    decode_config: DecodeConfig,
+) -> float:
+    """Compute effective track density scaled by section target density.
+
+    When section_view has target_density, computes:
+        clip(base * target_density / reference_density, 0, 1)
+    otherwise returns base unchanged.
+    """
+    if section_view is None or section_view.section.target_density is None:
+        return base
+    target = section_view.section.target_density
+    ref = decode_config.reference_density
+    scaled = (base * target) / ref
+    return max(0.0, min(1.0, scaled))
+
+
+def _resolve_expression(
+    tension: float,
+    window: BeatWindow,
+    decode_config: DecodeConfig,
+) -> float:
+    """Blend local tension expression and section target tension expression.
+
+    expression = (1 - b) * local_tension_expression + b * target_tension_expression
+    where b = target_expression_blend. With b = 0, preserves local expression exactly.
+    """
+    local_expr = _unit_to_expression(tension, decode_config)
+    b = decode_config.target_expression_blend
+    if b <= 0.0 or window.section_view is None:
+        return local_expr
+    target_tension = window.section_view.target_tension
+    target_expr = _unit_to_expression(target_tension, decode_config)
+    return ((1.0 - b) * local_expr) + (b * target_expr)
+
+
+def _resolve_timeline(
+    sections: Optional[Union[SectionTimeline, Sequence[PlanningSection], Sequence[object]]],
+    total_beats: int,
+    edo: int = 12,
+) -> Optional[SectionTimeline]:
+    """Resolve a sections input into a validated SectionTimeline or None."""
+    if sections is None:
+        return None
+    if isinstance(sections, SectionTimeline):
+        return sections
+    sec_tuple = tuple(sections)
+    if not sec_tuple:
+        return None
+    if all(isinstance(s, PlanningSection) for s in sec_tuple):
+        return SectionTimeline(sec_tuple, total_beats=total_beats, edo=edo)  # type: ignore[arg-type]
+    return None
 
 
 def build_subbeat_grid(
@@ -475,7 +540,8 @@ def gen_bass(
     activation_unit, key = _activation_unit(key, decode_config, window)
     tension = _tension_level(state, vocabularies)
     strong = state.beat_in_bar in _strong_beats(state, vocabularies)
-    if not _should_emit(decode_config.bass_density, activation_unit, tension, strong=strong):
+    density = effective_density(decode_config.bass_density, window.section_view, decode_config)
+    if not _should_emit(density, activation_unit, tension, strong=strong):
         return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
 
     chord = _chord_token(state, vocabularies)
@@ -499,7 +565,7 @@ def gen_bass(
         duration=duration,
         pitch=pitch,
         velocity=_unit_to_velocity(tension, decode_config),
-        expression=_unit_to_expression(tension, decode_config),
+        expression=_resolve_expression(tension, window, decode_config),
         track="bass",
     )
     return TrackStepResult(
@@ -518,6 +584,7 @@ def generate_bass_events(
     edo: int = 12,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
+    sections: Optional[Union[SectionTimeline, Sequence[PlanningSection], Sequence[object]]] = None,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
     """Whole-path bass track, composed from `gen_bass` via `_run_track`."""
     if not isinstance(key, RNGKey):
@@ -525,7 +592,8 @@ def generate_bass_events(
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
-    windows = _build_windows(states)
+    timeline = _resolve_timeline(sections, total_beats=len(states), edo=edo)
+    windows = _build_windows(states, timeline=timeline)
     events, next_key, _ = _run_track(
         states,
         windows,
@@ -555,7 +623,8 @@ def gen_comping(
     # Comping has no probabilistic activation gate (unlike bass/lead/drums),
     # but the key is still advanced once per beat for a uniform contract.
     key = key.next_key()
-    if decode_config.comping_density <= 0.0:
+    density = effective_density(decode_config.comping_density, window.section_view, decode_config)
+    if density <= 0.0:
         return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
 
     groove = _groove_token(state, vocabularies)
@@ -585,7 +654,8 @@ def gen_comping(
     next_voicing = tuple(sorted(voices))
 
     events: list[NoteEvent] = []
-    for offset in offsets[: max(1, round(decode_config.comping_density * len(offsets)))]:
+    offset_count = max(1, round(density * len(offsets)))
+    for offset in offsets[:offset_count]:
         ton = (window.beat_index * ticks_per_beat) + (
             (ticks_per_beat // decode_config.subbeats_per_beat) * offset
         )
@@ -596,7 +666,7 @@ def gen_comping(
                 duration=ticks_per_beat // 2,
                 pitch=pitch,
                 velocity=_unit_to_velocity(tension, decode_config),
-                expression=_unit_to_expression(tension, decode_config),
+                expression=_resolve_expression(tension, window, decode_config),
                 track="comping",
             )
     return TrackStepResult(
@@ -615,6 +685,7 @@ def generate_comping_events(
     edo: int = 12,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
+    sections: Optional[Union[SectionTimeline, Sequence[PlanningSection], Sequence[object]]] = None,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
     """Whole-path comping track, composed from `gen_comping` via `_run_track`."""
     if not isinstance(key, RNGKey):
@@ -622,7 +693,8 @@ def generate_comping_events(
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
-    windows = _build_windows(states)
+    timeline = _resolve_timeline(sections, total_beats=len(states), edo=edo)
+    windows = _build_windows(states, timeline=timeline)
     events, next_key, _ = _run_track(
         states,
         windows,
@@ -652,7 +724,8 @@ def gen_lead(
     activation_unit, key = _activation_unit(key, decode_config, window)
     tension = _tension_level(state, vocabularies)
     strong = state.beat_in_bar in _strong_beats(state, vocabularies)
-    if not _should_emit(decode_config.lead_density, activation_unit, tension, strong=strong):
+    density = effective_density(decode_config.lead_density, window.section_view, decode_config)
+    if not _should_emit(density, activation_unit, tension, strong=strong):
         return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
     head = _head_label(state, vocabularies)
     if head == "rest" and state.boundary_lvl == 0:
@@ -681,7 +754,7 @@ def gen_lead(
         duration=duration,
         pitch=pitch,
         velocity=_unit_to_velocity(tension, decode_config),
-        expression=_unit_to_expression(tension, decode_config),
+        expression=_resolve_expression(tension, window, decode_config),
         track="lead",
     )
     return TrackStepResult(
@@ -698,6 +771,7 @@ def generate_lead_events(
     edo: int = 12,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
+    sections: Optional[Union[SectionTimeline, Sequence[PlanningSection], Sequence[object]]] = None,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
     """Whole-path lead track, composed from `gen_lead` via `_run_track`."""
     if not isinstance(key, RNGKey):
@@ -705,7 +779,8 @@ def generate_lead_events(
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
-    windows = _build_windows(states)
+    timeline = _resolve_timeline(sections, total_beats=len(states), edo=edo)
+    windows = _build_windows(states, timeline=timeline)
     events, next_key, _ = _run_track(
         states,
         windows,
@@ -738,7 +813,8 @@ def gen_drums(
     activation_unit, key = _activation_unit(key, decode_config, window)
     tension = _tension_level(state, vocabularies)
     strong = state.beat_in_bar in _strong_beats(state, vocabularies)
-    if not _should_emit(decode_config.drum_density, activation_unit, tension, strong=strong):
+    density = effective_density(decode_config.drum_density, window.section_view, decode_config)
+    if not _should_emit(density, activation_unit, tension, strong=strong):
         return TrackStepResult(events=(), decoder_state=decoder_state, key=key)
 
     step_ticks = ticks_per_beat // decode_config.subbeats_per_beat
@@ -761,7 +837,7 @@ def gen_drums(
             duration=max(step_ticks // 2, 1),
             pitch=pitch,
             velocity=_unit_to_velocity(tension, decode_config),
-            expression=_unit_to_expression(tension, decode_config),
+            expression=_resolve_expression(tension, window, decode_config),
             track="drums",
         )
     return TrackStepResult(events=tuple(events), decoder_state=decoder_state, key=key)
@@ -775,13 +851,15 @@ def generate_drum_events(
     vocabularies: Vocabularies,
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     include_terminal_state: bool = False,
+    sections: Optional[Union[SectionTimeline, Sequence[PlanningSection], Sequence[object]]] = None,
 ) -> tuple[Tuple[NoteEvent, ...], RNGKey]:
     """Whole-path drum track, composed from `gen_drums` via `_run_track`."""
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
-    windows = _build_windows(states)
+    timeline = _resolve_timeline(sections, total_beats=len(states), edo=12)
+    windows = _build_windows(states, timeline=timeline)
     events, next_key, _ = _run_track(
         states,
         windows,
@@ -806,6 +884,7 @@ def decode_path_to_score(
     ticks_per_beat: int = DEFAULT_TICKS_PER_BEAT,
     tempo_bpm: float = 120.0,
     include_terminal_state: bool = False,
+    sections: Optional[Union[SectionTimeline, Sequence[PlanningSection], Sequence[object]]] = None,
 ) -> tuple[Score, RNGKey]:
     """Decode a BeatState path into a multi-track symbolic score."""
     if not isinstance(key, RNGKey):
@@ -813,44 +892,49 @@ def decode_path_to_score(
     validate_vocabulary_compatibility(vocabularies, edo)
     states = _decode_states(path, include_terminal_state=include_terminal_state)
     resolved_decode = DecodeConfig() if decode_config is None else decode_config
+    timeline = _resolve_timeline(sections, total_beats=len(states), edo=edo)
     track_keys, next_key = allocate_named_keys(
         key, ("decoder.comping", "decoder.bass", "decoder.lead", "decoder.drums")
     )
     comping, _ = generate_comping_events(
-                states,
-                key=track_keys["decoder.comping"],
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                edo=edo,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
+        states,
+        key=track_keys["decoder.comping"],
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        edo=edo,
+        ticks_per_beat=ticks_per_beat,
+        include_terminal_state=True,
+        sections=timeline,
+    )
     bass, _ = generate_bass_events(
-                states,
-                key=track_keys["decoder.bass"],
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                edo=edo,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
+        states,
+        key=track_keys["decoder.bass"],
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        edo=edo,
+        ticks_per_beat=ticks_per_beat,
+        include_terminal_state=True,
+        sections=timeline,
+    )
     lead, _ = generate_lead_events(
-                states,
-                key=track_keys["decoder.lead"],
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                edo=edo,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
+        states,
+        key=track_keys["decoder.lead"],
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        edo=edo,
+        ticks_per_beat=ticks_per_beat,
+        include_terminal_state=True,
+        sections=timeline,
+    )
     drums, _ = generate_drum_events(
-                states,
-                key=track_keys["decoder.drums"],
-                decode_config=resolved_decode,
-                vocabularies=vocabularies,
-                ticks_per_beat=ticks_per_beat,
-                include_terminal_state=True,
-            )
+        states,
+        key=track_keys["decoder.drums"],
+        decode_config=resolved_decode,
+        vocabularies=vocabularies,
+        ticks_per_beat=ticks_per_beat,
+        include_terminal_state=True,
+        sections=timeline,
+    )
     events = list(comping) + list(bass) + list(lead) + list(drums)
     _logger.info(f"Decoded {len(events)} note events ({len(states)} beats)")
     return Score(
@@ -858,3 +942,4 @@ def decode_path_to_score(
         ticks_per_beat=ticks_per_beat,
         tempo_bpm=tempo_bpm,
     ), next_key
+

@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError:
+    gr = None  # type: ignore[assignment]
+
 import mido
 import numpy as np
 
@@ -261,6 +265,7 @@ def _generate_artifacts(params: GenerationParams) -> GeneratedArtifacts:
         edo=params.edo,
         tempo_bpm=params.tempo_bpm,
         key=next_key,
+        sections=plan_result.endpoints.sections,
     )
     structural_stats = _build_structural_diagnostics(
         plan_result.path,
@@ -498,7 +503,7 @@ def _render_midi_preview_wav(
 
     peak = float(np.max(np.abs(samples)))
     if peak > 0:
-        samples = samples * min(0.95 / peak, 1.0)
+        samples *= min(0.95 / peak, 1.0)
 
     wav_path.parent.mkdir(parents=True, exist_ok=True)
     pcm = (samples * 32767.0).clip(-32768, 32767).astype("<i2")
@@ -954,6 +959,12 @@ css = """
     input[type=number] { padding: 1px 4px !important; }
     .drum-check .wrap { display: flex !important; flex-direction: row !important; flex-wrap: wrap !important; gap: 12px !important; }
 """
+
+if gr is None:
+    raise ImportError(
+        "The 'gradio' package is required to launch the web interface.\n"
+        "Please activate the virtual environment (.\\venv\\Scripts\\Activate.ps1) or install gradio: pip install gradio"
+    )
 
 with gr.Blocks(title="MIDI Generator", fill_height=True) as demo:
     gr.Markdown("## MIDI Generator <small style='font-weight:700;color:#9aa4b2;font-size:14px'>  | write configs and click 'generate'</small>")

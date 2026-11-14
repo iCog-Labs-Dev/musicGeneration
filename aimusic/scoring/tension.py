@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from aimusic.core.config import SectionStyleWeights
 from aimusic.core.core_types import BeatState
 from aimusic.core.vocab import Vocabularies
 from aimusic.theory.tonal import basic_space_distance, tonal_distance
 
 if TYPE_CHECKING:  # pragma: no cover - import-time cycle avoidance only
     from aimusic.planning.plans import PlanningSection
+    from aimusic.planning.sections import SectionTimeline
 
 TENSION_MODEL_VERSION = "1.0.0"
 
@@ -184,31 +186,249 @@ def realized_tension_curve(
     return curve
 
 
-def target_tension_curve(sections: Sequence["PlanningSection"]) -> List[Tuple[float, float]]:
-    """Time-indexed target tension curve sampled from section arcs.
+def target_tension_curve(
+    sections: Union["SectionTimeline", Sequence["PlanningSection"]],
+) -> List[Tuple[float, float]]:
+    """Time-indexed target tension curve sampled from SectionTimeline.
 
-    Each section's `target_tension_arc` (>= 2 control points, evenly spaced
-    across [start_time, end_time)) is linearly interpolated to produce one
-    sample per beat, so the result lines up point-for-point with
-    `realized_tension_curve`'s time indexing.
+    Delegates to SectionTimeline to eliminate duplicated interpolation logic.
+    The curve index k is the ARRIVAL beat (same as realized_tension_curve),
+    covering beats 0..total_beats so edge arrival states k = t + 1 align point-for-point.
     """
-    curve: List[Tuple[float, float]] = []
-    for section in sections:
-        arc = section.target_tension_arc
-        span = section.end_time - section.start_time
-        n_segments = len(arc) - 1
-        for offset in range(span):
-            # Position within the section, in [0, 1).
-            frac = offset / span if span > 0 else 0.0
-            # Which arc segment this position falls into.
-            seg_pos = frac * n_segments
-            seg_index = min(int(seg_pos), n_segments - 1)
-            seg_frac = seg_pos - seg_index
-            start_val = arc[seg_index]
-            end_val = arc[seg_index + 1]
-            value = start_val + (end_val - start_val) * seg_frac
-            curve.append((float(section.start_time + offset), value))
-    return curve
+    from aimusic.planning.sections import SectionTimeline
+
+    if isinstance(sections, SectionTimeline):
+        timeline = sections
+    else:
+        timeline = SectionTimeline(tuple(sections), total_beats=sections[-1].end_time)
+    return [(float(k), float(v)) for k, v in timeline.as_curve()]
+
+
+def target_tension_at_time(
+    sections: Union["SectionTimeline", Sequence["PlanningSection"]],
+    t: int,
+) -> float:
+    """Return interpolated target tension value for beat state index t across sections.
+
+    Delegates to SectionTimeline to eliminate duplicated interpolation logic.
+    Index t is the beat state index (arrival beat convention k = t + 1).
+    """
+    from aimusic.planning.sections import SectionTimeline
+
+    if isinstance(sections, SectionTimeline):
+        timeline = sections
+    else:
+        timeline = SectionTimeline(tuple(sections), total_beats=sections[-1].end_time)
+    return float(timeline.target_tension(t))
+
+
+def transition_target_tension_energy(
+    tau_hat: float | Optional[BeatState],
+    tau_star: float | BeatState,
+    sigma: float | int = 0.1,
+    *args: Any,
+    **kwargs: Any,
+) -> float:
+    """Compute target tension deviation energy: (tau_hat - tau_star)^2 / (2 * sigma^2).
+
+    sigma is the tolerance in tension units: a deviation of sigma costs exactly
+    0.5 nat before lambda scaling (Decision D2).
+    """
+    if (
+        isinstance(tau_hat, (int, float))
+        and not isinstance(tau_hat, bool)
+        and isinstance(tau_star, (int, float))
+        and not isinstance(tau_star, bool)
+    ):
+        if not isinstance(sigma, (int, float)) or isinstance(sigma, bool):
+            raise TypeError("sigma must be a real number.")
+        sig = float(sigma)
+        if sig <= 0.0:
+            raise ValueError("sigma must be > 0.")
+        diff = float(tau_hat - tau_star)
+        return float((diff * diff) / (2.0 * sig * sig))
+
+    # Backward compatibility fallback if called with legacy positional signature:
+    # (prev_state, state, t, target_tension, vocabularies, edo, ...)
+    prev_state = tau_hat  # type: ignore[assignment]
+    state = tau_star  # type: ignore[assignment]
+    target_tension = args[0] if len(args) > 0 else kwargs.get("target_tension", 0.5)
+    vocabs = args[1] if len(args) > 1 else kwargs.get("vocabularies")
+    edo = args[2] if len(args) > 2 else kwargs.get("edo", 12)
+    weights = args[3] if len(args) > 3 else kwargs.get("weights", DEFAULT_WEIGHTS)
+    realized = beat_tension(prev_state, state, vocabs, edo, weights)  # type: ignore[arg-type]
+    diff = realized - target_tension
+    return float((diff * diff) / (2.0 * 0.1 * 0.1))
+
+
+def _extract_section_context(
+    section_view: Any,
+    *,
+    is_section_start: Optional[bool] = None,
+    multi_meter: Optional[bool] = None,
+) -> Tuple[Optional[Any], bool, bool]:
+    """Extract (section, is_section_start, multi_meter) from section_view or explicit flags."""
+    import aimusic.planning.sections as _sec_mod
+
+    sec: Optional[Any] = None
+    start = False
+    mm = False
+
+    if isinstance(section_view, _sec_mod.EdgeSectionView):
+        sec = section_view.section
+        start = section_view.is_section_start
+        mm = getattr(section_view, "multi_meter", False)
+    elif isinstance(section_view, _sec_mod.PlanningSection):
+        sec = section_view
+        start = False
+        mm = False
+
+    if is_section_start is not None:
+        start = is_section_start
+    if multi_meter is not None:
+        mm = multi_meter
+    elif sec is not None and sec.allowed_meters and len(sec.allowed_meters) > 1:
+        mm = True
+
+    return sec, start, mm
+
+
+def section_style_breakdown(
+    prev_state: Optional[BeatState],
+    next_state: BeatState,
+    section_view: Any,
+    vocabularies: Vocabularies,
+    edo: int = 12,
+    style_weights: Optional[Any] = None,
+    *,
+    is_section_start: Optional[bool] = None,
+) -> Dict[str, float]:
+    """Return an ordered mapping of non-negative component energies for section-style deviation."""
+    section, is_start, _ = _extract_section_context(
+        section_view, is_section_start=is_section_start
+    )
+
+    if section is None:
+        return {
+            "meter": 0.0,
+            "key_region": 0.0,
+            "groove_family": 0.0,
+            "role": 0.0,
+            "boundary": 0.0,
+            "start_alignment": 0.0,
+        }
+
+    # 1. meter: 1 if next meter not in section.allowed_meters else 0
+    meter_comp = 0.0
+    if section.allowed_meters:
+        if vocabularies.meters.has_id(next_state.meter_id):
+            meter_label = vocabularies.meters.token_for_id(next_state.meter_id).label
+            if meter_label not in section.allowed_meters:
+                meter_comp = 1.0
+        else:
+            meter_comp = 1.0
+
+    # 2. key_region: min over region roots of d/(1+d), d = tonal_distance(next key root, region root, edo); 0 when no region
+    key_comp = 0.0
+    region = section.key_region
+    if region:
+        if vocabularies.keys.has_id(next_state.key_id):
+            next_root = vocabularies.keys.token_for_id(next_state.key_id).root_pc
+            d_min = min(tonal_distance(next_root, r, edo) for r in region)
+            key_comp = float(d_min / (1.0 + d_min))
+        else:
+            key_comp = 0.5
+
+    # 3. groove_family: 1 if groove family differs from section.groove_family else 0
+    groove_comp = 0.0
+    if section.groove_family:
+        if vocabularies.grooves.has_id(next_state.groove_id):
+            groove_tok = vocabularies.grooves.token_for_id(next_state.groove_id)
+            if groove_tok.family != section.groove_family:
+                groove_comp = 1.0
+        else:
+            groove_comp = 1.0
+
+    # 4. role: 1 if role label is not in section.preferred_roles else 0
+    role_comp = 0.0
+    if section.preferred_roles:
+        if vocabularies.roles.has_id(next_state.role_id):
+            role_label = vocabularies.roles.token_for_id(next_state.role_id).label
+            if role_label not in section.preferred_roles:
+                role_comp = 1.0
+        else:
+            role_comp = 1.0
+
+    # 5. boundary: at section-start arrival state, abs(next.boundary_lvl - section.boundary_level);
+    # in interior, 1 if next.boundary_lvl >= section.boundary_level and section.boundary_level >= 2 else 0
+    if is_start:
+        boundary_comp = float(abs(next_state.boundary_lvl - section.boundary_level))
+    else:
+        boundary_comp = (
+            1.0
+            if (next_state.boundary_lvl >= section.boundary_level and section.boundary_level >= 2)
+            else 0.0
+        )
+
+    # 6. start_alignment: at section-start arrival state, 1 if next.beat_in_bar != 0 else 0; 0 elsewhere
+    if is_start:
+        start_alignment_comp = 1.0 if next_state.beat_in_bar != 0 else 0.0
+    else:
+        start_alignment_comp = 0.0
+
+    return {
+        "meter": meter_comp,
+        "key_region": key_comp,
+        "groove_family": groove_comp,
+        "role": role_comp,
+        "boundary": boundary_comp,
+        "start_alignment": start_alignment_comp,
+    }
+
+
+def section_style_energy(
+    prev_state: Optional[BeatState],
+    next_state: BeatState,
+    section_view: Any,
+    vocabularies: Vocabularies,
+    edo: int = 12,
+    style_weights: Optional[Any] = None,
+    *,
+    multi_meter: Optional[bool] = None,
+    multi_meter_alignment_factor: float = 3.0,
+    is_section_start: Optional[bool] = None,
+) -> float:
+    """Compute section-style deviation energy penalty for transitioning into next_state.
+
+    Returns sum(weight_c * component_c). Unknown or unset preferences contribute 0.
+    """
+    resolved_weights = SectionStyleWeights() if style_weights is None else style_weights
+    section, is_start, is_multi = _extract_section_context(
+        section_view, is_section_start=is_section_start, multi_meter=multi_meter
+    )
+
+    components = section_style_breakdown(
+        prev_state,
+        next_state,
+        section_view,
+        vocabularies,
+        edo=edo,
+        style_weights=resolved_weights,
+        is_section_start=is_start,
+    )
+
+    alignment_factor = multi_meter_alignment_factor if is_multi else 1.0
+    total = (
+        resolved_weights.meter * components["meter"]
+        + resolved_weights.key_region * components["key_region"]
+        + resolved_weights.groove_family * components["groove_family"]
+        + resolved_weights.role * components["role"]
+        + resolved_weights.boundary * components["boundary"]
+        + (resolved_weights.start_alignment * alignment_factor) * components["start_alignment"]
+    )
+    return float(total)
+
+
 
 
 @dataclass(frozen=True)
@@ -240,15 +460,21 @@ def _pearson_correlation(xs: Sequence[float], ys: Sequence[float]) -> float:
 def compare_tension_curves(
     target: Sequence[Tuple[float, float]],
     realized: Sequence[Tuple[float, float]],
-    sections: Sequence["PlanningSection"],
+    sections: Union["SectionTimeline", Sequence["PlanningSection"]],
 ) -> TensionDeviationReport:
     """Compare target vs. realized tension curves.
 
     Pure function: takes two curves and the section plan, returns a report.
     Comparison is over the intersection of time points present in both
-    curves (curves are expected to share time indexing, but this makes the
-    function robust to minor length mismatches rather than raising).
+    curves, aligning target and realized by arrival beat index k.
     """
+    from aimusic.planning.sections import SectionTimeline
+
+    if isinstance(sections, SectionTimeline):
+        sec_list = sections.sections
+    else:
+        sec_list = tuple(sections)
+
     target_map = _as_time_value_map(target)
     realized_map = _as_time_value_map(realized)
     shared_times = sorted(set(target_map) & set(realized_map))
@@ -269,10 +495,11 @@ def compare_tension_curves(
     max_abs_error = max(abs_errors)
 
     section_errors: Dict[str, float] = {}
-    for section in sections:
+    for section in sec_list:
         section_times = [
             t for t in shared_times
-            if section.start_time <= t < section.end_time
+            if (section.start_time <= t < section.end_time)
+            or (t == section.end_time and section == sec_list[-1])
         ]
         if not section_times:
             continue

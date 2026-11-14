@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence, Tuple, Iterator
+from typing import TYPE_CHECKING, Iterator, Mapping, Optional, Sequence, Tuple
+if TYPE_CHECKING:
+    from aimusic.planning.plans import PlanningSection
+    from aimusic.planning.sections import EdgeSectionView
 
 from aimusic.core.config import StyleConfig
 from aimusic.core.core_types import BeatState
 from aimusic.core.rng import RNGKey, shuffle
+from aimusic.planning.sections import key_ids_for_pcs
 from aimusic.scoring.gttm_features import beats_per_bar
 from aimusic.scoring.priors import NullPrior, Prior, PriorContext, PriorQuery, prior_logps
 from aimusic.theory.tonal import get_fifth_steps, nearest_roots
@@ -382,10 +386,18 @@ def propose_meter_ids(
     prev_state: BeatState,
     style_config: StyleConfig,
     vocabularies: Vocabularies,
+    section: Optional["PlanningSection"] = None,
 ) -> Tuple[int, ...]:
     proposals = [prev_state.meter_id]
     if prev_state.boundary_lvl >= 2 and prev_state.beat_in_bar == 0:
         proposals.extend(_allowed_meter_ids(style_config, vocabularies))
+    if section is not None and section.allowed_meters:
+        sec_meter_ids = [
+            vocabularies.meters.token_for_label(m).id
+            for m in section.allowed_meters
+            if m in vocabularies.meters.label_map
+        ]
+        proposals = [m for m in sec_meter_ids if m in proposals] + [m for m in proposals if m not in sec_meter_ids]
     return tuple(dict.fromkeys(proposals))
 
 
@@ -394,6 +406,10 @@ def propose_boundary_levels(
     next_meter_id: int,
     next_beat_in_bar: int,
     vocabularies: Vocabularies,
+    section_view: Optional[EdgeSectionView] = None,
+    section: Optional[PlanningSection] = None,
+    section_guided_proposals: bool = False,
+    t: Optional[int] = None,
 ) -> Tuple[int, ...]:
     proposals = [vocabularies.boundaries.token_for_label("none").id]
     if _is_strong_beat(next_meter_id, next_beat_in_bar, vocabularies):
@@ -401,6 +417,26 @@ def propose_boundary_levels(
     if next_beat_in_bar == 0:
         proposals.append(vocabularies.boundaries.token_for_label("phrase").id)
         proposals.append(vocabularies.boundaries.token_for_label("section").id)
+
+    sec: Optional[PlanningSection] = None
+    is_start = False
+    if section_view is not None:
+        sec = getattr(section_view, "section", None)
+        is_start = getattr(section_view, "is_section_start", False)
+    elif section is not None:
+        sec = section
+        is_start = bool(t is not None and getattr(sec, "start_time", None) == t + 1)
+
+    if (
+        section_guided_proposals
+        and is_start
+        and sec is not None
+        and getattr(sec, "boundary_level", 0) > 0
+    ):
+        target_lvl = sec.boundary_level
+        if target_lvl in proposals:
+            proposals = [target_lvl] + [lvl for lvl in proposals if lvl != target_lvl]
+
     return tuple(dict.fromkeys(proposals))
 
 
@@ -410,6 +446,7 @@ def propose_role_ids(
     next_beat_in_bar: int,
     next_boundary_lvl: int,
     vocabularies: Vocabularies,
+    section: Optional["PlanningSection"] = None,
 ) -> Tuple[int, ...]:
     prev_role = _role_label(prev_state, vocabularies)
     allowed_labels = set(LEGAL_ROLE_SUCCESSORS[prev_role])
@@ -422,10 +459,18 @@ def propose_role_ids(
     if next_boundary_lvl == 0:
         allowed_labels.discard("cad")
 
-    return tuple(
+    role_ids = [
         vocabularies.roles.token_for_label(label).id
         for label in sorted(allowed_labels)
-    )
+    ]
+    if section is not None and section.preferred_roles:
+        pref_ids = set(
+            vocabularies.roles.token_for_label(r).id
+            for r in section.preferred_roles
+            if r in vocabularies.roles.label_map
+        )
+        role_ids.sort(key=lambda r_id: 0 if r_id in pref_ids else 1)
+    return tuple(role_ids)
 
 
 def propose_key_ids(
@@ -434,11 +479,16 @@ def propose_key_ids(
     next_role_id: int,
     vocabularies: Vocabularies,
     edo: Optional[int] = None,
+    section: Optional["PlanningSection"] = None,
 ) -> Tuple[int, ...]:
     resolved_edo = _edo_size(vocabularies) if edo is None else edo
     validate_vocabulary_compatibility(vocabularies, resolved_edo)
     role_label = vocabularies.roles.token_for_id(next_role_id).label
     proposals = [prev_state.key_id]
+    if section is not None and section.target_key_id is not None:
+        target_ids = key_ids_for_pcs((section.target_key_id,), vocabularies)
+        for tid in reversed(target_ids):
+            proposals.insert(0, tid)
     if next_boundary_lvl >= 2 or role_label in {"change", "cad"}:
         for root_pc in nearest_roots(
             _key_root(prev_state, vocabularies), resolved_edo, limit=2
@@ -522,6 +572,7 @@ def propose_groove_ids(
     next_boundary_lvl: int,
     next_role_id: int,
     vocabularies: Vocabularies,
+    section: Optional["PlanningSection"] = None,
 ) -> Tuple[int, ...]:
     prev_groove = _groove_token_by_id(prev_state.groove_id, vocabularies)
     next_role = vocabularies.roles.token_for_id(next_role_id).label
@@ -538,7 +589,14 @@ def propose_groove_ids(
                 proposals.append(groove.id)
                 seen_families.add(groove.family)
 
+    if section is not None and section.groove_family:
+        sec_family = section.groove_family
+        sec_grooves = [g.id for g in vocabularies.grooves if g.family == sec_family]
+        if sec_grooves:
+            proposals = sec_grooves + [g for g in proposals if g not in sec_grooves]
+
     return tuple(dict.fromkeys(proposals))
+
 
 def _candidate_generator(
     prev_state: BeatState,
@@ -549,33 +607,93 @@ def _candidate_generator(
     key: RNGKey,
     edo: int,
     key_state: Optional[list[RNGKey]] = None,
+    section_view: Optional[EdgeSectionView] = None,
+    section: Optional[PlanningSection] = None,
+    section_guided_proposals: bool = False,
+    t: Optional[int] = None,
 ) -> Iterator[BeatState]:
     """Yields candidate states iteratively to avoid combinatorial memory explosions."""
-    
     current_key = key
 
-    def _shuffled(items: Sequence[int]) -> Tuple[int, ...]:
+    sec: Optional[PlanningSection] = None
+    is_start = False
+    if section_view is not None:
+        sec = getattr(section_view, "section", None)
+        is_start = getattr(section_view, "is_section_start", False)
+    elif section is not None:
+        sec = section
+        is_start = bool(t is not None and getattr(sec, "start_time", None) == t + 1)
+
+    sec_meter_ids = (
+        set(vocabs.meters.token_for_label(m).id for m in sec.allowed_meters if m in vocabs.meters.label_map)
+        if section_guided_proposals and sec and sec.allowed_meters else None
+    )
+    sec_boundary_ids = (
+        {sec.boundary_level}
+        if section_guided_proposals and sec and is_start and sec.boundary_level > 0 and vocabs.boundaries.has_id(sec.boundary_level) else None
+    )
+    sec_role_ids = (
+        set(vocabs.roles.token_for_label(r).id for r in sec.preferred_roles if r in vocabs.roles.label_map)
+        if section_guided_proposals and sec and sec.preferred_roles else None
+    )
+    sec_groove_ids = (
+        set(g.id for g in vocabs.grooves if g.family == sec.groove_family)
+        if section_guided_proposals and sec and sec.groove_family else None
+    )
+    sec_key_ids = (
+        set(key_ids_for_pcs(sec.key_region, vocabs))
+        if section_guided_proposals and sec and sec.key_region is not None
+        else (
+            set(key_ids_for_pcs((sec.target_key_id,), vocabs))
+            if section_guided_proposals and sec and sec.target_key_id is not None
+            else None
+        )
+    )
+
+    def _shuffled_prioritized(items: Sequence[int], priority_set: Optional[set[int]] = None) -> Tuple[int, ...]:
         nonlocal current_key
-        shuffled, current_key = shuffle(current_key, items)
+        if not priority_set or not items:
+            shuffled, current_key = shuffle(current_key, items)
+            if key_state is not None:
+                key_state[0] = current_key
+            return shuffled
+        pref = [x for x in items if x in priority_set]
+        other = [x for x in items if x not in priority_set]
+        pref_shuffled, current_key = shuffle(current_key, pref)
+        other_shuffled, current_key = shuffle(current_key, other)
         if key_state is not None:
             key_state[0] = current_key
-        return shuffled
+        return pref_shuffled + other_shuffled
 
-    for meter_id in _shuffled(propose_meter_ids(prev_state, style, vocabs)):
+    sec_arg = sec if section_guided_proposals else None
+    for meter_id in _shuffled_prioritized(propose_meter_ids(prev_state, style, vocabs, section=sec_arg), sec_meter_ids):
         beat_in_bar = _next_beat_index(prev_state, meter_id, vocabs)
-        for bound_lvl in _shuffled(propose_boundary_levels(prev_state, meter_id, beat_in_bar, vocabs)):
-            for role_id in _shuffled(propose_role_ids(prev_state, meter_id, beat_in_bar, bound_lvl, vocabs)):
-                for groove_id in _shuffled(propose_groove_ids(prev_state, bound_lvl, role_id, vocabs)):
-                    for key_id in _shuffled(
+        for bound_lvl in _shuffled_prioritized(
+            propose_boundary_levels(
+                prev_state,
+                meter_id,
+                beat_in_bar,
+                vocabs,
+                section_view=section_view,
+                section=sec,
+                section_guided_proposals=section_guided_proposals,
+                t=t,
+            ),
+            sec_boundary_ids,
+        ):
+            for role_id in _shuffled_prioritized(propose_role_ids(prev_state, meter_id, beat_in_bar, bound_lvl, vocabs, section=sec_arg), sec_role_ids):
+                for groove_id in _shuffled_prioritized(propose_groove_ids(prev_state, bound_lvl, role_id, vocabs, section=sec_arg), sec_groove_ids):
+                    for key_id in _shuffled_prioritized(
                         propose_key_ids(
-                            prev_state, bound_lvl, role_id, vocabs, edo=edo
-                        )
+                            prev_state, bound_lvl, role_id, vocabs, edo=edo, section=sec_arg
+                        ),
+                        sec_key_ids,
                     ):
-                        for chord_id in _shuffled(propose_chord_ids(
+                        for chord_id in _shuffled_prioritized(propose_chord_ids(
                             prev_state, key_id, meter_id, beat_in_bar, bound_lvl,
                             role_id, groove_id, prior, context, vocabs, edo=edo
                         )):
-                            for head_id in _shuffled(propose_head_ids(chord_id, meter_id, beat_in_bar, bound_lvl, role_id, vocabs)):
+                            for head_id in _shuffled_prioritized(propose_head_ids(chord_id, meter_id, beat_in_bar, bound_lvl, role_id, vocabs)):
                                 yield BeatState(
                                     meter_id=meter_id,
                                     beat_in_bar=beat_in_bar,
@@ -607,6 +725,9 @@ def get_valid_next_states(
     edo: Optional[int] = None,
     proposal_budget: Optional[int] = None,
     prior_guided_proposals: bool = False,
+    section_view: Optional[EdgeSectionView] = None,
+    section: Optional[PlanningSection] = None,
+    section_guided_proposals: bool = False,
 ) -> tuple[CandidateGenerationResult, RNGKey]:
     """Generate a bounded pool of legal BeatState successors for one source state.
 
@@ -623,6 +744,18 @@ def get_valid_next_states(
     ``d_max`` is still accepted (and still validated) here for API stability
     and because callers commonly want to size their own budget relative to
     it, but it no longer bounds what this function returns.
+
+    REQ-04: Section structure is conveyed via ``section_view`` (an
+    ``EdgeSectionView`` describing arrival state context at k = t + 1). When
+    ``section_guided_proposals`` is enabled, proposal ordering prioritizes
+    section preferences (meters, boundary levels, roles, groove families,
+    and key regions). When proposal steering is disabled (the default),
+    proposals follow baseline order without section bias. However, if the
+    arrival state is a section start whose executable section boundary level
+    is legal, the generator guarantees that at least one legal candidate with
+    that boundary level is included within ``proposal_budget`` (by substituting
+    the final candidate slot only when the budgeted pool would otherwise starve
+    the boundary level, never bypassing legality checks).
     """
     if not isinstance(key, RNGKey):
         raise TypeError("key must be an RNGKey.")
@@ -637,6 +770,19 @@ def get_valid_next_states(
     resolved_prior = _resolved_prior(prior)
     resolved_edo = _edo_size(resolved_vocabs) if edo is None else edo
     validate_vocabulary_compatibility(resolved_vocabs, resolved_edo)
+
+    effective_sec_view = section_view
+    if effective_sec_view is None and context is not None:
+        effective_sec_view = context.section_view
+
+    sec: Optional[PlanningSection] = None
+    is_start = False
+    if effective_sec_view is not None:
+        sec = getattr(effective_sec_view, "section", None)
+        is_start = getattr(effective_sec_view, "is_section_start", False)
+    elif section is not None:
+        sec = section
+        is_start = bool(t is not None and getattr(sec, "start_time", None) == t + 1)
 
     seen: set[BeatState] = set()
     accepted: list[BeatState] = []
@@ -655,6 +801,10 @@ def get_valid_next_states(
         key,
         resolved_edo,
         key_state,
+        section_view=effective_sec_view,
+        section=sec,
+        section_guided_proposals=section_guided_proposals,
+        t=t,
     )
 
     for candidate in candidate_gen:
@@ -683,8 +833,92 @@ def get_valid_next_states(
                 )
             )
 
+    # Section-start boundary level guarantee:
+    target_bnd = getattr(sec, "boundary_level", 0) if sec is not None else 0
+    if section_guided_proposals and is_start and target_bnd > 0:
+        has_target_bnd = any(c.boundary_lvl == target_bnd for c in accepted)
+        if not has_target_bnd:
+            fallback_candidate = None
+            sec_arg = sec if section_guided_proposals else None
+            for m_id in propose_meter_ids(prev_state, resolved_style, resolved_vocabs, section=sec_arg):
+                b_in_bar = _next_beat_index(prev_state, m_id, resolved_vocabs)
+                avail_bnds = propose_boundary_levels(
+                    prev_state,
+                    m_id,
+                    b_in_bar,
+                    resolved_vocabs,
+                    section_view=effective_sec_view,
+                    section=sec,
+                    section_guided_proposals=True,
+                    t=t,
+                )
+                if target_bnd not in avail_bnds:
+                    continue
+                for r_id in propose_role_ids(
+                    prev_state, m_id, b_in_bar, target_bnd, resolved_vocabs, section=sec_arg
+                ):
+                    for g_id in propose_groove_ids(
+                        prev_state, target_bnd, r_id, resolved_vocabs, section=sec_arg
+                    ):
+                        for k_id in propose_key_ids(
+                            prev_state, target_bnd, r_id, resolved_vocabs, edo=resolved_edo, section=sec_arg
+                        ):
+                            for c_id in propose_chord_ids(
+                                prev_state, k_id, m_id, b_in_bar, target_bnd,
+                                r_id, g_id, resolved_prior, context, resolved_vocabs, edo=resolved_edo
+                            ):
+                                for h_id in propose_head_ids(
+                                    c_id, m_id, b_in_bar, target_bnd, r_id, resolved_vocabs
+                                ):
+                                    cand = BeatState(
+                                        meter_id=m_id,
+                                        beat_in_bar=b_in_bar,
+                                        boundary_lvl=target_bnd,
+                                        key_id=k_id,
+                                        chord_id=c_id,
+                                        role_id=r_id,
+                                        head_id=h_id,
+                                        groove_id=g_id,
+                                    )
+                                    is_leg, _ = is_legal_transition(
+                                        prev_state, cand, resolved_style, resolved_vocabs
+                                    )
+                                    if is_leg:
+                                        fallback_candidate = cand
+                                        break
+                                if fallback_candidate is not None:
+                                    break
+                            if fallback_candidate is not None:
+                                break
+                        if fallback_candidate is not None:
+                            break
+                    if fallback_candidate is not None:
+                        break
+                if fallback_candidate is not None:
+                    break
+
+            if fallback_candidate is not None:
+                if len(accepted) >= resolved_budget:
+                    accepted[-1] = fallback_candidate
+                else:
+                    accepted.append(fallback_candidate)
+                seen.add(fallback_candidate)
+
     unique_count = len(seen)
-    legal_states = tuple(sorted(accepted, key=_state_sort_key))
+    if section_guided_proposals and sec is not None:
+        from aimusic.scoring.tension import section_style_energy
+
+        legal_states = tuple(
+            sorted(
+                accepted,
+                key=lambda s: (
+                    section_style_energy(prev_state, s, effective_sec_view or sec, resolved_vocabs, resolved_edo),
+                    _state_sort_key(s),
+                ),
+            )
+        )
+    else:
+        legal_states = tuple(sorted(accepted, key=_state_sort_key))
     scores: Tuple[float, ...] = ()
 
     # 4. Batch-score (optional prior-guided ranking of the legal pool only).

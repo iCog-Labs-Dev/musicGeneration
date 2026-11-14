@@ -4,7 +4,7 @@ import importlib
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from aimusic.core.diagnostics import (
     RunManifest,
@@ -27,9 +27,7 @@ from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
 from aimusic.planning.plans import MethodARunConfig, PlanningSection, run_method_a
-from aimusic.render import TrackInstrumentConfig, render_midi
 from aimusic.scoring.priors import NullPrior, Prior
-from aimusic.render.package import write_render_package
 from aimusic.scoring.tension import (
     compare_tension_curves,
     realized_tension_curve,
@@ -74,6 +72,7 @@ def _build_structural_diagnostics(
     vocabularies: Any,
     edo: int,
     sections: tuple[PlanningSection, ...] = (),
+    transition_diagnostics: tuple[Any, ...] = (),
 ) -> StructuralDiagnostics:
     decoded_states = path[:-1] if len(path) > 1 else path
     key_labels = [vocabularies.keys.token_for_id(state.key_id).label for state in decoded_states]
@@ -99,6 +98,7 @@ def _build_structural_diagnostics(
         tension_curve=tension_curve,
         target_tension_curve=tension_target_curve,
         tension_deviation=dataclasses.asdict(deviation) if deviation is not None else {},
+        transition_diagnostics=_json_ready(transition_diagnostics),
     )
 
 
@@ -126,8 +126,26 @@ def _parse_track_program(value: str) -> tuple[str, int]:
     return track_name.strip(), program
 
 
-def _build_track_instruments(args: argparse.Namespace) -> dict[str, TrackInstrumentConfig]:
-    instruments: dict[str, TrackInstrumentConfig] = {}
+def _load_render_module():
+    try:
+        from aimusic.render import TrackInstrumentConfig, render_midi
+        from aimusic.render.package import write_render_package
+        return TrackInstrumentConfig, render_midi, write_render_package
+    except ImportError:
+        print(
+            "Error: MIDI rendering requires the 'mido' package.\n"
+            "Please install it by running:\n"
+            "    pip install mido\n"
+            "or:\n"
+            "    pip install -e \".[dev]\"",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _build_track_instruments(args: argparse.Namespace) -> dict[str, Any]:
+    TrackInstrumentConfig, _, _ = _load_render_module()
+    instruments: dict[str, Any] = {}
     for track_name, program in args.track_program:
         instruments[track_name.strip().lower()] = TrackInstrumentConfig(program=program)
     for track_name in args.drum_track:
@@ -142,6 +160,66 @@ def _build_track_instruments(args: argparse.Namespace) -> dict[str, TrackInstrum
 
 def handle_generate(args: argparse.Namespace) -> None:
     """Run the current Method A pipeline and export score, MIDI, and manifest artifacts."""
+    TrackInstrumentConfig, render_midi, write_render_package = _load_render_module()
+
+    sections: Optional[tuple[PlanningSection, ...]] = None
+    if getattr(args, "sections_file", None):
+        sections_path = Path(args.sections_file)
+        if not sections_path.exists():
+            print(f"Error: Could not find sections file at {sections_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with sections_path.open("r", encoding="utf-8") as f:
+                raw_sections = json.load(f)
+        except Exception as exc:
+            print(f"Error reading sections file {sections_path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(raw_sections, list):
+            print(f"Error: {sections_path} must contain a JSON list of section objects.", file=sys.stderr)
+            sys.exit(1)
+
+        from aimusic.planning.sections import SectionPlanError, SectionTimeline
+
+        parsed_sections = []
+        for idx, item in enumerate(raw_sections):
+            if not isinstance(item, dict):
+                print(f"Error: Section item at index {idx} must be a dictionary.", file=sys.stderr)
+                sys.exit(1)
+            try:
+                sec = PlanningSection(
+                    name=str(item["name"]),
+                    start_time=int(item["start_time"]),
+                    end_time=int(item["end_time"]),
+                    boundary_level=int(item.get("boundary_level", 2)),
+                    target_tension_arc=tuple(float(v) for v in item["target_tension_arc"]),
+                    allowed_meters=tuple(str(m) for m in item["allowed_meters"]) if "allowed_meters" in item and item["allowed_meters"] is not None else None,
+                    groove_family=str(item["groove_family"]) if "groove_family" in item and item["groove_family"] is not None else None,
+                    target_key_id=int(item["target_key_id"]) if "target_key_id" in item and item["target_key_id"] is not None else None,
+                    key_region=tuple(int(k) for k in item["key_region"]) if "key_region" in item and item["key_region"] is not None else None,
+                    target_density=float(item["target_density"]) if "target_density" in item and item["target_density"] is not None else None,
+                    preferred_roles=tuple(str(r) for r in item["preferred_roles"]) if "preferred_roles" in item and item["preferred_roles"] is not None else None,
+                )
+                parsed_sections.append(sec)
+            except SectionPlanError as exc:
+                print(f"SectionPlanError: {exc}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as exc:
+                print(f"SectionPlanError: Failed to construct PlanningSection at index {idx}: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+        sections = tuple(parsed_sections)
+        if args.beats is None and sections:
+            args.beats = sections[-1].end_time
+
+        try:
+            SectionTimeline(sections=sections, total_beats=args.beats, edo=args.edo)
+        except SectionPlanError as exc:
+            print(f"SectionPlanError: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.beats is None:
+        args.beats = 8
+
     style_config = StyleConfig(
         allowed_meters=(args.meter,),
         groove_families=(args.groove_family,),
@@ -153,24 +231,37 @@ def handle_generate(args: argparse.Namespace) -> None:
         comping_density=args.comping_density,
         lead_density=args.lead_density,
     )
+    plan_config = PlanConfig(
+        sectioning_strategy=(
+            SectioningStrategy.SECTION_WISE if getattr(args, "sections", None)
+            else SectioningStrategy.SINGLE_PASS
+        ),
+        section_names=tuple(getattr(args, "sections", None) or ()),
+        section_guided_proposals=bool(getattr(args, "section_guided_proposals", False)),
+    )
+    sb_config = SBConfig(
+        horizon_t=args.beats,
+        max_horizon_per_solve=getattr(args, "max_horizon_per_solve", None),
+        section_guided_proposals=bool(getattr(args, "section_guided_proposals", False)),
+    )
+    prior_weights = PriorWeights(
+        lambda_data=getattr(args, "lambda_data", PriorWeights().lambda_data),
+        lambda_gttm=getattr(args, "lambda_gttm", PriorWeights().lambda_gttm),
+        lambda_target_tension=getattr(args, "lambda_target_tension", 0.0),
+        lambda_section_style=getattr(args, "lambda_section_style", 0.0),
+        sigma_tension=getattr(args, "sigma_tension", 0.1),
+    )
     run_config = MethodARunConfig(
         total_beats=args.beats,
         seed=args.seed,
         use_sampling=args.sample_path,
         style_config=style_config,
         decode_config=decode_config,
-        prior_weights=PriorWeights(
-            lambda_data=getattr(args, "lambda_data", PriorWeights().lambda_data),
-            lambda_gttm=getattr(args, "lambda_gttm", PriorWeights().lambda_gttm),
-        ),
+        prior_weights=prior_weights,
+        plan_config=plan_config,
+        sb_config=sb_config,
         edo=args.edo,
-        plan_config=PlanConfig(
-            sectioning_strategy=(SectioningStrategy.SECTION_WISE if getattr(args, "sections", None)
-                                 else SectioningStrategy.SINGLE_PASS),
-            section_names=tuple(getattr(args, "sections", None) or ()),
-        ),
-        sb_config=SBConfig(horizon_t=args.beats,
-                           max_horizon_per_solve=getattr(args, "max_horizon_per_solve", None)),
+        sections=sections,
     )
     prior: Prior | None = (
         NullPrior() if getattr(args, "null_prior", False) else None
@@ -195,12 +286,14 @@ def handle_generate(args: argparse.Namespace) -> None:
         edo=args.edo,
         tempo_bpm=args.tempo_bpm,
         key=next_key,
+        sections=plan_result.endpoints.sections,
     )
     structural_stats = _build_structural_diagnostics(
         plan_result.path,
         plan_result.vocabularies,
         edo=args.edo,
         sections=plan_result.endpoints.sections,
+        transition_diagnostics=plan_result.diagnostics.transition_diagnostics,
     )
     manifest = RunManifest(
         seed=args.seed,
@@ -262,6 +355,7 @@ def handle_generate(args: argparse.Namespace) -> None:
     print(f"Generated multitrack MIDI: {midi_path}")
     print(f"Generated manifest: {manifest_path}")
     print(f"Generated RenderPackage: {package.root}")
+
 
 def _load_json_file(path: Path, *, kind: str) -> Any:
     """Load a JSON file, converting missing/malformed files into actionable exits."""
@@ -394,6 +488,7 @@ def handle_inspect(args: argparse.Namespace) -> None:
 
 def handle_export(args: argparse.Namespace) -> None:
     """Handle the export command by rendering a serialized Score to MIDI."""
+    _, render_midi, _ = _load_render_module()
     score_path = Path(args.file)
     data = _load_json_file(score_path, kind="score file")
 
@@ -445,7 +540,7 @@ def main() -> None:
 
     gen_parser = subparsers.add_parser("generate", help="Generate a new score")
     gen_parser.add_argument("--seed", type=int, default=42)
-    gen_parser.add_argument("--beats", type=int, default=8)
+    gen_parser.add_argument("--beats", type=int, default=None)
     gen_parser.add_argument("--sections", nargs="+", help="Ordered section names; enables one SB solve per section.")
     gen_parser.add_argument("--max-horizon-per-solve", type=int, help="Maximum beat transitions in any one graph/SB solve.")
     gen_parser.add_argument("--edo", type=int, default=12)
@@ -477,6 +572,21 @@ def main() -> None:
         action="append",
         default=[],
         help="Treat the named symbolic track as percussion; repeatable.",
+    )
+    gen_parser.add_argument("--lambda-target-tension", type=float, default=0.0, help="Weight for section target tension tracking.")
+    gen_parser.add_argument("--lambda-section-style", type=float, default=0.0, help="Weight for section style preference matching.")
+    gen_parser.add_argument("--sigma-tension", type=float, default=0.1, help="Standard deviation parameter for tension tracking penalty.")
+    gen_parser.add_argument(
+        "--section-guided-proposals",
+        action="store_true",
+        default=False,
+        help="Enable proposal candidate steering toward section-preferred structural tokens.",
+    )
+    gen_parser.add_argument(
+        "--sections-file",
+        type=str,
+        default=None,
+        help="Path to JSON file containing a list of PlanningSection definitions.",
     )
     gen_parser.add_argument("--out", type=str, default="./outputs")
     gen_parser.add_argument(

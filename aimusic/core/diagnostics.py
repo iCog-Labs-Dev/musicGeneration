@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from aimusic.scoring.tension import TENSION_MODEL_VERSION
 
+DIAGNOSTICS_SCHEMA_VERSION = "0.2.0"
+
 @dataclass(frozen=True)
 class TimelineEvent:
     start_time: float
@@ -23,8 +25,19 @@ class StructuralDiagnostics:
     tension_curve: List[Tuple[float, float]] = field(default_factory=list)
     target_tension_curve: List[Tuple[float, float]] = field(default_factory=list)
     tension_deviation: Dict[str, Any] = field(default_factory=dict)
+    transition_diagnostics: List[Any] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
+        serialized_diags = []
+        for d in self.transition_diagnostics:
+            if hasattr(d, "to_dict") and callable(d.to_dict):
+                serialized_diags.append(d.to_dict())
+            elif dataclasses.is_dataclass(d) and not isinstance(d, type):
+                serialized_diags.append(dataclasses.asdict(d))
+            elif isinstance(d, dict):
+                serialized_diags.append(d)
+            else:
+                serialized_diags.append(d)
         return {
             "key_timeline": [dataclasses.asdict(e) for e in self.key_timeline],
             "chord_timeline": [dataclasses.asdict(e) for e in self.chord_timeline],
@@ -34,7 +47,44 @@ class StructuralDiagnostics:
             "tension_curve": self.tension_curve,
             "target_tension_curve": self.target_tension_curve,
             "tension_deviation": self.tension_deviation,
+            "transition_diagnostics": serialized_diags,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StructuralDiagnostics":
+        from aimusic.planning.plans import TransitionDiagnostic
+        raw_trans = data.get("transition_diagnostics", [])
+        trans_diags = []
+        for item in raw_trans:
+            if isinstance(item, dict):
+                trans_diags.append(TransitionDiagnostic.from_dict(item))
+            elif isinstance(item, TransitionDiagnostic):
+                trans_diags.append(item)
+            else:
+                trans_diags.append(item)
+        return cls(
+            key_timeline=[
+                TimelineEvent(**e) if isinstance(e, dict) else e
+                for e in data.get("key_timeline", [])
+            ],
+            chord_timeline=[
+                TimelineEvent(**e) if isinstance(e, dict) else e
+                for e in data.get("chord_timeline", [])
+            ],
+            role_timeline=[
+                TimelineEvent(**e) if isinstance(e, dict) else e
+                for e in data.get("role_timeline", [])
+            ],
+            groove_timeline=[
+                TimelineEvent(**e) if isinstance(e, dict) else e
+                for e in data.get("groove_timeline", [])
+            ],
+            boundaries=[float(b) for b in data.get("boundaries", [])],
+            tension_curve=[(float(t), float(v)) for t, v in data.get("tension_curve", [])],
+            target_tension_curve=[(float(t), float(v)) for t, v in data.get("target_tension_curve", [])],
+            tension_deviation=dict(data.get("tension_deviation", {})),
+            transition_diagnostics=trans_diags,
+        )
 
 @dataclass
 class SBDiagnostics:
@@ -117,6 +167,17 @@ class SBDiagnostics:
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SBDiagnostics":
+        return cls(
+            iterations_run=int(data.get("iterations_run", 0)),
+            converged=bool(data.get("converged", False)),
+            final_max_delta=float(data.get("final_max_delta", 0.0)),
+            layer_sizes=list(data.get("layer_sizes", [])),
+            pruned_nodes=int(data.get("pruned_nodes", 0)),
+            effective_entropy=float(data.get("effective_entropy", 0.0)),
+        )
+
 @dataclass(frozen=True)
 class RunManifest:
     """Captures all parameters required to perfectly reproduce a generation run."""
@@ -126,7 +187,7 @@ class RunManifest:
     sb_stats: SBDiagnostics = field(default_factory=SBDiagnostics)
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: float = field(default_factory=time.time)
-    version: str = "0.1.0"
+    version: str = DIAGNOSTICS_SCHEMA_VERSION
     tension_model_version: str = TENSION_MODEL_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -141,3 +202,33 @@ class RunManifest:
             "structure": self.structural_stats.to_dict(),
             "sb_stats": self.sb_stats.to_dict()
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RunManifest":
+        """Deserialize RunManifest, supporting new and legacy schemas."""
+        struct_data = data.get("structure", {})
+        if isinstance(struct_data, dict):
+            structural_stats = StructuralDiagnostics.from_dict(struct_data)
+        elif isinstance(struct_data, StructuralDiagnostics):
+            structural_stats = struct_data
+        else:
+            structural_stats = StructuralDiagnostics()
+
+        sb_data = data.get("sb_stats", {})
+        if isinstance(sb_data, dict):
+            sb_stats = SBDiagnostics.from_dict(sb_data)
+        elif isinstance(sb_data, SBDiagnostics):
+            sb_stats = sb_data
+        else:
+            sb_stats = SBDiagnostics()
+
+        return cls(
+            seed=int(data.get("seed", 0)),
+            config_dump=dict(data.get("config", {})),
+            structural_stats=structural_stats,
+            sb_stats=sb_stats,
+            run_id=str(data.get("run_id", uuid.uuid4())),
+            timestamp=float(data.get("timestamp", time.time())),
+            version=str(data.get("version", DIAGNOSTICS_SCHEMA_VERSION)),
+            tension_model_version=str(data.get("tension_model_version", TENSION_MODEL_VERSION)),
+        )

@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
-from typing import Mapping, Optional, Protocol, Sequence, Tuple, cast, runtime_checkable
+from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple, cast, runtime_checkable
 
 from aimusic.core.config import (
     NeuralPriorConfig,
@@ -13,6 +13,8 @@ from aimusic.core.config import (
     PriorWeights,
 )
 from aimusic.core.core_types import BeatState
+from aimusic.core.vocab import Vocabularies
+from aimusic.planning.sections import EdgeSectionView, PlanningSection
 from aimusic.scoring.gttm_features import (
     TransitionWindow,
     transition_feature_vector,
@@ -30,6 +32,8 @@ STRUCTURAL_STREAM_NAMES: Tuple[str, ...] = (
     "head",
     "groove",
 )
+
+SUPPORTED_STREAM_NAMES: Tuple[str, ...] = STRUCTURAL_STREAM_NAMES + ("section",)
 
 
 MetadataPairs = Tuple[Tuple[str, str], ...]
@@ -89,11 +93,130 @@ def _coerce_token_streams(streams: Sequence[str]) -> Tuple[str, ...]:
         raise ValueError("token_streams must not be empty.")
     for idx, stream in enumerate(items):
         _require_non_empty_str(f"token_streams[{idx}]", stream)
-        if stream not in STRUCTURAL_STREAM_NAMES:
+        if stream not in SUPPORTED_STREAM_NAMES:
             raise ValueError(f"Unsupported token stream: {stream!r}")
     if len(items) != len(set(items)):
         raise ValueError("token_streams must not contain duplicates.")
     return items
+
+
+@dataclass(frozen=True)
+class SectionTokens:
+    """Factorized section context tokens derived from an EdgeSectionView.
+
+    Encapsulates timeline and section guidance for transition queries,
+    following the arrival-state convention where edge t scores arrival state t + 1.
+    """
+
+    section_index: int
+    section_name: str
+    offset_in_section: int
+    section_length: int
+    is_section_start: bool
+    target_tension: float
+    groove_family: Optional[str] = None
+    allowed_meters: Tuple[str, ...] = ()
+    key_region: Optional[Tuple[int, ...]] = None
+    boundary_level: Optional[int] = None
+    target_density: Optional[float] = None
+    preferred_roles: Optional[Tuple[str, ...]] = None
+    target_key_id: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        _require_int("section_index", self.section_index, minimum=0)
+        _require_non_empty_str("section_name", self.section_name)
+        _require_int("offset_in_section", self.offset_in_section, minimum=0)
+        _require_int("section_length", self.section_length, minimum=1)
+        if not isinstance(self.is_section_start, bool):
+            raise TypeError("is_section_start must be a bool.")
+        _require_real("target_tension", self.target_tension)
+        if self.target_tension < 0.0 or self.target_tension > 1.0:
+            raise ValueError("target_tension must be in [0, 1].")
+        if self.groove_family is not None:
+            _require_non_empty_str("groove_family", self.groove_family)
+        if self.allowed_meters is not None:
+            meters = tuple(self.allowed_meters)
+            for idx, m in enumerate(meters):
+                _require_non_empty_str(f"allowed_meters[{idx}]", m)
+            object.__setattr__(self, "allowed_meters", meters)
+        else:
+            object.__setattr__(self, "allowed_meters", ())
+        if self.key_region is not None:
+            kr = tuple(self.key_region)
+            for idx, k in enumerate(kr):
+                _require_int(f"key_region[{idx}]", k, minimum=0)
+            object.__setattr__(self, "key_region", kr)
+        if self.boundary_level is not None:
+            _require_int("boundary_level", self.boundary_level, minimum=0)
+        if self.target_density is not None:
+            _require_real("target_density", self.target_density)
+        if self.preferred_roles is not None:
+            roles = tuple(self.preferred_roles)
+            for idx, r in enumerate(roles):
+                _require_non_empty_str(f"preferred_roles[{idx}]", r)
+            object.__setattr__(self, "preferred_roles", roles)
+        if self.target_key_id is not None:
+            _require_int("target_key_id", self.target_key_id, minimum=0)
+
+    @classmethod
+    def from_section_view(cls, view: EdgeSectionView) -> "SectionTokens":
+        if not isinstance(view, EdgeSectionView):
+            raise TypeError("view must be an EdgeSectionView.")
+        sec = view.section
+        sec_len = sec.end_time - sec.start_time
+        return cls(
+            section_index=view.section_index,
+            section_name=sec.name,
+            offset_in_section=view.offset_in_section,
+            section_length=sec_len,
+            is_section_start=view.is_section_start,
+            target_tension=float(view.target_tension),
+            groove_family=sec.groove_family,
+            allowed_meters=tuple(sec.allowed_meters) if sec.allowed_meters is not None else (),
+            key_region=tuple(sec.key_region) if sec.key_region is not None else None,
+            boundary_level=sec.boundary_level,
+            target_density=sec.target_density,
+            preferred_roles=tuple(sec.preferred_roles) if sec.preferred_roles is not None else None,
+            target_key_id=sec.target_key_id,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "section_index": self.section_index,
+            "section_name": self.section_name,
+            "offset_in_section": self.offset_in_section,
+            "section_length": self.section_length,
+            "is_section_start": self.is_section_start,
+            "target_tension": float(self.target_tension),
+            "groove_family": self.groove_family,
+            "allowed_meters": list(self.allowed_meters),
+            "key_region": list(self.key_region) if self.key_region is not None else None,
+            "boundary_level": self.boundary_level,
+            "target_density": self.target_density,
+            "preferred_roles": list(self.preferred_roles) if self.preferred_roles is not None else None,
+            "target_key_id": self.target_key_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SectionTokens":
+        allowed = data.get("allowed_meters")
+        key_reg = data.get("key_region")
+        roles = data.get("preferred_roles")
+        return cls(
+            section_index=int(data["section_index"]),
+            section_name=str(data["section_name"]),
+            offset_in_section=int(data["offset_in_section"]),
+            section_length=int(data["section_length"]),
+            is_section_start=bool(data["is_section_start"]),
+            target_tension=float(data["target_tension"]),
+            groove_family=str(data["groove_family"]) if data.get("groove_family") is not None else None,
+            allowed_meters=tuple(str(m) for m in allowed) if allowed is not None else (),
+            key_region=tuple(int(k) for k in key_reg) if key_reg is not None else None,
+            boundary_level=int(data["boundary_level"]) if data.get("boundary_level") is not None else None,
+            target_density=float(data["target_density"]) if data.get("target_density") is not None else None,
+            preferred_roles=tuple(str(r) for r in roles) if roles is not None else None,
+            target_key_id=int(data["target_key_id"]) if data.get("target_key_id") is not None else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -245,51 +368,100 @@ class StructuralTokenSequence:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PriorContext:
     """Optional transition-scoring context for external priors."""
 
     history: Tuple[BeatState, ...] = ()
     future_hints: Tuple[BeatState, ...] = ()
     section_name: Optional[str] = None
+    section_view: Optional[EdgeSectionView] = None
     metadata: MetadataPairs = ()
     history_tokens: Optional[StructuralTokenSequence] = None
     future_hint_tokens: Optional[StructuralTokenSequence] = None
 
-    def __post_init__(self) -> None:
-        history = _coerce_state_tuple("history", self.history)
-        future_hints = _coerce_state_tuple("future_hints", self.future_hints)
-        object.__setattr__(self, "history", history)
-        object.__setattr__(self, "future_hints", future_hints)
+    def __init__(
+        self,
+        history: Sequence[BeatState] = (),
+        future_hints: Sequence[BeatState] = (),
+        section_name: Optional[str] = None,
+        section_view: Optional[EdgeSectionView] = None,
+        metadata: Sequence[Tuple[str, str]] = (),
+        history_tokens: Optional[StructuralTokenSequence] = None,
+        future_hint_tokens: Optional[StructuralTokenSequence] = None,
+        *,
+        section: Optional[object] = None,
+        target_tension: Optional[float] = None,
+    ) -> None:
+        history_coerced = _coerce_state_tuple("history", history)
+        future_hints_coerced = _coerce_state_tuple("future_hints", future_hints)
+        object.__setattr__(self, "history", history_coerced)
+        object.__setattr__(self, "future_hints", future_hints_coerced)
 
-        if self.section_name is not None:
-            _require_non_empty_str("section_name", self.section_name)
+        resolved_view = section_view
+        if resolved_view is None and (section is not None or target_tension is not None):
+            from aimusic.planning.sections import EdgeSectionView, PlanningSection
 
-        metadata = _coerce_metadata("metadata", self.metadata)
-        object.__setattr__(self, "metadata", metadata)
+            if isinstance(section, PlanningSection):
+                resolved_view = EdgeSectionView(
+                    section=section,
+                    section_index=0,
+                    offset_in_section=0,
+                    is_section_start=False,
+                    target_tension=float(target_tension) if target_tension is not None else 0.5,
+                    arrival_time=1,
+                )
 
-        history_tokens = (
-            StructuralTokenSequence.from_states(history)
-            if self.history_tokens is None
-            else self.history_tokens
+        resolved_sec_name = section_name
+        if resolved_sec_name is None and resolved_view is not None:
+            resolved_sec_name = resolved_view.section.name
+        if resolved_sec_name is not None:
+            _require_non_empty_str("section_name", resolved_sec_name)
+
+        object.__setattr__(self, "section_name", resolved_sec_name)
+        object.__setattr__(self, "section_view", resolved_view)
+
+        meta_coerced = _coerce_metadata("metadata", metadata)
+        object.__setattr__(self, "metadata", meta_coerced)
+
+        hist_tokens = (
+            StructuralTokenSequence.from_states(history_coerced)
+            if history_tokens is None
+            else history_tokens
         )
-        future_hint_tokens = (
-            StructuralTokenSequence.from_states(future_hints)
-            if self.future_hint_tokens is None
-            else self.future_hint_tokens
+        fut_tokens = (
+            StructuralTokenSequence.from_states(future_hints_coerced)
+            if future_hint_tokens is None
+            else future_hint_tokens
         )
 
-        if not isinstance(history_tokens, StructuralTokenSequence):
+        if not isinstance(hist_tokens, StructuralTokenSequence):
             raise TypeError("history_tokens must be a StructuralTokenSequence.")
-        if not isinstance(future_hint_tokens, StructuralTokenSequence):
+        if not isinstance(fut_tokens, StructuralTokenSequence):
             raise TypeError("future_hint_tokens must be a StructuralTokenSequence.")
-        if len(history_tokens) != len(history):
+        if len(hist_tokens) != len(history_coerced):
             raise ValueError("history_tokens length must match history length.")
-        if len(future_hint_tokens) != len(future_hints):
+        if len(fut_tokens) != len(future_hints_coerced):
             raise ValueError("future_hint_tokens length must match future_hints length.")
 
-        object.__setattr__(self, "history_tokens", history_tokens)
-        object.__setattr__(self, "future_hint_tokens", future_hint_tokens)
+        object.__setattr__(self, "history_tokens", hist_tokens)
+        object.__setattr__(self, "future_hint_tokens", fut_tokens)
+
+    @property
+    def section(self) -> Optional[PlanningSection]:
+        return self.section_view.section if self.section_view is not None else None
+
+    @property
+    def target_tension(self) -> Optional[float]:
+        return self.section_view.target_tension if self.section_view is not None else None
+
+    @property
+    def section_tokens(self) -> Optional[SectionTokens]:
+        return (
+            SectionTokens.from_section_view(self.section_view)
+            if self.section_view is not None
+            else None
+        )
 
     def to_dict(self) -> dict[str, object]:
         assert self.history_tokens is not None
@@ -339,6 +511,7 @@ class TokenizedPriorQuery:
     history_tokens: StructuralTokenSequence = field(default_factory=StructuralTokenSequence)
     future_hint_tokens: StructuralTokenSequence = field(default_factory=StructuralTokenSequence)
     section_name: Optional[str] = None
+    section_tokens: Optional[SectionTokens] = None
     metadata: MetadataPairs = ()
     factorization_mode: PriorFactorization = PriorFactorization.FACTORIZED
 
@@ -354,6 +527,8 @@ class TokenizedPriorQuery:
             raise TypeError("future_hint_tokens must be a StructuralTokenSequence.")
         if self.section_name is not None:
             _require_non_empty_str("section_name", self.section_name)
+        if self.section_tokens is not None and not isinstance(self.section_tokens, SectionTokens):
+            raise TypeError("section_tokens must be a SectionTokens or None.")
         metadata = _coerce_metadata("metadata", self.metadata)
         object.__setattr__(self, "metadata", metadata)
         if not isinstance(self.factorization_mode, PriorFactorization):
@@ -371,6 +546,11 @@ class TokenizedPriorQuery:
         context = query.context or PriorContext()
         assert context.history_tokens is not None
         assert context.future_hint_tokens is not None
+        section_tokens = (
+            SectionTokens.from_section_view(context.section_view)
+            if context.section_view is not None
+            else None
+        )
         return cls(
             prev_event=StructuralEventTokens.from_state(query.prev_state),
             next_event=StructuralEventTokens.from_state(query.next_state),
@@ -378,6 +558,7 @@ class TokenizedPriorQuery:
             history_tokens=context.history_tokens,
             future_hint_tokens=context.future_hint_tokens,
             section_name=context.section_name,
+            section_tokens=section_tokens,
             metadata=context.metadata,
             factorization_mode=factorization_mode,
         )
@@ -391,6 +572,7 @@ class TokenizedPriorQuery:
             "history_tokens": self.history_tokens.to_dict(),
             "future_hint_tokens": self.future_hint_tokens.to_dict(),
             "section_name": self.section_name,
+            "section_tokens": self.section_tokens.to_dict() if self.section_tokens is not None else None,
             "metadata": list(self.metadata),
         }
 
@@ -440,7 +622,7 @@ class BatchedNeuralPriorModel(NeuralPriorModel, Protocol):
 class NeuralPriorManifest:
     """Serializable artifact manifest for an external neural prior bundle."""
 
-    manifest_version: int = 1
+    manifest_version: int = 2
     model_family: str = "external_neural_prior"
     model_version: str = "placeholder-v1"
     factorization_mode: PriorFactorization = PriorFactorization.FACTORIZED
@@ -537,7 +719,11 @@ def load_neural_prior_manifest(path: str) -> NeuralPriorManifest:
 
 @dataclass(frozen=True)
 class NullPrior:
-    """Algorithmic-only prior that contributes a constant neutral log-probability."""
+    """Algorithmic-only prior that contributes a constant neutral log-probability.
+
+    Note: This prior contributes a static neutral log-probability and does not consume
+    or use SectionTokens or section context to influence its output.
+    """
 
     neutral_logp: float = 0.0
 
@@ -560,7 +746,13 @@ class NullPrior:
 
 @dataclass(frozen=True)
 class NeuralPrior:
-    """Wrapper around an external neural prior or a deterministic placeholder."""
+    """Wrapper around an external neural prior or a deterministic placeholder.
+
+    Note: The built-in deterministic placeholder mode does not consume or use
+    SectionTokens to alter scoring behavior, preserving baseline transitions. External
+    models supplied via the `model` argument receive full TokenizedPriorQuery objects
+    and may consume section_tokens if supported.
+    """
 
     config: NeuralPriorConfig = field(default_factory=NeuralPriorConfig)
     manifest: Optional[NeuralPriorManifest] = None
@@ -581,6 +773,11 @@ class NeuralPrior:
             raise TypeError("model must satisfy the NeuralPriorModel protocol.")
 
     def _score_placeholder(self, query: TokenizedPriorQuery) -> float:
+        """Deterministic placeholder scoring based on factorized token agreements.
+
+        Note: Section tokens (query.section_tokens) are explicitly ignored by this
+        placeholder to preserve existing graph weights and baseline transitions.
+        """
         assert self.manifest is not None
         score = float(self.config.default_logp)
         if self.config.placeholder_mode is PlaceholderPriorMode.NEUTRAL:
@@ -685,18 +882,48 @@ class TransitionScoreBreakdown:
     gttm_energy: float
     gttm_contribution: float
     final_log_weight: float
+    target_tension: Optional[float] = None
+    realized_tension: Optional[float] = None
+    tension_deviation: float = 0.0
+    target_tension_energy: float = 0.0
+    target_tension_contribution: float = 0.0
+    section_style_components: Mapping[str, float] = field(default_factory=dict)
+    section_style_energy: float = 0.0
+    section_style_contribution: float = 0.0
+    prev_state: Optional[BeatState] = None
+    next_state: Optional[BeatState] = None
+
+    def check_decomposition(self, tol: float = 1e-9) -> None:
+        """Check that final_log_weight equals data + gttm - tension_contribution - style_contribution within tol."""
+        expected = (
+            self.data_contribution
+            + self.gttm_contribution
+            - self.target_tension_contribution
+            - self.section_style_contribution
+        )
+        diff = abs(self.final_log_weight - expected)
+        if diff > tol:
+            raise ValueError(
+                f"TransitionScoreBreakdown decomposition violated: "
+                f"final_log_weight={self.final_log_weight} != "
+                f"data ({self.data_contribution}) + gttm ({self.gttm_contribution}) - "
+                f"target_tension ({self.target_tension_contribution}) - "
+                f"section_style ({self.section_style_contribution}). "
+                f"Expected {expected}, discrepancy {diff} > tol {tol}."
+            )
 
 
-def _transition_score_breakdown_from_data_logp(
+def score_transition_breakdown(
     query: PriorQuery,
-    data_logp: float,
-    *,
     window: Optional[TransitionWindow],
     weights: PriorWeights,
+    vocabularies: Vocabularies,
+    edo: int,
+    data_logp: float,
+    *,
     meters=None,
-    vocabularies=None,
-    edo: Optional[int] = None,
 ) -> TransitionScoreBreakdown:
+    """Compute base data and GTTM terms for one transition query and window."""
     raw = transition_feature_vector(
         query.prev_state,
         query.next_state,
@@ -730,6 +957,100 @@ def _transition_score_breakdown_from_data_logp(
         gttm_energy=gttm_energy,
         gttm_contribution=gttm_contribution,
         final_log_weight=final_log_weight,
+        prev_state=query.prev_state,
+        next_state=query.next_state,
+    )
+
+
+# Backward-compatible alias
+_transition_score_breakdown_from_data_logp = score_transition_breakdown
+
+
+def with_section_terms(
+    breakdown: TransitionScoreBreakdown,
+    section_view: Optional[EdgeSectionView],
+    weights: PriorWeights,
+    vocabularies: Vocabularies,
+    edo: int,
+    *,
+    prev_state: Optional[BeatState] = None,
+    next_state: Optional[BeatState] = None,
+) -> TransitionScoreBreakdown:
+    """Add target tension and section style terms for the arrival state once per edge."""
+    prev = prev_state if prev_state is not None else breakdown.prev_state
+    next_st = next_state if next_state is not None else breakdown.next_state
+
+    if section_view is None or next_st is None:
+        return breakdown
+
+    target_tension = section_view.target_tension
+    from aimusic.scoring.tension import (
+        beat_tension,
+        section_style_breakdown,
+        section_style_energy,
+        transition_target_tension_energy,
+    )
+
+    realized_tension = beat_tension(prev, next_st, vocabularies, edo)
+    tension_deviation = realized_tension - target_tension
+    target_tension_energy = transition_target_tension_energy(
+        realized_tension, target_tension, weights.sigma_tension
+    )
+    target_tension_contribution = float(weights.lambda_target_tension * target_tension_energy)
+
+    is_multi_meter = getattr(section_view, "multi_meter", False)
+    if not is_multi_meter and section_view.section.allowed_meters:
+        is_multi_meter = len(section_view.section.allowed_meters) > 1
+
+    style_energy = float(
+        section_style_energy(
+            prev,
+            next_st,
+            section_view,
+            vocabularies,
+            edo,
+            style_weights=weights.style_weights,
+            multi_meter=is_multi_meter,
+            multi_meter_alignment_factor=weights.multi_meter_alignment_factor,
+        )
+    )
+    style_breakdown = section_style_breakdown(
+        prev,
+        next_st,
+        section_view,
+        vocabularies,
+        edo,
+        style_weights=weights.style_weights,
+    )
+    style_components = dict(style_breakdown)
+    section_style_contribution = float(weights.lambda_section_style * style_energy)
+
+    final_log_weight = float(
+        breakdown.data_contribution
+        + breakdown.gttm_contribution
+        - target_tension_contribution
+        - section_style_contribution
+    )
+
+    return TransitionScoreBreakdown(
+        raw_feature_contributions=breakdown.raw_feature_contributions,
+        weighted_feature_contributions=breakdown.weighted_feature_contributions,
+        data_logp=breakdown.data_logp,
+        data_contribution=breakdown.data_contribution,
+        gttm_score=breakdown.gttm_score,
+        gttm_energy=breakdown.gttm_energy,
+        gttm_contribution=breakdown.gttm_contribution,
+        final_log_weight=final_log_weight,
+        target_tension=target_tension,
+        realized_tension=realized_tension,
+        tension_deviation=tension_deviation,
+        target_tension_energy=target_tension_energy,
+        target_tension_contribution=target_tension_contribution,
+        section_style_components=style_components,
+        section_style_energy=style_energy,
+        section_style_contribution=section_style_contribution,
+        prev_state=prev,
+        next_state=next_st,
     )
 
 
@@ -748,16 +1069,28 @@ def calculate_transition_score_breakdown(
 ) -> TransitionScoreBreakdown:
     """Scalar transition scoring with raw and weighted feature diagnostics."""
     resolved_weights = PriorWeights() if weights is None else weights
+    from aimusic.core.vocab import DEFAULT_VOCABULARIES
+    resolved_vocabs = DEFAULT_VOCABULARIES if vocabularies is None else vocabularies
+    resolved_edo = len(resolved_vocabs.keys) if edo is None else edo
+
     query = PriorQuery(prev_state, next_state, t, context)
     data_logp = float(prior.logp_next(prev_state, next_state, t, context))
-    return _transition_score_breakdown_from_data_logp(
+    base = score_transition_breakdown(
         query,
+        window,
+        resolved_weights,
+        resolved_vocabs,
+        resolved_edo,
         data_logp,
-        window=window,
-        weights=resolved_weights,
         meters=meters,
-        vocabularies=vocabularies,
-        edo=edo,
+    )
+    sec_view = context.section_view if context is not None else None
+    return with_section_terms(
+        base,
+        sec_view,
+        resolved_weights,
+        resolved_vocabs,
+        resolved_edo,
     )
 
 
@@ -770,10 +1103,15 @@ def calculate_transition_score_breakdowns(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    include_section_terms: bool = True,
 ) -> Tuple[TransitionScoreBreakdown, ...]:
     """Batch transition scoring with windows aligned one-to-one with queries."""
     query_items = tuple(queries)
     resolved_weights = PriorWeights() if weights is None else weights
+    from aimusic.core.vocab import DEFAULT_VOCABULARIES
+    resolved_vocabs = DEFAULT_VOCABULARIES if vocabularies is None else vocabularies
+    resolved_edo = len(resolved_vocabs.keys) if edo is None else edo
+
     data_scores = prior_logps(prior, query_items)
     if len(data_scores) != len(query_items):
         raise ValueError("prior scoring must return one score per query.")
@@ -785,18 +1123,31 @@ def calculate_transition_score_breakdowns(
         if len(window_items) != len(query_items):
             raise ValueError("windows must align 1:1 with queries.")
 
-    return tuple(
-        _transition_score_breakdown_from_data_logp(
+    results: list[TransitionScoreBreakdown] = []
+    for idx, query in enumerate(query_items):
+        base = score_transition_breakdown(
             query,
+            window_items[idx],
+            resolved_weights,
+            resolved_vocabs,
+            resolved_edo,
             data_scores[idx],
-            window=window_items[idx],
-            weights=resolved_weights,
             meters=meters,
-            vocabularies=vocabularies,
-            edo=edo,
         )
-        for idx, query in enumerate(query_items)
-    )
+        if include_section_terms:
+            sec_view = query.context.section_view if query.context is not None else None
+            results.append(
+                with_section_terms(
+                    base,
+                    sec_view,
+                    resolved_weights,
+                    resolved_vocabs,
+                    resolved_edo,
+                )
+            )
+        else:
+            results.append(base)
+    return tuple(results)
 
 
 def calculate_transition_log_weight(
@@ -811,20 +1162,50 @@ def calculate_transition_log_weight(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    target_tension: Optional[float] = None,
+    section: Optional[object] = None,
+    section_view: Optional[EdgeSectionView] = None,
 ) -> float:
-    """Combine prior data likelihood and GTTM energy into one graph-ready edge weight."""
-    return calculate_transition_score_breakdown(
+    """Combine prior data likelihood, GTTM energy, target tension deviation, and section style energy into one edge weight."""
+    effective_context = context
+    effective_view = section_view
+    if effective_view is None and context is not None:
+        effective_view = context.section_view
+
+    if effective_view is None and (target_tension is not None or section is not None):
+        from aimusic.planning.sections import EdgeSectionView, PlanningSection
+
+        sec_obj = section if isinstance(section, PlanningSection) else (
+            context.section if context is not None and isinstance(context.section, PlanningSection) else None
+        )
+        if sec_obj is not None:
+            tau = target_tension if target_tension is not None else (
+                context.target_tension if context is not None and context.target_tension is not None else 0.5
+            )
+            effective_view = EdgeSectionView(
+                section=sec_obj,
+                section_index=0,
+                offset_in_section=max(0, t + 1 - sec_obj.start_time),
+                is_section_start=(t + 1 == sec_obj.start_time),
+                target_tension=tau,
+                arrival_time=t + 1,
+            )
+            history = context.history if context is not None else (prev_state,)
+            effective_context = PriorContext(history=history, section_view=effective_view)
+
+    breakdown = calculate_transition_score_breakdown(
         prev_state,
         next_state,
         t,
         prior=prior,
-        context=context,
+        context=effective_context,
         window=window,
         weights=weights,
         meters=meters,
         vocabularies=vocabularies,
         edo=edo,
-    ).final_log_weight
+    )
+    return breakdown.final_log_weight
 
 
 def calculate_transition_log_weights(
@@ -836,20 +1217,49 @@ def calculate_transition_log_weights(
     meters=None,
     vocabularies=None,
     edo: Optional[int] = None,
+    target_tensions: Optional[Sequence[Optional[float]]] = None,
+    sections: Optional[Sequence[Optional[object]]] = None,
 ) -> Tuple[float, ...]:
-    """Batch version of transition log-weight scoring."""
-    return tuple(
-        item.final_log_weight
-        for item in calculate_transition_score_breakdowns(
-            queries,
-            prior=prior,
-            windows=windows,
-            weights=weights,
-            meters=meters,
-            vocabularies=vocabularies,
-            edo=edo,
-        )
+    """Batch version of transition log-weight scoring with target tension and section style support."""
+    effective_queries = list(queries)
+    if target_tensions is not None or sections is not None:
+        from aimusic.planning.sections import EdgeSectionView, PlanningSection
+
+        for idx, q in enumerate(queries):
+            cur_view = q.context.section_view if q.context is not None else None
+            if cur_view is None:
+                sec_obj = (
+                    sections[idx] if sections is not None and idx < len(sections) and isinstance(sections[idx], PlanningSection)
+                    else (q.context.section if q.context is not None and isinstance(q.context.section, PlanningSection) else None)
+                )
+                if sec_obj is not None:
+                    tau = (
+                        target_tensions[idx] if target_tensions is not None and idx < len(target_tensions) and target_tensions[idx] is not None
+                        else (q.context.target_tension if q.context is not None and q.context.target_tension is not None else 0.5)
+                    )
+                    new_view = EdgeSectionView(
+                        section=sec_obj,
+                        section_index=0,
+                        offset_in_section=max(0, q.time_index + 1 - sec_obj.start_time),
+                        is_section_start=(q.time_index + 1 == sec_obj.start_time),
+                        target_tension=tau,
+                        arrival_time=q.time_index + 1,
+                    )
+                    hist = q.context.history if q.context is not None else (q.prev_state,)
+                    new_ctx = PriorContext(history=hist, section_view=new_view)
+                    effective_queries[idx] = PriorQuery(q.prev_state, q.next_state, q.time_index, new_ctx)
+
+    breakdowns = calculate_transition_score_breakdowns(
+        effective_queries,
+        prior=prior,
+        windows=windows,
+        weights=weights,
+        meters=meters,
+        vocabularies=vocabularies,
+        edo=edo,
     )
+    return tuple(b.final_log_weight for b in breakdowns)
 
 
 calculate_log_weight = calculate_transition_log_weight
+

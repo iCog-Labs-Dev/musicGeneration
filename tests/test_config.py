@@ -12,6 +12,7 @@ from aimusic.core.config import (
     PriorWeights,
     SBBackend,
     SBConfig,
+    SectionStyleWeights,
     SectioningStrategy,
     StyleConfig,
 )
@@ -58,17 +59,65 @@ class TestStyleConfig(unittest.TestCase):
             StyleConfig(bass_register=(52, 28))
 
 
+class TestSectionStyleWeights(unittest.TestCase):
+    def test_defaults(self):
+        w = SectionStyleWeights()
+        self.assertEqual(w.meter, 1.0)
+        self.assertEqual(w.key_region, 0.5)
+        self.assertEqual(w.groove_family, 0.3)
+        self.assertEqual(w.role, 0.2)
+        self.assertEqual(w.boundary, 1.5)
+        self.assertEqual(w.start_alignment, 1.0)
+
+    def test_custom_and_frozen(self):
+        w = SectionStyleWeights(meter=2.0, key_region=0.0)
+        self.assertEqual(w.meter, 2.0)
+        self.assertEqual(w.key_region, 0.0)
+        with self.assertRaises(FrozenInstanceError):
+            w.meter = 3.0  # type: ignore[misc]
+
+    def test_reject_negative_or_invalid(self):
+        with self.assertRaises(ValueError):
+            SectionStyleWeights(meter=-0.1)
+        with self.assertRaises(ValueError):
+            SectionStyleWeights(key_region=-1.0)
+        with self.assertRaises(TypeError):
+            SectionStyleWeights(groove_family="fast")  # type: ignore[arg-type]
+
+
 class TestPriorWeights(unittest.TestCase):
     def test_prior_weights_accept_non_negative_values(self):
         weights = PriorWeights(lambda_data=1.2, lambda_gttm=0.8, harmonic=1.5)
         self.assertEqual(weights.lambda_data, 1.2)
         self.assertEqual(weights.harmonic, 1.5)
 
+    def test_prior_weights_defaults_and_sigma_tension(self):
+        weights = PriorWeights()
+        self.assertEqual(weights.lambda_target_tension, 0.0)
+        self.assertEqual(weights.lambda_section_style, 0.0)
+        self.assertEqual(weights.sigma_tension, 0.1)
+        self.assertIsInstance(weights.style_weights, SectionStyleWeights)
+        self.assertEqual(weights.multi_meter_alignment_factor, 3.0)
+
+        custom = PriorWeights(sigma_tension=0.05, multi_meter_alignment_factor=4.5)
+        self.assertEqual(custom.sigma_tension, 0.05)
+        self.assertEqual(custom.multi_meter_alignment_factor, 4.5)
+
     def test_prior_weights_reject_fully_disabled_or_negative_weights(self):
         with self.assertRaises(ValueError):
             PriorWeights(lambda_data=0.0, lambda_gttm=0.0)
         with self.assertRaises(ValueError):
             PriorWeights(harmonic=-0.1)
+        with self.assertRaises(ValueError):
+            PriorWeights(sigma_tension=0.0)
+        with self.assertRaises(ValueError):
+            PriorWeights(sigma_tension=-0.05)
+        with self.assertRaises(TypeError):
+            PriorWeights(sigma_tension="invalid")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            PriorWeights(style_weights="invalid")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            PriorWeights(multi_meter_alignment_factor=-1.0)
 
 
 class TestSBConfig(unittest.TestCase):
@@ -76,6 +125,7 @@ class TestSBConfig(unittest.TestCase):
         cfg = SBConfig()
         self.assertEqual(cfg.backend_selection, SBBackend.NUMPY)
         self.assertFalse(cfg.raise_on_non_convergence)
+        self.assertFalse(cfg.section_guided_proposals)
 
     def test_sb_config_rejects_invalid_numerics(self):
         with self.assertRaises(ValueError):
@@ -92,6 +142,8 @@ class TestSBConfig(unittest.TestCase):
             SBConfig(raise_on_non_convergence=1)  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             SBConfig(backend_selection="numpy")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            SBConfig(section_guided_proposals="yes")  # type: ignore[arg-type]
 
 
 class TestNeuralPriorConfig(unittest.TestCase):
@@ -160,6 +212,14 @@ class TestPlanConfig(unittest.TestCase):
             PlanConfig(sectioning_strategy=SectioningStrategy.SECTION_WISE)
         with self.assertRaises(TypeError):
             PlanConfig(method="method_a")  # type: ignore[arg-type]
+
+    def test_plan_config_section_guided_proposals(self):
+        cfg_default = PlanConfig()
+        self.assertFalse(cfg_default.section_guided_proposals)
+        cfg_steered = PlanConfig(section_guided_proposals=True)
+        self.assertTrue(cfg_steered.section_guided_proposals)
+        with self.assertRaises(TypeError):
+            PlanConfig(section_guided_proposals="invalid")  # type: ignore[arg-type]
 
 
 class TestConfigImmutability(unittest.TestCase):

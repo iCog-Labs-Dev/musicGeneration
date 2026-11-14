@@ -185,11 +185,39 @@ class StyleConfig:
 
 
 @dataclass(frozen=True)
+class SectionStyleWeights:
+    """Component weights for section style energies (all non-negative)."""
+
+    meter: float = 1.0
+    key_region: float = 0.5
+    groove_family: float = 0.3
+    role: float = 0.2
+    boundary: float = 1.5
+    start_alignment: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "meter",
+            "key_region",
+            "groove_family",
+            "role",
+            "boundary",
+            "start_alignment",
+        ):
+            _require_real(name, getattr(self, name), minimum=0.0)
+
+
+@dataclass(frozen=True)
 class PriorWeights:
     """Relative weighting for corpus priors and GTTM feature families."""
 
     lambda_data: float = 1.0
     lambda_gttm: float = 1.0
+    lambda_target_tension: float = 0.0
+    lambda_section_style: float = 0.0
+    style_weights: SectionStyleWeights = field(default_factory=SectionStyleWeights)
+    multi_meter_alignment_factor: float = 3.0
+    sigma_tension: float = 0.1
     meter: float = 1.0
     grouping: float = 1.0
     harmonic: float = 1.0
@@ -201,6 +229,10 @@ class PriorWeights:
         for name in (
             "lambda_data",
             "lambda_gttm",
+            "lambda_target_tension",
+            "lambda_section_style",
+            "multi_meter_alignment_factor",
+            "sigma_tension",
             "meter",
             "grouping",
             "harmonic",
@@ -209,6 +241,10 @@ class PriorWeights:
             "groove",
         ):
             _require_real(name, getattr(self, name), minimum=0.0)
+        if not isinstance(self.style_weights, SectionStyleWeights):
+            raise TypeError("style_weights must be a SectionStyleWeights instance.")
+        if self.sigma_tension <= 0.0:
+            raise ValueError("sigma_tension must be > 0.")
         if self.lambda_data == 0.0 and self.lambda_gttm == 0.0:
             raise ValueError("At least one of lambda_data or lambda_gttm must be > 0.")
 
@@ -267,6 +303,7 @@ class SBConfig:
     # and aimusic/planning/graph.py).
     proposal_budget: int = 256
     prior_guided_proposals: bool = False
+    section_guided_proposals: bool = False
     log_underflow_floor: float = -745.0
     raise_on_non_convergence: bool = False
     backend_selection: SBBackend = SBBackend.NUMPY
@@ -288,6 +325,8 @@ class SBConfig:
         _require_int("proposal_budget", self.proposal_budget, minimum=1)
         if not isinstance(self.prior_guided_proposals, bool):
             raise TypeError("prior_guided_proposals must be a bool.")
+        if not isinstance(self.section_guided_proposals, bool):
+            raise TypeError("section_guided_proposals must be a bool.")
         _require_real("log_underflow_floor", self.log_underflow_floor)
         if self.log_underflow_floor > 0.0:
             raise ValueError(
@@ -309,6 +348,10 @@ class DecodeConfig:
     bass_density: float = 0.60
     comping_density: float = 0.55
     lead_density: float = 0.45
+    # Target density scaling baseline: effective_density = base * target / reference.
+    reference_density: float = 0.5
+    # Blend between local tension expression and target tension expression in [0, 1].
+    target_expression_blend: float = 0.0
     bass_register: RegisterRange = (28, 52)
     comping_register: RegisterRange = (45, 72)
     lead_register: RegisterRange = (60, 88)
@@ -331,6 +374,12 @@ class DecodeConfig:
             _require_real(name, value, minimum=0.0)
             if value > 1.0:
                 raise ValueError(f"{name} must be <= 1.0.")
+        _require_real("reference_density", self.reference_density, minimum=0.0)
+        if self.reference_density <= 0.0 or self.reference_density > 1.0:
+            raise ValueError("reference_density must be in (0, 1].")
+        _require_real("target_expression_blend", self.target_expression_blend, minimum=0.0)
+        if self.target_expression_blend > 1.0:
+            raise ValueError("target_expression_blend must be in [0, 1].")
         object.__setattr__(
             self, "bass_register", _coerce_register_range("bass_register", self.bass_register)
         )
@@ -396,6 +445,7 @@ class PlanConfig:
     start_anchor_weight: float = 1.0
     end_anchor_weight: float = 1.0
     section_names: Tuple[str, ...] = ()
+    section_guided_proposals: bool = False
     stitching: StitchingConfig = field(default_factory=StitchingConfig)
 
     def __post_init__(self) -> None:
@@ -415,6 +465,8 @@ class PlanConfig:
         _require_real("end_anchor_weight", self.end_anchor_weight, minimum=0.0)
         if self.start_anchor_weight == 0.0 and self.end_anchor_weight == 0.0:
             raise ValueError("At least one endpoint anchor weight must be > 0.")
+        if not isinstance(self.section_guided_proposals, bool):
+            raise TypeError("section_guided_proposals must be a bool.")
 
         section_names = tuple(self.section_names)
         if any(not isinstance(name, str) or not name.strip() for name in section_names):
