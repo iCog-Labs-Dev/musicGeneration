@@ -1,0 +1,15 @@
+{
+  "schema_version": "mus28-config/1",
+  "name": "m1_smoke",
+  "config_version": "1.0.0",
+  "description": "Tiny-horizon smoke matrix for development and CI-style checks; NOT a benchmark result.",
+  "horizons": [8, 12],
+  "seeds": [0, 1, 2],
+  "edos": [12],
+  "path_modes": ["sample"],
+  "conditions": ["full", "no_gttm", "no_prior", "no_sb"],
+  "graph_grid": [{"k_max": 64, "d_max": 8, "proposal_budget": 256}],
+  "prior_guided_proposals": false,
+  "sb": {"max_iterations": 200, "tolerance": 1e-6, "temperature": 1.0},
+  "timeout_s": 600
+}

@@ -1,0 +1,106 @@
+{
+  "config": {
+    "conditions": [
+      "full",
+      "no_prior"
+    ],
+    "config_version": "1.0.0",
+    "description": "Single-seed scaling probe at 256 beats (full and no_prior) to validate the linear-extrapolation estimate before attempting 512/1,024 beats. Not a benchmark result.",
+    "edos": [
+      12
+    ],
+    "graph_grid": [
+      {
+        "d_max": 8,
+        "k_max": 64,
+        "proposal_budget": 256
+      }
+    ],
+    "horizons": [
+      256
+    ],
+    "name": "m1_profile_256",
+    "path_modes": [
+      "sample"
+    ],
+    "prior_guided_proposals": false,
+    "sb": {
+      "max_iterations": 200,
+      "temperature": 1.0,
+      "tolerance": 1e-06
+    },
+    "schema_version": "mus28-config/1",
+    "seeds": [
+      0
+    ],
+    "timeout_s": 3600
+  },
+  "config_hash": "a953c8bbefae5214bf247318034753b9d6745854b4d12c734b02510ff1bb8ac5",
+  "config_name": "m1_profile_256",
+  "config_version": "1.0.0",
+  "created_with": {
+    "aimusic_version": "0.1.0",
+    "git_branch": "feature/req-18-evaluation-suite",
+    "git_commit": "084c4a4d55eeff91b60d994b2ecf69b5cb90faae",
+    "git_dirty": true,
+    "numpy": "2.5.3",
+    "platform": "Linux-6.18.44-fc-v114-x86_64-with-glibc2.39",
+    "python": "3.13.16",
+    "source_sha256": "d9a54ac6a349db9df86825d9e1d849ce01eb46b20c6adbc6b9d7e15ed02a66f4"
+  },
+  "expected_runs": [
+    {
+      "run_id": "full-h256-e12-s0-sample-7eb131eb",
+      "spec": {
+        "bridge_mode": "sb",
+        "condition": "full",
+        "config_hash": "a953c8bbefae5214bf247318034753b9d6745854b4d12c734b02510ff1bb8ac5",
+        "config_name": "m1_profile_256",
+        "d_max": 8,
+        "edo": 12,
+        "generation_method": "method_a_singleton_endpoints",
+        "horizon": 256,
+        "k_max": 64,
+        "lambda_data": 1.0,
+        "lambda_gttm": 1.0,
+        "max_iterations": 200,
+        "path_mode": "sample",
+        "prior_bundle": null,
+        "prior_guided_proposals": false,
+        "prior_mode": "placeholder_structured",
+        "proposal_budget": 256,
+        "sectioning": "single_pass",
+        "seed": 0,
+        "temperature": 1.0,
+        "tolerance": 1e-06
+      }
+    },
+    {
+      "run_id": "no_prior-h256-e12-s0-sample-c3ba15cb",
+      "spec": {
+        "bridge_mode": "sb",
+        "condition": "no_prior",
+        "config_hash": "a953c8bbefae5214bf247318034753b9d6745854b4d12c734b02510ff1bb8ac5",
+        "config_name": "m1_profile_256",
+        "d_max": 8,
+        "edo": 12,
+        "generation_method": "method_a_singleton_endpoints",
+        "horizon": 256,
+        "k_max": 64,
+        "lambda_data": 1.0,
+        "lambda_gttm": 1.0,
+        "max_iterations": 200,
+        "path_mode": "sample",
+        "prior_bundle": null,
+        "prior_guided_proposals": false,
+        "prior_mode": "null",
+        "proposal_budget": 256,
+        "sectioning": "single_pass",
+        "seed": 0,
+        "temperature": 1.0,
+        "tolerance": 1e-06
+      }
+    }
+  ],
+  "schema_version": "mus28-manifest/1"
+}

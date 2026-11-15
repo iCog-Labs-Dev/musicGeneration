@@ -37,6 +37,10 @@ audio-bridge = [
   # Pin public main tip with M1–M3 spine; retag v0.1.0 later when local m2a commits push.
   "midi2audio-generative @ git+https://github.com/arsenylosev/midi2audio_generative.git@46b3dfe",
 ]
+ui = [
+  "gradio>=5",
+  "plotly",
+]
 dev = [
   "pytest",
   "flake8",

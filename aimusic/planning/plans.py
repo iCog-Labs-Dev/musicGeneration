@@ -919,6 +919,7 @@ def run_section_wise(
                 section_context=context,
                 stitch_policy=StitchPolicy(run_config.plan_config.stitching, vocabs,
                                           run_config.edo, edge_times),
+                preserve_start_support=True,
             )
             pending.append((section, graph, local_sb, stream_id))
         except (ValueError, RuntimeError) as exc:

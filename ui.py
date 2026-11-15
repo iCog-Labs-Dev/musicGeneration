@@ -29,6 +29,7 @@ from aimusic.core.diagnostics import RunManifest, SBDiagnostics
 from aimusic.core.rng import RNGKey
 from aimusic.core.vocab import DEFAULT_GROOVE_FAMILIES, DEFAULT_METER_SIGNATURES
 from aimusic.decode import decode_path_to_score
+from aimusic.evaluation.ui import build_evaluation_page
 from aimusic.planning.plans import MethodARunConfig, run_method_a
 from aimusic.render import render_midi
 from aimusic.render.midi_render import TrackInstrumentConfig
@@ -1078,6 +1079,10 @@ with gr.Blocks(title="MIDI Generator", fill_height=True) as demo:
         ],
         show_progress="full",
     )
+
+# MUS-28 evaluation dashboard: a separate page, so the generation UI above is untouched.
+with demo.route("Evaluation", "evaluation"):
+    build_evaluation_page(demo)
 
 if __name__ == "__main__":
     demo.queue()

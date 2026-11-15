@@ -1,0 +1,32 @@
+{
+  "schema_version": "mus28-config/1",
+  "name": "m2_section_wise_sb",
+  "config_version": "1.0.0",
+  "description": "MUS-16 section-wise SB and soft-stitching evaluation: monolithic Method A vs section-wise Method A, matched on seed, horizon, EDO, endpoint mode, graph limits, prior, path mode, style and section plan. Single 4/4 meter because 4-beat sections cannot preserve shared boundaries under the default mixed 4/4-5/4-7/4 style.",
+  "benchmark_type": "evaluation",
+  "horizons": [16, 32],
+  "seeds": [0, 1, 2],
+  "edos": [12],
+  "path_modes": ["sample"],
+  "conditions": ["full"],
+  "endpoint_mode": "distribution",
+  "sectioning": ["single_pass", "section_wise"],
+  "section_names": ["intro", "theme", "bridge", "return"],
+  "style": {
+    "allowed_meters": ["4/4"]
+  },
+  "graph_grid": [
+    {
+      "k_max": 64,
+      "d_max": 8,
+      "proposal_budget": 256
+    }
+  ],
+  "prior_guided_proposals": false,
+  "sb": {
+    "max_iterations": 200,
+    "tolerance": 1e-6,
+    "temperature": 1.0
+  },
+  "timeout_s": 900
+}

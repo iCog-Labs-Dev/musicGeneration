@@ -15,6 +15,7 @@ Symbolic music generation (`aimusic`): GTTM-inspired energies + Schrödinger Bri
 - Lint: `flake8 aimusic tests ui.py`
 - Typecheck: `mypy aimusic tests ui.py`
 - Generate: `python -m aimusic.app.cli generate --seed 11 --beats 4 --out ./outputs`
+- Benchmark (MUS-28): `python -m aimusic.evaluation run --config config/benchmarks/m1_64_128.json --out ./outputs/benchmarks/m1_64_128` (see [docs/evaluation-suite.md](docs/evaluation-suite.md))
 
 ## Code conventions
 
